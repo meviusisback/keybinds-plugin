@@ -305,9 +305,10 @@ Item {
       }
     }
 
-    Item {
+    FocusScope {
       id: mainContainer
       anchors.fill: parent
+      focus: true
 
       Keys.onEscapePressed: function(event) {
         if (editDialog.opened) {

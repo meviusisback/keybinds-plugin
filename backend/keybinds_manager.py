@@ -860,7 +860,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             elif cmd and (cmd.strip().startswith("{") or cmd.strip().startswith("hl.")):
                 new_lines.append(f'o.bind("{key}", "{desc}", {cmd.strip()})')
             else:
-                escaped_cmd = (cmd or action).replace('"', '\\"')
+                raw_cmd = (cmd or action).strip()
+                if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
+                    raw_cmd = raw_cmd[1:-1]
+                escaped_cmd = raw_cmd.replace('"', '\\"')
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
 
     final_output = []
