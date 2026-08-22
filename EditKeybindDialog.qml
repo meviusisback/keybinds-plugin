@@ -5,7 +5,7 @@ import qs.Commons
 import qs.Ui
 
 // Modal dialog for adding or modifying a keybinding
-// Strictly implements Omarchy border insets, standard typography, and clean spacing
+// Strictly implements Omarchy border insets, standard typography, clean spacing, and smart free key recommendations
 Item {
   id: root
 
@@ -29,6 +29,66 @@ Item {
 
   signal saved(string key, string description, string command, string action, string oldKey, bool overrideConflict)
   signal canceled()
+
+  // Smart Suggested Free Combinations
+  readonly property var suggestedKeys: {
+    var bound = {}
+    if (root.allBindings) {
+      for (var i = 0; i < root.allBindings.length; i++) {
+        var b = root.allBindings[i]
+        if (b && b.status !== "disabled" && b.key) {
+          bound[b.key.toUpperCase()] = true
+        }
+      }
+    }
+
+    // Extract first letter of current action title
+    var firstLetter = ""
+    if (root.actionTitle && root.actionTitle.trim().length > 0) {
+      var cleanTitle = root.actionTitle.trim()
+      for (var j = 0; j < cleanTitle.length; j++) {
+        var ch = cleanTitle.charAt(j).toUpperCase()
+        if (ch >= 'A' && ch <= 'Z') {
+          firstLetter = ch
+          break
+        }
+      }
+    }
+
+    var candidates = []
+    // 1. If we have a first letter, prioritize variations of that letter
+    if (firstLetter) {
+      candidates.push("SUPER + " + firstLetter)
+      candidates.push("SUPER + ALT + " + firstLetter)
+      candidates.push("SUPER + SHIFT + " + firstLetter)
+      candidates.push("SUPER + CTRL + " + firstLetter)
+    }
+
+    // 2. Standard ergonomic chords
+    var letters = ["B", "D", "E", "H", "M", "N", "R", "T", "U", "Y", "Z", "A", "C", "F", "K", "L", "P", "Q", "S", "W"]
+    for (var k = 0; k < letters.length; k++) {
+      var l = letters[k]
+      if (l !== firstLetter) {
+        candidates.push("SUPER + " + l)
+        candidates.push("SUPER + ALT + " + l)
+        candidates.push("SUPER + SHIFT + " + l)
+        candidates.push("SUPER + CTRL + " + l)
+      }
+    }
+
+    var suggestions = []
+    for (var c = 0; c < candidates.length; c++) {
+      var chord = candidates[c]
+      if (!bound[chord.toUpperCase()] && suggestions.indexOf(chord) === -1) {
+        if (chord.toUpperCase() !== root.actionKey.toUpperCase()) {
+          suggestions.push(chord)
+          if (suggestions.length >= 4) break
+        }
+      }
+    }
+
+    return suggestions
+  }
 
   function openCreate(presetItem) {
     root.isEditing = false
@@ -291,10 +351,10 @@ Item {
           }
         }
 
-        // 5. Interactive Shortcut Key Input
+        // 5. Interactive Shortcut Key Input & Suggestions
         ColumnLayout {
           Layout.fillWidth: true
-          spacing: Style.space(6)
+          spacing: Style.space(8)
 
           Text {
             text: "Keyboard Shortcut:"
@@ -311,6 +371,83 @@ Item {
             currentDescription: root.isEditing ? root.actionTitle : ""
             onKeyChanged: function(newK) {
               root.actionKey = newK
+            }
+          }
+
+          // Smart Suggested Free Combinations Card
+          ColumnLayout {
+            visible: root.suggestedKeys.length > 0
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+
+            RowLayout {
+              spacing: Style.space(6)
+
+              Text {
+                text: "💡"
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                text: "Suggested Free Shortcuts (Click to pick):"
+                color: Util.alpha(root.foreground, 0.75)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            Flow {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+
+              Repeater {
+                model: root.suggestedKeys
+
+                BorderSurface {
+                  id: suggestChip
+                  required property string modelData
+                  height: Style.space(28)
+                  width: suggestChipRow.implicitWidth + Style.space(18)
+                  radius: Style.cornerRadius
+                  color: suggestMouse.containsMouse ? Util.alpha(root.accent, 0.24) : Util.alpha(root.accent, 0.10)
+                  borderSpec: Border.flat(
+                    suggestMouse.containsMouse ? root.accent : Util.alpha(root.accent, 0.4),
+                    1
+                  )
+
+                  MouseArea {
+                    id: suggestMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      keyRecorder.value = suggestChip.modelData
+                      root.actionKey = suggestChip.modelData
+                      keyRecorder.stopRecording()
+                    }
+                  }
+
+                  RowLayout {
+                    id: suggestChipRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+
+                    Text {
+                      text: "✨"
+                      font.pixelSize: Style.font.caption - 2
+                    }
+
+                    Text {
+                      text: suggestChip.modelData
+                      color: root.accent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+                }
+              }
             }
           }
         }
