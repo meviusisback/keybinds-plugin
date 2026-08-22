@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
 USER_BINDINGS_PATH = os.path.expanduser("~/.config/hypr/bindings.lua")
@@ -25,6 +26,7 @@ MAX_KEY_LEN = 64
 MAX_TEXT_LEN = 200
 MAX_CMD_LEN = 2000
 MAX_FILE_BYTES = 1_048_576  # 1 MiB cap on any single config file read
+MAX_DIR_FILES = 4096  # ceiling on enumerated default-binding files
 
 def sanitize_lua_str(s: str) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
@@ -32,6 +34,15 @@ def sanitize_lua_str(s: str) -> str:
     if len(s) > MAX_TEXT_LEN:
         s = s[:MAX_TEXT_LEN]
     return s.replace("\\", "\\\\").replace('"', '\\"')
+def _refuse_if_symlink(path: str) -> None:
+    """Hardening: refuse to read/write through a symlink at the config path.
+
+    Prevents a local TOCTOU/symlink redirect where a crafted symlink at
+    ~/.config/hypr/bindings.lua (or its .bak/.tmp) points at an arbitrary
+    file that the write would then truncate or overwrite.
+    """
+    if os.path.islink(path):
+        raise ValueError(f"refusing to operate on symlink: {path}")
 
 
 PRESET_CATALOG = [
@@ -556,7 +567,11 @@ def parse_default_bindings():
     if not os.path.isdir(DEFAULT_BINDINGS_DIR):
         return bindings
 
+    file_count = 0
     for fname in sorted(os.listdir(DEFAULT_BINDINGS_DIR)):
+        if file_count >= MAX_DIR_FILES:
+            break
+        file_count += 1
         if not fname.endswith(".lua"):
             continue
         filepath = os.path.join(DEFAULT_BINDINGS_DIR, fname)
@@ -817,11 +832,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
     """
-    os.makedirs(os.path.dirname(USER_BINDINGS_PATH), exist_ok=True)
+    cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
+    os.makedirs(cfg_dir, exist_ok=True)
 
     existing_content = ""
     if os.path.isfile(USER_BINDINGS_PATH):
+        _refuse_if_symlink(USER_BINDINGS_PATH)
         backup_path = USER_BINDINGS_PATH + ".bak"
+        if os.path.exists(backup_path):
+            _refuse_if_symlink(backup_path)
         shutil.copyfile(USER_BINDINGS_PATH, backup_path)
         with open(USER_BINDINGS_PATH, "r", encoding="utf-8") as f:
             existing_content = f.read(MAX_FILE_BYTES)
@@ -896,11 +915,23 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             final_output.append(line)
             prev_blank = False
 
-    temp_file = USER_BINDINGS_PATH + ".tmp"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(final_output) + "\n")
-
-    os.replace(temp_file, USER_BINDINGS_PATH)
+    fd, temp_file = tempfile.mkstemp(dir=cfg_dir, prefix=".bindings_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(final_output) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.islink(temp_file):
+            os.unlink(temp_file)
+            raise ValueError("temp write path is a symlink")
+        os.replace(temp_file, USER_BINDINGS_PATH)
+    except BaseException:
+        if os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except BaseException:
+                pass
+        raise
 
 
 def reload_hyprland():
