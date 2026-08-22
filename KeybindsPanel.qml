@@ -44,8 +44,7 @@ Item {
     "Workspaces",
     "Menus & System",
     "Applications",
-    "Media & Audio",
-    "Custom"
+    "Media & Audio"
   ]
 
   function open(payloadJson) {
