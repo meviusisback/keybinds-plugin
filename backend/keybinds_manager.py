@@ -25,8 +25,9 @@ UNSAFE_KEY_RE = re.compile(r'["\'\\()\n\r\t]')
 MAX_KEY_LEN = 64
 MAX_TEXT_LEN = 200
 MAX_CMD_LEN = 2000
-MAX_FILE_BYTES = 1_048_576  # 1 MiB cap on any single config file read
-MAX_DIR_FILES = 4096  # ceiling on enumerated default-binding files
+MAX_FILE_BYTES = 65_536  # 64 KiB cap on any single config file read
+MAX_DIR_FILES = 256  # ceiling on enumerated default-binding files
+MAX_TOTAL_READ = 2_097_152  # 2 MiB cumulative cap across the default-bindings dir
 
 def sanitize_lua_str(s: str) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
@@ -568,8 +569,9 @@ def parse_default_bindings():
         return bindings
 
     file_count = 0
+    total_read = 0
     for fname in sorted(os.listdir(DEFAULT_BINDINGS_DIR)):
-        if file_count >= MAX_DIR_FILES:
+        if file_count >= MAX_DIR_FILES or total_read > MAX_TOTAL_READ:
             break
         file_count += 1
         if not fname.endswith(".lua"):
@@ -578,6 +580,7 @@ def parse_default_bindings():
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read(MAX_FILE_BYTES)
+            total_read += len(content.encode("utf-8"))
         except Exception:
             continue
 
@@ -837,13 +840,23 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     existing_content = ""
     if os.path.isfile(USER_BINDINGS_PATH):
-        _refuse_if_symlink(USER_BINDINGS_PATH)
-        backup_path = USER_BINDINGS_PATH + ".bak"
-        if os.path.exists(backup_path):
-            _refuse_if_symlink(backup_path)
-        shutil.copyfile(USER_BINDINGS_PATH, backup_path)
-        with open(USER_BINDINGS_PATH, "r", encoding="utf-8") as f:
+        # Atomic symlink rejection: O_NOFOLLOW makes the kernel refuse to open
+        # a symlink, eliminating the check/use race of a pathname islink test.
+        try:
+            src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            raise ValueError(f"refusing to operate on symlink: {USER_BINDINGS_PATH}")
+        with os.fdopen(src_fd, "r", encoding="utf-8") as f:
             existing_content = f.read(MAX_FILE_BYTES)
+        backup_path = USER_BINDINGS_PATH + ".bak"
+        try:
+            bak_fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        except OSError:
+            raise ValueError(f"refusing to operate on symlink: {backup_path}")
+        with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
+            bak_f.write(existing_content)
+            bak_f.flush()
+            os.fsync(bak_f.fileno())
 
     current_lines = existing_content.splitlines() if existing_content else []
 
