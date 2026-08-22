@@ -11,7 +11,7 @@ A modern, intuitive graphical frontend plugin for **[Omarchy Linux](https://omar
 
 ## ✨ Features
 
-- **📱 Apps Menu Integration**: Sits cleanly in the **Apps** menu as an on-demand floating tool without cluttering the top status bar.
+- **🚀 On-Demand Launch**: Summon the floating manager anytime via `omarchy-shell shell summon meviusisback.keybinds` (or bind it to a key) — no top status bar clutter.
 - **🔤 Alphabetical Sorting**: All active keybindings and catalog presets are strictly sorted in case-insensitive alphabetical order by action name.
 - **⭐ Dedicated Modified & Custom Section**: Easily review and manage all personal shortcut overrides and custom keybindings in one place with 1-click **↺ Reset to Default** and **🗑️ Delete**.
 - **💡 Smart Free Key Recommendations**: When creating or editing an action, the modal automatically scans for 100% free, unassigned shortcuts matching the action's first letter (e.g. `SUPER + S`, `SUPER + SHIFT + S` for *Spotify*) and offers 1-click suggestion chips.
@@ -29,30 +29,20 @@ A modern, intuitive graphical frontend plugin for **[Omarchy Linux](https://omar
 
 ## 🚀 Installation
 
-### Automated Installation
-Clone the repository and run the install script:
+Install directly from the marketplace with the Omarchy CLI (it clones and links the plugin into `~/.config/omarchy/plugins/`):
 ```bash
-git clone https://github.com/meviusisback/keybinds-plugin.git ~/repo/keybinds-plugin
-cd ~/repo/keybinds-plugin
-./install.sh
+omarchy plugin add https://github.com/meviusisback/keybinds-plugin --enable
 ```
 
-### Manual Installation
-```bash
-mkdir -p ~/.config/omarchy/plugins ~/.local/share/applications
-ln -sfn "$(pwd)" ~/.config/omarchy/plugins/meviusisback.keybinds
-cp meviusisback.keybinds.desktop ~/.local/share/applications/
-omarchy-shell shell rescanPlugins
-```
+The plugin is then available via `omarchy-shell shell summon meviusisback.keybinds`.
 
 ---
 
 ## 📖 Usage
 
 ### From the Graphical Desktop
-1. Open the Omarchy Apps Menu (<kbd>SUPER</kbd> + <kbd>SPACE</kbd> or <kbd>SUPER</kbd> + <kbd>ALT</kbd> + <kbd>SPACE</kbd>).
-2. Select **Keybindings**.
-3. Search by shortcut (e.g. `SUPER + W`), action name (e.g. `Terminal`), category, or command.
+1. Summon the plugin via `omarchy-shell shell summon meviusisback.keybinds` (or your configured launcher/keybinding).
+2. Search by shortcut (e.g. `SUPER + W`), action name (e.g. `Terminal`), category, or command.
 
 ### From the Terminal
 Launch the GUI directly:
@@ -124,7 +114,6 @@ python3 -m unittest discover -s tests -p "test_*.py"
 omarchy-shell shell hide meviusisback.keybinds >/dev/null 2>&1 || true
 omarchy-shell shell removePlugin meviusisback.keybinds >/dev/null 2>&1 || true
 rm -f ~/.config/omarchy/plugins/meviusisback.keybinds
-rm -f ~/.local/share/applications/meviusisback.keybinds.desktop
 ```
 
 ---
@@ -145,14 +134,12 @@ keybinds-plugin/
 ├── EditKeybindDialog.qml         # Modal dialog for creating/editing shortcuts with smart free recommendations
 ├── KeyRecorder.qml               # Interactive keyboard event catcher, modifier pills, and live conflict check
 ├── KeyBadge.qml                  # Visual keyboard chord badge renderer
-├── meviusisback.keybinds.desktop # XDG desktop launcher for Apps menu
 ├── bin/
 │   └── omarchy-keybinds          # CLI wrapper script
 ├── backend/
 │   └── keybinds_manager.py       # Python engine for parsing defaults, user Lua config, conflicts, and mouse sync
 ├── tests/
 │   └── test_backend.py           # Unit tests for parser and backend operations
-├── install.sh                    # Automated installer script
 └── README.md                     # Documentation
 ```
 
