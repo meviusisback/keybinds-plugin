@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "meviusisback.keybinds",
+  "name": "Keybindings",
+  "version": "1.0.0",
+  "author": "meviusisback",
+  "license": "MIT",
+  "description": "Graphical frontend to view, modify, create, and manage Hyprland keybindings with conflict detection.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "KeybindsPanel.qml"
+  }
+}

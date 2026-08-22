@@ -1,0 +1,34 @@
+#!/bin/bash
+# omarchy:summary=Graphical frontend to view, search, modify, and create Hyprland keybindings.
+
+PLUGIN_ID="meviusisback.keybinds"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+  echo "Usage: omarchy-keybinds [list|set|reset|disable|--print]"
+  echo "  (no args)  Open the graphical keybindings manager window"
+  echo "  list       Output full JSON model of active binds, catalog, and conflicts"
+  echo "  set        Set a keybinding: omarchy-keybinds set <key> <description> <command>"
+  echo "  reset      Reset a keybinding to default: omarchy-keybinds reset <key>"
+  echo "  disable    Disable/unbind a keybinding: omarchy-keybinds disable <key>"
+  exit 0
+fi
+
+if [[ "$1" == "--print" || "$1" == "-p" ]]; then
+  omarchy-menu-keybindings --print
+  exit 0
+fi
+
+if [[ -n "$1" ]]; then
+  exec python3 "$REPO_DIR/backend/keybinds_manager.py" "$@"
+fi
+
+# Ensure plugin is linked and registered in omarchy-shell
+if [[ ! -d "$HOME/.config/omarchy/plugins/$PLUGIN_ID" ]]; then
+  mkdir -p "$HOME/.config/omarchy/plugins"
+  ln -sfn "$REPO_DIR" "$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+fi
+
+# Summon the GUI panel
+omarchy-shell shell summon "$PLUGIN_ID" '{}'

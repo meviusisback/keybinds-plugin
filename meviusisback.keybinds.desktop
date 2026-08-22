@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Keybindings
+GenericName=Keybindings Manager
+Comment=Graphical frontend to modify and create Hyprland keybindings
+Exec=/home/alberto/repo/keybinds-plugin/bin/omarchy-keybinds
+Icon=preferences-desktop-keyboard-shortcuts
+Terminal=false
+Categories=Settings;DesktopSettings;Utility;
+Keywords=keybindings;shortcuts;hyprland;hotkeys;keys;bindings;
+StartupNotify=true
