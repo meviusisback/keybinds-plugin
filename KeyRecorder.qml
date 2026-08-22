@@ -541,6 +541,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: {
                 if (!root.activeConflict || root.activeConflict.length === 0) return ""

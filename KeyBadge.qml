@@ -68,6 +68,7 @@ Item {
             id: keyLabel
             anchors.centerIn: parent
             text: partRow.modelData
+            textFormat: Text.PlainText
             color: root.highlighted ? root.accent : (partRow.isModifier ? root.accent : root.foreground)
             font.family: Style.font.family
             font.pixelSize: root.fontSize

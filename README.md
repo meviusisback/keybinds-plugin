@@ -115,6 +115,27 @@ python3 -m unittest discover -s tests -p "test_*.py"
 
 ---
 
+---
+
+## 🗑️ Removal
+
+```bash
+# Remove the plugin from Omarchy (keeps your personal ~/.config/hypr/bindings.lua untouched)
+omarchy-shell shell hide meviusisback.keybinds >/dev/null 2>&1 || true
+omarchy-shell shell removePlugin meviusisback.keybinds >/dev/null 2>&1 || true
+rm -f ~/.config/omarchy/plugins/meviusisback.keybinds
+rm -f ~/.local/share/applications/meviusisback.keybinds.desktop
+```
+
+---
+
+## 🔒 Security & Privacy
+
+- **Local-only**: The plugin runs entirely on your machine. It has **no network access**, no telemetry, and reads only your Hyprland keybinding configuration (`~/.config/hypr/bindings.lua` and the Omarchy default bindings).
+- **No keylogging**: The interactive recorder captures keystrokes only in-memory to display the pressed chord; nothing is persisted to disk or transmitted.
+- **Safe Lua writes**: All key chords, descriptions, and commands are validated and escaped before being written to `bindings.lua`. Invalid chords (containing characters that could break out of a Lua literal) are rejected, and string values are escaped so a crafted binding description cannot inject arbitrary Lua.
+- **Automatic backups**: Every write first copies the existing `bindings.lua` to `bindings.lua.bak` and applies the change atomically via an atomic rename.
+
 ## 🏗️ Architecture
 
 ```

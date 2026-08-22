@@ -23,7 +23,7 @@ echo "✓ Plugin linked to $PLUGIN_TARGET"
 
 # 3. Install desktop entry for Apps menu
 mkdir -p "$DESKTOP_DIR"
-cp "$REPO_DIR/meviusisback.keybinds.desktop" "$DESKTOP_DIR/meviusisback.keybinds.desktop"
+sed "s|__PLUGIN_DIR__|$REPO_DIR|g" "$REPO_DIR/meviusisback.keybinds.desktop" > "$DESKTOP_DIR/meviusisback.keybinds.desktop"
 echo "✓ Desktop entry installed to $DESKTOP_DIR/meviusisback.keybinds.desktop"
 
 # 4. Refresh plugin state safely (dismiss any open instance before rescan to avoid hot-reload crash)

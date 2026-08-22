@@ -91,7 +91,7 @@ Item {
     root.loading = true
     setProc.running = false
     setProc.command = [
-      Quickshell.env("HOME") + "/repo/keybinds-plugin/backend/keybinds_manager.py",
+      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "set",
       key,
       desc,
@@ -106,7 +106,7 @@ Item {
     root.loading = true
     resetProc.running = false
     resetProc.command = [
-      Quickshell.env("HOME") + "/repo/keybinds-plugin/backend/keybinds_manager.py",
+      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "reset",
       key,
       defaultKey || ""
@@ -118,7 +118,7 @@ Item {
     root.loading = true
     enableProc.running = false
     enableProc.command = [
-      Quickshell.env("HOME") + "/repo/keybinds-plugin/backend/keybinds_manager.py",
+      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "enable",
       key
     ]
@@ -129,7 +129,7 @@ Item {
     root.loading = true
     disableProc.running = false
     disableProc.command = [
-      Quickshell.env("HOME") + "/repo/keybinds-plugin/backend/keybinds_manager.py",
+      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "disable",
       key
     ]
@@ -271,7 +271,7 @@ Item {
 
   Process {
     id: listProc
-    command: [Quickshell.env("HOME") + "/repo/keybinds-plugin/backend/keybinds_manager.py", "list"]
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "list"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -750,6 +750,7 @@ Item {
 
                         Text {
                           text: (activeRow.modelData && activeRow.modelData.description) || "Action"
+                          textFormat: Text.PlainText
                           color: (activeRow.modelData && activeRow.modelData.status === "disabled")
                             ? Util.alpha(root.foreground, 0.4)
                             : root.foreground
@@ -771,6 +772,7 @@ Item {
                             id: catLabel
                             anchors.centerIn: parent
                             text: (activeRow.modelData && activeRow.modelData.category) || "General"
+                            textFormat: Text.PlainText
                             color: Util.alpha(root.foreground, 0.5)
                             font.family: Style.font.family
                             font.pixelSize: Style.font.caption - 3
@@ -781,6 +783,7 @@ Item {
                       Text {
                         Layout.fillWidth: true
                         text: (activeRow.modelData && (activeRow.modelData.command || activeRow.modelData.action)) || ""
+                        textFormat: Text.PlainText
                         color: Util.alpha(root.foreground, 0.5)
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
@@ -868,6 +871,7 @@ Item {
                   Text {
                     text: root.searchQuery.length > 0
                       ? ("No keybinding found for \"" + root.searchQuery + "\"")
+                    textFormat: Text.PlainText
                       : "No keybindings match your filter."
                     color: root.foreground
                     font.family: Style.font.family
@@ -972,6 +976,7 @@ Item {
 
                         Text {
                           text: (modRow.modelData && modRow.modelData.description) || "Action"
+                          textFormat: Text.PlainText
                           color: root.foreground
                           font.family: Style.font.family
                           font.pixelSize: Style.font.body
@@ -989,6 +994,7 @@ Item {
                             id: modCatLabel
                             anchors.centerIn: parent
                             text: (modRow.modelData && modRow.modelData.category) || "Custom"
+                            textFormat: Text.PlainText
                             color: Util.alpha(root.foreground, 0.5)
                             font.family: Style.font.family
                             font.pixelSize: Style.font.caption - 3
@@ -999,6 +1005,7 @@ Item {
                       Text {
                         Layout.fillWidth: true
                         text: (modRow.modelData && (modRow.modelData.command || modRow.modelData.action)) || ""
+                        textFormat: Text.PlainText
                         color: Util.alpha(root.foreground, 0.5)
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
@@ -1109,6 +1116,7 @@ Item {
                         id: catPill
                         anchors.centerIn: parent
                         text: catalogRow.modelData.category
+                        textFormat: Text.PlainText
                         color: root.accent
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption - 2
@@ -1124,6 +1132,7 @@ Item {
 
                       Text {
                         text: catalogRow.modelData.name
+                        textFormat: Text.PlainText
                         color: root.foreground
                         font.family: Style.font.family
                         font.pixelSize: Style.font.body
@@ -1133,6 +1142,7 @@ Item {
                       Text {
                         Layout.fillWidth: true
                         text: catalogRow.modelData.description
+                        textFormat: Text.PlainText
                         color: Util.alpha(root.foreground, 0.5)
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
@@ -1276,6 +1286,7 @@ Item {
 
                             Text {
                               text: confSubRow.modelData.description || "Action"
+                              textFormat: Text.PlainText
                               color: root.foreground
                               font.family: Style.font.family
                               font.pixelSize: Style.font.body
@@ -1285,6 +1296,7 @@ Item {
 
                             Text {
                               text: confSubRow.modelData.action || ""
+                              textFormat: Text.PlainText
                               color: Util.alpha(root.foreground, 0.5)
                               font.family: Style.font.family
                               font.pixelSize: Style.font.caption

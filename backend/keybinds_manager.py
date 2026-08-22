@@ -19,6 +19,20 @@ CACHE_DIR = os.path.expanduser("~/.cache/omarchy")
 
 # Standard modifier weights for consistent ordering
 MODIFIER_ORDER = {"SUPER": 1, "SHIFT": 2, "CTRL": 3, "CONTROL": 3, "ALT": 4}
+# Reject any chord containing characters that could break out of a Lua literal or command context.
+UNSAFE_KEY_RE = re.compile(r'["\'\\()\n\r\t]')
+MAX_KEY_LEN = 64
+MAX_TEXT_LEN = 200
+MAX_CMD_LEN = 2000
+MAX_FILE_BYTES = 1_048_576  # 1 MiB cap on any single config file read
+
+def sanitize_lua_str(s: str) -> str:
+    """Escape a string for safe embedding inside a Lua double-quoted literal."""
+    s = (s or "").replace("\r", " ").replace("\n", " ")
+    if len(s) > MAX_TEXT_LEN:
+        s = s[:MAX_TEXT_LEN]
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
 
 PRESET_CATALOG = [
     # Window Management
@@ -501,18 +515,22 @@ def normalize_key_chord(key_chord: str) -> str:
             main_key = main_key.upper()
 
     if mods and main_key:
-        return f"{' + '.join(mods)} + {main_key}"
+        out = f"{' + '.join(mods)} + {main_key}"
     elif mods and not main_key:
-        return " + ".join(mods)
+        out = " + ".join(mods)
     else:
-        return main_key
+        out = main_key
+    if len(out) > MAX_KEY_LEN or UNSAFE_KEY_RE.search(out or ""):
+        return ""
+    return out
+
 
 
 def get_mouse_scroll_settings():
     """Retrieve active Hyprland mouse scroll configuration (scroll_factor & natural_scroll)."""
     settings = {"natural_scroll": False, "scroll_factor": 1.0}
     try:
-        res = subprocess.run(["hyprctl", "getoption", "input:scroll_factor", "-j"], capture_output=True, text=True)
+        res = subprocess.run(["hyprctl", "getoption", "input:scroll_factor", "-j"], capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
             if "float" in data:
@@ -521,7 +539,7 @@ def get_mouse_scroll_settings():
         pass
 
     try:
-        res = subprocess.run(["hyprctl", "getoption", "input:natural_scroll", "-j"], capture_output=True, text=True)
+        res = subprocess.run(["hyprctl", "getoption", "input:natural_scroll", "-j"], capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
             if "bool" in data:
@@ -544,7 +562,7 @@ def parse_default_bindings():
         filepath = os.path.join(DEFAULT_BINDINGS_DIR, fname)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
+                content = f.read(MAX_FILE_BYTES)
         except Exception:
             continue
 
@@ -612,7 +630,7 @@ def parse_user_bindings():
 
     try:
         with open(USER_BINDINGS_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
+            content = f.read(MAX_FILE_BYTES)
             result["raw_content"] = content
     except Exception:
         return result
@@ -806,7 +824,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         backup_path = USER_BINDINGS_PATH + ".bak"
         shutil.copyfile(USER_BINDINGS_PATH, backup_path)
         with open(USER_BINDINGS_PATH, "r", encoding="utf-8") as f:
-            existing_content = f.read()
+            existing_content = f.read(MAX_FILE_BYTES)
 
     current_lines = existing_content.splitlines() if existing_content else []
 
@@ -850,21 +868,22 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     if lines_to_add:
         for entry in lines_to_add:
-            key = normalize_key_chord(entry["key"])
-            desc = entry.get("description", "").replace('"', '\\"')
+            key = normalize_key_chord(entry.get("key", ""))
+            desc = sanitize_lua_str(entry.get("description", ""))
             cmd = entry.get("command", "")
             action = entry.get("action", "")
 
             if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
-                new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()})')
+                new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()[:MAX_CMD_LEN]})')
             elif cmd and (cmd.strip().startswith("{") or cmd.strip().startswith("hl.")):
-                new_lines.append(f'o.bind("{key}", "{desc}", {cmd.strip()})')
+                new_lines.append(f'o.bind("{key}", "{desc}", {cmd.strip()[:MAX_CMD_LEN]})')
             else:
                 raw_cmd = (cmd or action).strip()
                 if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
                     raw_cmd = raw_cmd[1:-1]
-                escaped_cmd = raw_cmd.replace('"', '\\"')
+                escaped_cmd = sanitize_lua_str(raw_cmd)
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
+
 
     final_output = []
     prev_blank = False
@@ -887,8 +906,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 def reload_hyprland():
     """Reload Hyprland configuration and check for errors."""
     try:
-        res = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True)
-        err_res = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True)
+        res = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=10)
+        err_res = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=10)
         return {
             "success": res.returncode == 0,
             "reload_output": res.stdout.strip(),
