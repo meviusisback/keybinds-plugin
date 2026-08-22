@@ -22,6 +22,7 @@ A modern, intuitive graphical frontend plugin for **[Omarchy Linux](https://omar
 - **⚠️ Collision Detection & 1-Click Rebind**: Detects shortcut collisions in real-time, displays detailed conflict cards, and offers 1-click rebind options for colliding actions.
 - **📜 Actions Catalog**: Browse pre-configured Hyprland / Omarchy window management, workspace, media, and system presets ready to bind.
 - **🖱️ Mouse Scroll Sync**: Automatically respects your configured scroll sensitivity multiplier (`scroll_factor`) and direction (`natural_scroll`) from the [Mouse Settings](https://github.com/meviusisback/mouse-settings) plugin (`meviusisback.mouse-settings`).
+- **🔍 Record-to-Find Shortcut Lookup**: Click **Record to Find** next to the search bar and press any key chord on your keyboard to instantly locate its assigned action (or reveal that it's unassigned with a 1-click **+ Create Keybinding** shortcut).
 - **🔄 Safe Lua Sync & Live Reload**: Writes directly to `~/.config/hypr/bindings.lua` (with automatic `.bak` backups) and invokes `hyprctl reload` for instantaneous application without session restarts.
 
 ---

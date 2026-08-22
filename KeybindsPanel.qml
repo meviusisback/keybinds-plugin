@@ -32,6 +32,7 @@ Item {
 
   property bool loading: false
   property string searchQuery: ""
+  property bool recordingSearch: false
   property string currentTab: "active" // "active" | "modified" | "catalog" | "conflicts"
   property string currentCategory: "All"
   property string toastMessage: ""
@@ -134,6 +135,52 @@ Item {
       key
     ]
     disableProc.running = true
+  }
+
+  function translateQtKey(event) {
+    var key = event.key
+    var text = event.text
+
+    if (key === Qt.Key_Return || key === Qt.Key_Enter) return "RETURN"
+    if (key === Qt.Key_Space) return "SPACE"
+    if (key === Qt.Key_Escape) return "ESCAPE"
+    if (key === Qt.Key_Tab || key === Qt.Key_Backtab) return "TAB"
+    if (key === Qt.Key_Backspace) return "BACKSPACE"
+    if (key === Qt.Key_Delete) return "DELETE"
+    if (key === Qt.Key_Print) return "PRINT"
+    if (key === Qt.Key_Left) return "LEFT"
+    if (key === Qt.Key_Right) return "RIGHT"
+    if (key === Qt.Key_Up) return "UP"
+    if (key === Qt.Key_Down) return "DOWN"
+    if (key === Qt.Key_Comma) return "comma"
+    if (key === Qt.Key_Period) return "period"
+    if (key === Qt.Key_Slash) return "slash"
+    if (key === Qt.Key_Minus) return "minus"
+    if (key === Qt.Key_Equal) return "equal"
+    if (key === Qt.Key_BracketLeft) return "bracketleft"
+    if (key === Qt.Key_BracketRight) return "bracketright"
+    if (key === Qt.Key_PageUp) return "Page_Up"
+    if (key === Qt.Key_PageDown) return "Page_Down"
+    if (key === Qt.Key_Home) return "Home"
+    if (key === Qt.Key_End) return "End"
+
+    if (key >= Qt.Key_F1 && key <= Qt.Key_F12) {
+      return "F" + (key - Qt.Key_F1 + 1)
+    }
+
+    if (key >= Qt.Key_0 && key <= Qt.Key_9) {
+      return String.fromCharCode(key)
+    }
+
+    if (key >= Qt.Key_A && key <= Qt.Key_Z) {
+      return String.fromCharCode(key)
+    }
+
+    if (text && text.length === 1 && text.charCodeAt(0) >= 33 && text.charCodeAt(0) <= 126) {
+      return text.toUpperCase()
+    }
+
+    return ""
   }
 
   // Filtered active bindings (sorted alphabetically)
@@ -310,8 +357,47 @@ Item {
       anchors.fill: parent
       focus: true
 
+      Keys.onPressed: function(event) {
+        if (!root.recordingSearch) return
+
+        var isSuper = (event.modifiers & Qt.MetaModifier) !== 0 || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
+        var isCtrl = (event.modifiers & Qt.ControlModifier) !== 0 || event.key === Qt.Key_Control
+        var isAlt = (event.modifiers & Qt.AltModifier) !== 0 || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
+        var isShift = (event.modifiers & Qt.ShiftModifier) !== 0 || event.key === Qt.Key_Shift
+
+        // Escape cancels search recording
+        if (event.key === Qt.Key_Escape && !isSuper && !isCtrl && !isAlt && !isShift) {
+          root.recordingSearch = false
+          event.accepted = true
+          return
+        }
+
+        // Ignore modifier-only keypresses alone
+        if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+          event.accepted = true
+          return
+        }
+
+        var keyName = root.translateQtKey(event)
+        if (keyName.length > 0) {
+          var mods = []
+          if (isSuper) mods.push("SUPER")
+          if (isShift) mods.push("SHIFT")
+          if (isCtrl) mods.push("CTRL")
+          if (isAlt) mods.push("ALT")
+
+          var chord = mods.length > 0 ? (mods.join(" + ") + " + " + keyName) : keyName
+          root.searchQuery = chord
+          searchInput.text = chord
+          root.recordingSearch = false
+          event.accepted = true
+        }
+      }
+
       Keys.onEscapePressed: function(event) {
-        if (editDialog.opened) {
+        if (root.recordingSearch) {
+          root.recordingSearch = false
+        } else if (editDialog.opened) {
           editDialog.close()
         } else {
           root.requestClose()
@@ -361,30 +447,57 @@ Item {
             }
           }
 
-          // Search Bar (Expands flexibly to fill available width)
-          Item {
+          // Search & Record to Find Bar (Expands flexibly)
+          RowLayout {
             Layout.fillWidth: true
-            Layout.preferredHeight: Style.space(38)
+            spacing: Style.space(8)
 
-            TextField {
-              id: searchInput
-              anchors.fill: parent
-              placeholderText: "Search shortcuts, actions, commands..."
-              text: root.searchQuery
-              onTextChanged: root.searchQuery = text
+            Item {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(38)
 
-              // Clear button
-              Button {
-                visible: root.searchQuery.length > 0
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                iconText: "✕"
-                horizontalPadding: Style.space(6)
-                verticalPadding: Style.space(2)
-                onClicked: {
-                  root.searchQuery = ""
-                  searchInput.text = ""
+              TextField {
+                id: searchInput
+                anchors.fill: parent
+                placeholderText: root.recordingSearch
+                  ? "Listening... Press any shortcut combination (e.g. CTRL + O)"
+                  : "Search shortcuts, actions, commands..."
+                text: root.searchQuery
+                onTextChanged: root.searchQuery = text
+
+                // Clear button
+                Button {
+                  visible: root.searchQuery.length > 0
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "✕"
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.space(2)
+                  onClicked: {
+                    root.searchQuery = ""
+                    searchInput.text = ""
+                    root.recordingSearch = false
+                  }
+                }
+              }
+            }
+
+            // Quick Record Shortcut to Find Button
+            Button {
+              id: recordSearchBtn
+              text: root.recordingSearch ? "Listening..." : "Record to Find"
+              iconText: root.recordingSearch ? "⏺" : ""
+              accent: root.recordingSearch ? root.accent : root.foreground
+              selected: root.recordingSearch
+              horizontalPadding: Style.space(12)
+              tooltipText: "Press a key combination on your keyboard to instantly find its assigned action"
+              onClicked: {
+                if (root.recordingSearch) {
+                  root.recordingSearch = false
+                } else {
+                  root.recordingSearch = true
+                  mainContainer.forceActiveFocus()
                 }
               }
             }
@@ -739,14 +852,52 @@ Item {
               }
 
               // Empty state for active list
-              Text {
+              BorderSurface {
                 visible: root.filteredActive.length === 0
-                text: "No keybindings match your filter."
-                color: Util.alpha(root.foreground, 0.4)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.body
-                Layout.alignment: Qt.AlignHCenter
-                Layout.topMargin: Style.space(40)
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(170)
+                radius: Style.cornerRadius
+                color: Util.alpha(root.foreground, 0.02)
+                borderSpec: Border.flat(Util.alpha(root.foreground, 0.1), 1)
+
+                ColumnLayout {
+                  anchors.centerIn: parent
+                  spacing: Style.space(10)
+
+                  Text {
+                    text: root.searchQuery.length > 0
+                      ? ("No keybinding found for \"" + root.searchQuery + "\"")
+                      : "No keybindings match your filter."
+                    color: root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    Layout.alignment: Qt.AlignHCenter
+                  }
+
+                  Text {
+                    visible: root.searchQuery.length > 0
+                    text: "This shortcut combination is currently free and unassigned."
+                    color: Util.alpha(root.foreground, 0.6)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    Layout.alignment: Qt.AlignHCenter
+                  }
+
+                  Button {
+                    visible: root.searchQuery.length > 0
+                    text: "Create Keybinding with " + root.searchQuery
+                    iconText: "➕"
+                    accent: root.accent
+                    selected: true
+                    Layout.alignment: Qt.AlignHCenter
+                    horizontalPadding: Style.space(18)
+                    verticalPadding: Style.space(6)
+                    onClicked: {
+                      editDialog.openCreate({ default_key: root.searchQuery })
+                    }
+                  }
+                }
               }
             }
 
