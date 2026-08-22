@@ -11,6 +11,7 @@ Item {
 
   property string value: ""
   property bool recording: false
+  property string previousValueBeforeRecord: ""
   property color foreground: Color.foreground
   property color background: Color.background
   property color accent: Color.accent
@@ -33,7 +34,9 @@ Item {
   readonly property bool hasConflict: activeConflict !== null
 
   onValueChanged: {
-    parseCurrentValue(root.value)
+    if (!root.recording) {
+      parseCurrentValue(root.value)
+    }
   }
 
   function parseCurrentValue(str) {
@@ -154,12 +157,23 @@ Item {
   }
 
   function startRecording() {
+    root.previousValueBeforeRecord = root.value
+    // Reset all modifier states cleanly for the new recording session
+    root.modSuper = false
+    root.modCtrl = false
+    root.modAlt = false
+    root.modShift = false
+    root.mainKey = ""
     root.recording = true
     keyCaptureFocus.forceActiveFocus()
   }
 
   function stopRecording() {
     root.recording = false
+    if (!root.value && root.previousValueBeforeRecord) {
+      root.value = root.previousValueBeforeRecord
+      parseCurrentValue(root.value)
+    }
   }
 
   function translateQtKey(event) {
@@ -283,7 +297,7 @@ Item {
             }
 
             Text {
-              text: "Listening for keys... Press combination (e.g. CTRL + A)"
+              text: "Listening for keys... Press combination (e.g. CTRL + O)"
               color: root.accent
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -559,31 +573,41 @@ Item {
     Keys.onPressed: function(event) {
       if (!root.recording) return
 
-      var keyName = root.translateQtKey(event)
+      var isSuper = (event.modifiers & Qt.MetaModifier) !== 0 || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
+      var isCtrl = (event.modifiers & Qt.ControlModifier) !== 0 || event.key === Qt.Key_Control
+      var isAlt = (event.modifiers & Qt.AltModifier) !== 0 || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
+      var isShift = (event.modifiers & Qt.ShiftModifier) !== 0 || event.key === Qt.Key_Shift
 
-      if (event.modifiers & Qt.MetaModifier) root.modSuper = true
-      if (event.modifiers & Qt.ShiftModifier) root.modShift = true
-      if (event.modifiers & Qt.ControlModifier) root.modCtrl = true
-      if (event.modifiers & Qt.AltModifier) root.modAlt = true
-
-      // Escape alone without modifiers cancels recording
-      if (event.key === Qt.Key_Escape && !root.modSuper && !root.modCtrl && !root.modAlt && !root.modShift) {
+      // Escape alone without any modifiers cancels recording and restores previous value
+      if (event.key === Qt.Key_Escape && !isSuper && !isCtrl && !isAlt && !isShift) {
         root.stopRecording()
         event.accepted = true
         return
       }
 
-      // Pure modifier keys alone update modifier pills
-      if (event.key === Qt.Key_Control) { root.modCtrl = true; root.composeKey(); event.accepted = true; return }
-      if (event.key === Qt.Key_Shift) { root.modShift = true; root.composeKey(); event.accepted = true; return }
-      if (event.key === Qt.Key_Alt) { root.modAlt = true; root.composeKey(); event.accepted = true; return }
-      if (event.key === Qt.Key_Meta) { root.modSuper = true; root.composeKey(); event.accepted = true; return }
+      // Modifier-only keypress: live update modifier pills
+      if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+        root.modSuper = isSuper
+        root.modCtrl = isCtrl
+        root.modAlt = isAlt
+        root.modShift = isShift
+        root.mainKey = ""
+        root.composeKey()
+        event.accepted = true
+        return
+      }
 
+      var keyName = root.translateQtKey(event)
       if (keyName.length > 0) {
+        // Strictly set the modifiers from the incoming event so old ones are not preserved
+        root.modSuper = (event.modifiers & Qt.MetaModifier) !== 0
+        root.modCtrl = (event.modifiers & Qt.ControlModifier) !== 0
+        root.modAlt = (event.modifiers & Qt.AltModifier) !== 0
+        root.modShift = (event.modifiers & Qt.ShiftModifier) !== 0
         root.mainKey = keyName
         manualKeyField.text = keyName
         root.composeKey()
-        root.stopRecording()
+        root.recording = false
         event.accepted = true
       }
     }
