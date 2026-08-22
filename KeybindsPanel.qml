@@ -447,57 +447,33 @@ Item {
             }
           }
 
-          // Search & Record to Find Bar (Expands flexibly)
-          RowLayout {
+          // Search Bar (Expands flexibly to fill available width)
+          Item {
             Layout.fillWidth: true
-            spacing: Style.space(8)
+            Layout.preferredHeight: Style.space(38)
 
-            Item {
-              Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(38)
+            TextField {
+              id: searchInput
+              anchors.fill: parent
+              placeholderText: root.recordingSearch
+                ? "Listening... Press any shortcut combination (e.g. CTRL + O)"
+                : "Search shortcuts, actions, commands..."
+              text: root.searchQuery
+              onTextChanged: root.searchQuery = text
 
-              TextField {
-                id: searchInput
-                anchors.fill: parent
-                placeholderText: root.recordingSearch
-                  ? "Listening... Press any shortcut combination (e.g. CTRL + O)"
-                  : "Search shortcuts, actions, commands..."
-                text: root.searchQuery
-                onTextChanged: root.searchQuery = text
-
-                // Clear button
-                Button {
-                  visible: root.searchQuery.length > 0
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(6)
-                  anchors.verticalCenter: parent.verticalCenter
-                  iconText: "✕"
-                  horizontalPadding: Style.space(6)
-                  verticalPadding: Style.space(2)
-                  onClicked: {
-                    root.searchQuery = ""
-                    searchInput.text = ""
-                    root.recordingSearch = false
-                  }
-                }
-              }
-            }
-
-            // Quick Record Shortcut to Find Button
-            Button {
-              id: recordSearchBtn
-              text: root.recordingSearch ? "Listening..." : "Record to Find"
-              iconText: root.recordingSearch ? "⏺" : ""
-              accent: root.recordingSearch ? root.accent : root.foreground
-              selected: root.recordingSearch
-              horizontalPadding: Style.space(12)
-              tooltipText: "Press a key combination on your keyboard to instantly find its assigned action"
-              onClicked: {
-                if (root.recordingSearch) {
+              // Clear button
+              Button {
+                visible: root.searchQuery.length > 0
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "✕"
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(2)
+                onClicked: {
+                  root.searchQuery = ""
+                  searchInput.text = ""
                   root.recordingSearch = false
-                } else {
-                  root.recordingSearch = true
-                  mainContainer.forceActiveFocus()
                 }
               }
             }
@@ -574,47 +550,73 @@ Item {
           Item { Layout.fillWidth: true }
         }
 
-        // 3. Category Filter Chips (when in active, modified, or catalog tabs)
-        Flow {
+        // 3. Category Filter Chips & Record to Find on the Right
+        RowLayout {
           visible: root.currentTab !== "conflicts"
           Layout.fillWidth: true
-          spacing: Style.space(6)
+          spacing: Style.space(12)
 
-          Repeater {
-            model: root.categories
+          Flow {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
 
-            BorderSurface {
-              id: chip
-              required property string modelData
-              height: Style.space(26)
-              width: chipLabel.implicitWidth + Style.space(20)
-              radius: Style.cornerRadius
-              readonly property bool isSelected: root.currentCategory === modelData
+            Repeater {
+              model: root.categories
 
-              color: isSelected
-                ? Util.alpha(root.accent, 0.22)
-                : (chipMouseArea.containsMouse ? Util.alpha(root.foreground, 0.08) : Util.alpha(root.foreground, 0.04))
-              borderSpec: Border.flat(
-                isSelected ? root.accent : Util.alpha(root.foreground, 0.15),
-                1
-              )
+              BorderSurface {
+                id: chip
+                required property string modelData
+                height: Style.space(26)
+                width: chipLabel.implicitWidth + Style.space(20)
+                radius: Style.cornerRadius
+                readonly property bool isSelected: root.currentCategory === modelData
 
-              MouseArea {
-                id: chipMouseArea
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.currentCategory = chip.modelData
+                color: isSelected
+                  ? Util.alpha(root.accent, 0.22)
+                  : (chipMouseArea.containsMouse ? Util.alpha(root.foreground, 0.08) : Util.alpha(root.foreground, 0.04))
+                borderSpec: Border.flat(
+                  isSelected ? root.accent : Util.alpha(root.foreground, 0.15),
+                  1
+                )
+
+                MouseArea {
+                  id: chipMouseArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.currentCategory = chip.modelData
+                }
+
+                Text {
+                  id: chipLabel
+                  anchors.centerIn: parent
+                  text: chip.modelData
+                  color: chip.isSelected ? root.accent : root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: chip.isSelected
+                }
               }
+            }
+          }
 
-              Text {
-                id: chipLabel
-                anchors.centerIn: parent
-                text: chip.modelData
-                color: chip.isSelected ? root.accent : root.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: chip.isSelected
+          // Record to Find Shortcut Button pinned to the right hand side
+          Button {
+            id: recordSearchBtn
+            text: root.recordingSearch ? "Listening..." : "Record to Find"
+            iconText: root.recordingSearch ? "⏺" : ""
+            accent: root.recordingSearch ? root.accent : root.foreground
+            selected: root.recordingSearch
+            horizontalPadding: Style.space(14)
+            verticalPadding: Style.space(4)
+            Layout.alignment: Qt.AlignVCenter | Qt.AlignRight
+            tooltipText: "Press a key combination on your keyboard to instantly find its assigned action"
+            onClicked: {
+              if (root.recordingSearch) {
+                root.recordingSearch = false
+              } else {
+                root.recordingSearch = true
+                mainContainer.forceActiveFocus()
               }
             }
           }
