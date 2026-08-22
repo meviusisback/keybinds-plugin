@@ -26,10 +26,11 @@ mkdir -p "$DESKTOP_DIR"
 cp "$REPO_DIR/meviusisback.keybinds.desktop" "$DESKTOP_DIR/meviusisback.keybinds.desktop"
 echo "✓ Desktop entry installed to $DESKTOP_DIR/meviusisback.keybinds.desktop"
 
-# 4. Rescan plugins in omarchy-shell
+# 4. Refresh plugin state safely (dismiss any open instance before rescan to avoid hot-reload crash)
 if which omarchy-shell >/dev/null 2>&1; then
+  omarchy-shell shell hide "$PLUGIN_ID" >/dev/null 2>&1 || true
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-  echo "✓ Rescanned Omarchy shell plugins"
+  echo "✓ Refreshed Omarchy shell plugin state"
 fi
 
 echo "==> Omarchy Keybindings Plugin installed successfully!"
