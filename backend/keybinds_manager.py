@@ -13,6 +13,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 import tempfile
+import stat
 
 DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
 USER_BINDINGS_PATH = os.path.expanduser("~/.config/hypr/bindings.lua")
@@ -839,24 +840,38 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     os.makedirs(cfg_dir, exist_ok=True)
 
     existing_content = ""
-    if os.path.isfile(USER_BINDINGS_PATH):
-        # Atomic symlink rejection: O_NOFOLLOW makes the kernel refuse to open
-        # a symlink, eliminating the check/use race of a pathname islink test.
+    # Open the source directly (no isfile() pre-check -> no TOCTOU window in
+    # which a FIFO could be swapped in to block the open indefinitely).
+    try:
+        src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        src_fd = None
+    except OSError:
+        raise ValueError(f"refusing to operate on non-regular/symlink path: {USER_BINDINGS_PATH}")
+    if src_fd is not None:
         try:
-            src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
-            raise ValueError(f"refusing to operate on symlink: {USER_BINDINGS_PATH}")
-        with os.fdopen(src_fd, "r", encoding="utf-8") as f:
-            existing_content = f.read(MAX_FILE_BYTES)
+            if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+                os.close(src_fd)
+                raise ValueError(f"refusing non-regular file: {USER_BINDINGS_PATH}")
+            with os.fdopen(src_fd, "r", encoding="utf-8") as f:
+                existing_content = f.read(MAX_FILE_BYTES)
+        except BaseException:
+            raise
         backup_path = USER_BINDINGS_PATH + ".bak"
         try:
-            bak_fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            bak_fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
         except OSError:
-            raise ValueError(f"refusing to operate on symlink: {backup_path}")
-        with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
-            bak_f.write(existing_content)
-            bak_f.flush()
-            os.fsync(bak_f.fileno())
+            raise ValueError(f"refusing to operate on non-regular/symlink path: {backup_path}")
+        try:
+            if not stat.S_ISREG(os.fstat(bak_fd).st_mode):
+                os.close(bak_fd)
+                raise ValueError(f"refusing non-regular file: {backup_path}")
+            with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
+                bak_f.write(existing_content)
+                bak_f.flush()
+                os.fsync(bak_f.fileno())
+        except BaseException:
+            raise
 
     current_lines = existing_content.splitlines() if existing_content else []
 
