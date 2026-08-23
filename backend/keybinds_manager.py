@@ -858,19 +858,23 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         except BaseException:
             raise
         backup_path = USER_BINDINGS_PATH + ".bak"
+        # Write the backup through a unique temp file and atomically replace,
+        # instead of O_TRUNC on the predictable .bak path. This avoids
+        # truncating an existing inode, so a planted hard link / symlink at
+        # that path cannot destroy another file's contents.
+        bak_fd, bak_tmp = tempfile.mkstemp(dir=cfg_dir, prefix=".bindings_", suffix=".bak.tmp")
         try:
-            bak_fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
-        except OSError:
-            raise ValueError(f"refusing to operate on non-regular/symlink path: {backup_path}")
-        try:
-            if not stat.S_ISREG(os.fstat(bak_fd).st_mode):
-                os.close(bak_fd)
-                raise ValueError(f"refusing non-regular file: {backup_path}")
             with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
                 bak_f.write(existing_content)
                 bak_f.flush()
                 os.fsync(bak_f.fileno())
+            os.replace(bak_tmp, backup_path)
         except BaseException:
+            if os.path.exists(bak_tmp):
+                try:
+                    os.unlink(bak_tmp)
+                except OSError:
+                    pass
             raise
 
     current_lines = existing_content.splitlines() if existing_content else []
