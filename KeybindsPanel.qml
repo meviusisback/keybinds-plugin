@@ -871,8 +871,8 @@ Item {
                   Text {
                     text: root.searchQuery.length > 0
                       ? ("No keybinding found for \"" + root.searchQuery + "\"")
-                    textFormat: Text.PlainText
                       : "No keybindings match your filter."
+                    textFormat: Text.PlainText
                     color: root.foreground
                     font.family: Style.font.family
                     font.pixelSize: Style.font.body
