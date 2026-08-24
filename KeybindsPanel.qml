@@ -337,8 +337,12 @@ Item {
   }
 
   // Main Window
+  // Start hidden: keepLoaded mounts this panel at every shell startup, and
+  // Quickshell windows default to visible. Only open() may reveal it
+  // (same contract as first-party overlays' `visible: root.opened`).
   FloatingWindow {
     id: window
+    visible: false
     title: "Keybindings"
     color: root.background
     implicitWidth: Style.space(1000)
