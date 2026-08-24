@@ -45,9 +45,17 @@ The plugin is then available via `omarchy-shell shell summon meviusisback.keybin
 2. Search by shortcut (e.g. `SUPER + W`), action name (e.g. `Terminal`), category, or command.
 
 ### From the Terminal
-Launch the GUI directly:
+
+The plugin's `bin/` directory is **not** on `PATH` by default — Omarchy only puts
+`/usr/share/omarchy/bin` there. Either call the wrapper by its installed path:
 ```bash
-omarchy-keybinds
+~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds
+```
+or link it once into your personal bin (the wrapper resolves symlinks correctly):
+```bash
+mkdir -p ~/.local/bin
+ln -s ~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds ~/.local/bin/omarchy-keybinds
+omarchy-keybinds   # launch the GUI directly
 ```
 Or summon via the shell IPC:
 ```bash
@@ -61,6 +69,9 @@ omarchy-shell shell summon meviusisback.keybinds '{}'
 The plugin includes a full-featured CLI backend engine:
 
 ```bash
+# One-time setup if you want the short command name (see "From the Terminal"):
+#   ln -s ~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds ~/.local/bin/omarchy-keybinds
+
 # List all active keybindings, presets, conflicts, and mouse settings in JSON
 omarchy-keybinds list
 

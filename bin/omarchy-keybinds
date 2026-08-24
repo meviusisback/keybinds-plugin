@@ -2,7 +2,7 @@
 # omarchy:summary=Graphical frontend to view, search, modify, and create Hyprland keybindings.
 
 PLUGIN_ID="meviusisback.keybinds"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
   echo "Usage: omarchy-keybinds [list|set|reset|disable|--print]"
