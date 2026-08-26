@@ -640,13 +640,13 @@ Item {
             acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
             onWheel: function(event) {
               var factor = (root.modelData.mouse_settings && root.modelData.mouse_settings.scroll_factor) || 1.0
-              var natural = Boolean(root.modelData.mouse_settings && root.modelData.mouse_settings.natural_scroll)
 
               var dy = event.angleDelta.y
               if (dy === 0) dy = event.pixelDelta.y
 
-              var direction = natural ? -1 : 1
-              var step = (dy / 120.0) * 100.0 * factor * direction
+              // natural_scroll is applied by libinput before the event reaches the
+              // client, so re-inverting here would double-flip the axis.
+              var step = (dy / 120.0) * 100.0 * factor
 
               var flick = scrollArea.contentItem
               if (flick && flick.contentY !== undefined) {
