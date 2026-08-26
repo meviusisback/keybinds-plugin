@@ -36,15 +36,91 @@ def sanitize_lua_str(s: str) -> str:
     if len(s) > MAX_TEXT_LEN:
         s = s[:MAX_TEXT_LEN]
     return s.replace("\\", "\\\\").replace('"', '\\"')
-def _refuse_if_symlink(path: str) -> None:
-    """Hardening: refuse to read/write through a symlink at the config path.
 
-    Prevents a local TOCTOU/symlink redirect where a crafted symlink at
-    ~/.config/hypr/bindings.lua (or its .bak/.tmp) points at an arbitrary
-    file that the write would then truncate or overwrite.
+
+# Pre-compiled regex for the o.bind() header: matches the function call
+# up to and including the opening of the 3rd argument.
+_BIND_HEADER_RE = re.compile(
+    r"o\.bind(?:_toggle)?\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*"
+    r"(?:[\"']([^\"']+)[\"']|nil)\s*,\s*"
+)
+
+
+def _parse_bind_line(line: str):
+    """Extract (raw_key, desc, action, opts) from an o.bind() or o.bind_toggle() line.
+
+    Uses parenthesis/brace depth tracking instead of a single regex to
+    correctly handle actions containing nested parentheses and curly
+    braces (e.g. ``hl.dsp.window.move({ direction = "left" })``).
     """
-    if os.path.islink(path):
-        raise ValueError(f"refusing to operate on symlink: {path}")
+    m = _BIND_HEADER_RE.match(line)
+    if not m:
+        return None
+
+    raw_key = m.group(1).strip()
+    desc = (m.group(2) or "").strip()
+    pos = m.end()
+
+    depth_paren = 0
+    depth_brace = 0
+    in_string = None
+    escape_next = False
+    action_start = pos
+
+    while pos < len(line):
+        ch = line[pos]
+
+        if escape_next:
+            escape_next = False
+            pos += 1
+            continue
+
+        if ch == '\\' and in_string:
+            escape_next = True
+            pos += 1
+            continue
+
+        if ch == '"' or ch == "'":
+            if not in_string:
+                in_string = ch
+            elif in_string == ch:
+                in_string = None
+            pos += 1
+            continue
+
+        if in_string:
+            pos += 1
+            continue
+
+        if ch == '(':
+            depth_paren += 1
+        elif ch == ')':
+            if depth_paren > 0:
+                depth_paren -= 1
+            else:
+                break  # closes o.bind()
+        elif ch == '{':
+            depth_brace += 1
+        elif ch == '}':
+            depth_brace -= 1
+        elif ch == ',' and depth_paren == 0 and depth_brace == 0:
+            break  # separator before opts
+
+        pos += 1
+
+    action = line[action_start:pos].strip()
+
+    opts = None
+    if pos < len(line) and line[pos] == ',':
+        opts_start = pos + 1
+        opts_text = line[opts_start:].rstrip()
+        if opts_text.endswith(')'):
+            opts_text = opts_text[:-1].strip()
+        if opts_text:
+            opts = opts_text
+
+    return raw_key, desc, action, opts
+
 
 
 PRESET_CATALOG = [
@@ -585,16 +661,16 @@ def parse_default_bindings():
         except Exception:
             continue
 
-        matches = re.finditer(
-            r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']\s*,\s*(?:["\']([^"\']+)["\']|nil)\s*,\s*([^,\n\)]+(?:\([^)]*\)|{[^}]*})?)\s*(?:,\s*([^\n\)]+))?\)',
-            content,
-        )
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('--'):
+                continue
 
-        for m in matches:
-            raw_key = m.group(1).strip()
-            desc = (m.group(2) or "").strip()
-            action_raw = m.group(3).strip()
-            opts_raw = (m.group(4) or "").strip()
+            parsed = _parse_bind_line(stripped)
+            if not parsed:
+                continue
+
+            raw_key, desc, action_raw, opts_raw = parsed
 
             norm_key = normalize_key_chord(raw_key)
             if not desc:
@@ -615,7 +691,7 @@ def parse_default_bindings():
             elif base == "voxtype":
                 cat = "AI & Voice"
 
-            is_release = "on_release = true" in opts_raw or "on_release=true" in opts_raw
+            is_release = opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw)
 
             bindings.append({
                 "source": "default",
@@ -625,7 +701,7 @@ def parse_default_bindings():
                 "description": desc,
                 "action": action_raw,
                 "category": cat,
-                "is_mouse": "mouse" in raw_key.lower() or "mouse" in opts_raw,
+                "is_mouse": "mouse" in raw_key.lower() or "mouse" in (opts_raw or ""),
                 "is_release": is_release,
             })
 
@@ -665,15 +741,9 @@ def parse_user_bindings():
             result["unbinds"].add(normalize_key_chord(raw_key))
             continue
 
-        m_bind = re.match(
-            r'o\.bind\s*\(\s*["\']([^"\']+)["\']\s*,\s*(?:["\']([^"\']+)["\']|nil)\s*,\s*([^,\n\)]+(?:\([^)]*\)|{[^}]*})?)\s*(?:,\s*([^\n\)]+))?\)',
-            stripped,
-        )
-        if m_bind:
-            raw_key = m_bind.group(1).strip()
-            desc = (m_bind.group(2) or "").strip()
-            action_raw = m_bind.group(3).strip()
-            opts_raw = (m_bind.group(4) or "").strip()
+        parsed = _parse_bind_line(stripped)
+        if parsed:
+            raw_key, desc, action_raw, opts_raw = parsed
             norm_key = normalize_key_chord(raw_key)
 
             entry = {
@@ -682,8 +752,8 @@ def parse_user_bindings():
                 "raw_key": raw_key,
                 "description": desc or action_raw.strip('"\''),
                 "action": action_raw,
-                "is_mouse": "mouse" in raw_key.lower() or "mouse" in opts_raw,
-                "is_release": "on_release = true" in opts_raw or "on_release=true" in opts_raw,
+                "is_mouse": "mouse" in raw_key.lower() or "mouse" in (opts_raw or ""),
+                "is_release": opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw),
             }
 
             if entry["is_mouse"]:
@@ -903,7 +973,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             if m_unbind and normalize_key_chord(m_unbind.group(1)) in clean_keys:
                 is_targeted = True
 
-            m_bind = re.match(r'o\.bind\s*\(\s*["\']([^"\']+)["\']', stripped)
+            m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', stripped)
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
                 is_targeted = True
 
