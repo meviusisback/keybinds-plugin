@@ -1,5 +1,7 @@
 # Omarchy Keybindings Plugin (`meviusisback.keybinds`)
 
+![](infographic.png)
+
 [![Omarchy Linux](https://img.shields.io/badge/Omarchy-Hyprland%20Plugin-blue)](https://omarchy.org)
 [![Quickshell](https://img.shields.io/badge/Frontend-Quickshell%20%2F%20QML-orange)](https://quickshell.outfoxxed.me/)
 [![Python 3.10+](https://img.shields.io/badge/Backend-Python%203-green)](https://python.org)
