@@ -40,6 +40,7 @@ Item {
 
   // Menu entry setup (first-run)
   property bool menuEntryChecked: false
+  property bool launcherEntryInstalled: false
 
   readonly property var categories: [
     "All",
@@ -352,6 +353,7 @@ Item {
       onStreamFinished: {
         try {
           var parsed = JSON.parse(text)
+          root.launcherEntryInstalled = parsed.exists
           if (!parsed.exists) {
             menuSetupDialog.opened = true
           }
@@ -372,6 +374,7 @@ Item {
         try {
           var parsed = JSON.parse(text)
           if (parsed.success) {
+            root.launcherEntryInstalled = true
             root.showToast(parsed.message || "Added Keybindings Manager to launcher!")
             refreshMenuProc.running = true
           } else {
@@ -390,6 +393,29 @@ Item {
   Process {
     id: refreshMenuProc
     command: ["omarchy-menu", "refresh"]
+  }
+
+  Process {
+    id: menuRemoveProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-remove"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          if (parsed.success) {
+            root.launcherEntryInstalled = false
+            root.showToast(parsed.message || "Removed from launcher.")
+            refreshMenuProc.running = true
+          } else {
+            root.showToast(parsed.message || "Failed to remove menu entry.")
+          }
+        } catch (e) {
+          console.warn("KeybindsPanel: Failed to parse menu-remove json:", e)
+          root.showToast("Failed to remove menu entry.")
+        }
+      }
+    }
   }
 
   // Main Window
@@ -559,10 +585,28 @@ Item {
             }
 
             Button {
-              iconText: ""
+              iconText: ""
               tooltipText: "Edit bindings.lua in Editor"
               horizontalPadding: Style.space(10)
               onClicked: Util.execDetached("omarchy-launch-config-editor $HOME/.config/hypr/bindings.lua")
+            }
+
+            Button {
+              text: root.launcherEntryInstalled ? "✓ In Launcher" : "📋 Add to Launcher"
+              iconText: root.launcherEntryInstalled ? "✓" : "📋"
+              tooltipText: root.launcherEntryInstalled
+                ? "Remove Keybindings Manager from Omarchy launcher"
+                : "Add Keybindings Manager to Omarchy launcher"
+              horizontalPadding: Style.space(10)
+              onClicked: {
+                if (root.launcherEntryInstalled) {
+                  menuRemoveProc.running = false
+                  menuRemoveProc.running = true
+                } else {
+                  menuSetupWriteProc.running = false
+                  menuSetupWriteProc.running = true
+                }
+              }
             }
           }
         }
