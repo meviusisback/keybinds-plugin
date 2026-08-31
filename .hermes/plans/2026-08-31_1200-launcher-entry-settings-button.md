@@ -88,3 +88,9 @@ Mention the manual launcher entry option in the Usage section.
 - `python3 backend/keybinds_manager.py menu-install` — idempotent
 - `python3 backend/keybinds_manager.py menu-remove` — removes entry
 - `python3 -m unittest discover -s tests -p "test_*.py"` — existing tests pass
+
+## Security Review Verdict: ✅ PASS
+- 3 base reviewers dispatched: all returned `passed: true`
+- 1 medium finding fixed: missing `.running = false` guard on button click (race condition)
+- 0 critical/high findings
+- Low-severity findings noted: TOCTOU on rapid clicks (mitigated by atomic writes), naive JSONC stripping (existing behavior), unhandled ValueError on symlink path (edge case)
