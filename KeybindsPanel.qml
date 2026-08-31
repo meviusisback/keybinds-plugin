@@ -38,6 +38,9 @@ Item {
   property string toastMessage: ""
   property bool toastVisible: false
 
+  // Menu entry setup (first-run)
+  property bool menuEntryChecked: false
+
   readonly property var categories: [
     "All",
     "Window Management",
@@ -51,6 +54,14 @@ Item {
     closingFromHost = false
     window.visible = true
     loadData()
+    // First-run menu entry setup
+    if (!menuEntryChecked) {
+      menuSetupCheckProc.command = [
+        "bash", "-c",
+        'grep -q setup.keybindings.gui "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" 2>/dev/null && echo exists || true'
+      ]
+      menuSetupCheckProc.running = true
+    }
     Qt.callLater(function() {
       if (searchInput) searchInput.forceActiveFocus()
     })
@@ -334,6 +345,39 @@ Item {
         root.showToast("Keybinding disabled!")
       }
     }
+  }
+
+  // --- First-run: menu entry setup ---
+  Process {
+    id: menuSetupCheckProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // exitCode 0 from grep = entry exists; the echo ensures onStreamFinished fires
+        if (text.trim() !== "exists") {
+          menuSetupDialog.opened = true
+        }
+        menuEntryChecked = true
+      }
+    }
+  }
+
+  Process {
+    id: menuSetupWriteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        menuEntryChecked = true
+        menuSetupDialog.opened = false
+        root.showToast("Added Keybindings Manager to launcher!")
+        refreshMenuProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: refreshMenuProc
+    command: ["omarchy-menu", "refresh"]
   }
 
   // Main Window
@@ -1403,6 +1447,25 @@ Item {
               font.bold: true
             }
           }
+        }
+      }
+
+      // First-run: Add to Omarchy launcher
+      ConfirmDialog {
+        id: menuSetupDialog
+        anchors.fill: parent
+        message: "Add \"Keybindings Manager\" to your Omarchy launcher?\n\nYou'll find it under Setup \u203A Keybindings."
+        confirmText: "Add"
+        cancelText: "Not now"
+        onConfirmed: {
+          menuSetupWriteProc.command = [
+            "bash", "-c",
+            'grep -q setup.keybindings.gui "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" 2>/dev/null || cat > "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" << \'MENU\'\n{\n  // Keybindings Manager \u2014 added by meviusisback.keybinds\n  "setup.keybindings.gui": { "icon": "\uf464", "label": "Keybindings Manager", "action": "omarchy-shell shell summon meviusisback.keybinds" },\n}\nMENU'
+          ]
+          menuSetupWriteProc.running = true
+        }
+        onCanceled: {
+          menuEntryChecked = true
         }
       }
 

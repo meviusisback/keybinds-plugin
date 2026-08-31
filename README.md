@@ -36,7 +36,7 @@ Install directly from the marketplace with the Omarchy CLI (it clones and links 
 omarchy plugin add https://github.com/meviusisback/keybinds-plugin --enable
 ```
 
-The plugin is then available via `omarchy-shell shell summon meviusisback.keybinds`.
+On first launch, the plugin will offer to add a **Keybindings Manager** entry to your Omarchy launcher (Setup → Keybindings → Keybindings Manager). You can accept or dismiss this — it only asks once per session.
 
 ---
 
