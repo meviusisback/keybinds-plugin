@@ -30,6 +30,16 @@ MAX_FILE_BYTES = 65_536  # 64 KiB cap on any single config file read
 MAX_DIR_FILES = 256  # ceiling on enumerated default-binding files
 MAX_TOTAL_READ = 2_097_152  # 2 MiB cumulative cap across the default-bindings dir
 
+MENU_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/extensions/omarchy-menu.jsonc")
+MENU_ENTRY_KEY = "setup.keybindings.gui"
+MENU_ENTRY_VALUE = {
+    "icon": "\uf464",
+    "label": "Keybindings Manager",
+    "action": "omarchy-shell shell summon meviusisback.keybinds",
+}
+_JSONC_LINE_COMMENT_RE = re.compile(r'//.*$')
+_JSONC_BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.DOTALL)
+
 def sanitize_lua_str(s: str) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
     s = (s or "").replace("\r", " ").replace("\n", " ")
@@ -1131,6 +1141,87 @@ def enable_keybinding(key: str):
     return {"success": reload_status.get("success", False), "key": norm_key, "reload": reload_status}
 
 
+def _strip_jsonc_comments(text: str) -> str:
+    """Remove JSONC (JSON with Comments) style comments."""
+    text = _JSONC_BLOCK_COMMENT_RE.sub('', text)
+    lines = []
+    for line in text.splitlines():
+        lines.append(_JSONC_LINE_COMMENT_RE.sub('', line))
+    return '\n'.join(lines)
+
+
+def _safe_read_regular_file(path: str):
+    """Open path with O_NOFOLLOW | O_NONBLOCK, verify S_ISREG, return contents or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError(f"refusing to operate on non-regular/symlink path: {path}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"refusing non-regular file: {path}")
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            return f.read(MAX_FILE_BYTES)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _safe_atomic_write_file(path: str, content: str):
+    """Write content to path atomically via a temp file in the same directory."""
+    dir_name = os.path.dirname(path) or "."
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".menu_", suffix=".jsonc.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+
+def check_menu_entry():
+    """Return whether the launcher menu entry already exists."""
+    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+    if contents is None:
+        return {"exists": False}
+    try:
+        stripped = _strip_jsonc_comments(contents)
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    return {"exists": MENU_ENTRY_KEY in data}
+
+
+def install_menu_entry():
+    """Safely add the launcher menu entry without destroying existing entries."""
+    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+    data = {}
+    if contents is not None:
+        try:
+            stripped = _strip_jsonc_comments(contents)
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+    if MENU_ENTRY_KEY in data:
+        return {"success": True, "message": "Menu entry already exists."}
+    data[MENU_ENTRY_KEY] = dict(MENU_ENTRY_VALUE)
+    out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _safe_atomic_write_file(MENU_CONFIG_PATH, out)
+    return {"success": True, "message": "Added Keybindings Manager to launcher."}
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps(build_complete_model(), indent=2))
@@ -1180,6 +1271,14 @@ def main():
 
     elif cmd == "reload":
         res = reload_hyprland()
+        print(json.dumps(res))
+
+    elif cmd == "menu-check":
+        res = check_menu_entry()
+        print(json.dumps(res))
+
+    elif cmd == "menu-install":
+        res = install_menu_entry()
         print(json.dumps(res))
 
     else:

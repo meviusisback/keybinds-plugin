@@ -38,6 +38,9 @@ Item {
   property string toastMessage: ""
   property bool toastVisible: false
 
+  // Menu entry setup (first-run)
+  property bool menuEntryChecked: false
+
   readonly property var categories: [
     "All",
     "Window Management",
@@ -51,6 +54,10 @@ Item {
     closingFromHost = false
     window.visible = true
     loadData()
+    // First-run menu entry setup
+    if (!menuEntryChecked) {
+      menuSetupCheckProc.running = true
+    }
     Qt.callLater(function() {
       if (searchInput) searchInput.forceActiveFocus()
     })
@@ -334,6 +341,55 @@ Item {
         root.showToast("Keybinding disabled!")
       }
     }
+  }
+
+  // --- First-run: menu entry setup ---
+  Process {
+    id: menuSetupCheckProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-check"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          if (!parsed.exists) {
+            menuSetupDialog.opened = true
+          }
+        } catch (e) {
+          console.warn("KeybindsPanel: Failed to parse menu-check json:", e)
+        }
+        menuEntryChecked = true
+      }
+    }
+  }
+
+  Process {
+    id: menuSetupWriteProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-install"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          if (parsed.success) {
+            root.showToast(parsed.message || "Added Keybindings Manager to launcher!")
+            refreshMenuProc.running = true
+          } else {
+            root.showToast(parsed.message || "Failed to add menu entry.")
+          }
+        } catch (e) {
+          console.warn("KeybindsPanel: Failed to parse menu-install json:", e)
+          root.showToast("Failed to add menu entry.")
+        }
+        menuEntryChecked = true
+        menuSetupDialog.opened = false
+      }
+    }
+  }
+
+  Process {
+    id: refreshMenuProc
+    command: ["omarchy-menu", "refresh"]
   }
 
   // Main Window
@@ -1403,6 +1459,21 @@ Item {
               font.bold: true
             }
           }
+        }
+      }
+
+      // First-run: Add to Omarchy launcher
+      ConfirmDialog {
+        id: menuSetupDialog
+        anchors.fill: parent
+        message: "Add \"Keybindings Manager\" to your Omarchy launcher?\n\nYou'll find it under Setup \u203A Keybindings."
+        confirmText: "Add"
+        cancelText: "Not now"
+        onConfirmed: {
+          menuSetupWriteProc.running = true
+        }
+        onCanceled: {
+          menuEntryChecked = true
         }
       }
 
