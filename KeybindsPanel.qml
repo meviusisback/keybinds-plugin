@@ -592,8 +592,8 @@ Item {
             }
 
             Button {
-              text: root.launcherEntryInstalled ? "✓ In Launcher" : "📋 Add to Launcher"
-              iconText: root.launcherEntryInstalled ? "✓" : "📋"
+              text: root.launcherEntryInstalled ? "In Launcher" : "Add to Launcher"
+              iconText: "🚀"
               tooltipText: root.launcherEntryInstalled
                 ? "Remove Keybindings Manager from Omarchy launcher"
                 : "Add Keybindings Manager to Omarchy launcher"
