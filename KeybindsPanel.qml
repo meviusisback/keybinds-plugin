@@ -600,8 +600,10 @@ Item {
               horizontalPadding: Style.space(10)
               onClicked: {
                 if (root.launcherEntryInstalled) {
+                  menuRemoveProc.running = false
                   menuRemoveProc.running = true
                 } else {
+                  menuSetupWriteProc.running = false
                   menuSetupWriteProc.running = true
                 }
               }

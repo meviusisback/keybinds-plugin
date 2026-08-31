@@ -36,7 +36,7 @@ Install directly from the marketplace with the Omarchy CLI (it clones and links 
 omarchy plugin add https://github.com/meviusisback/keybinds-plugin --enable
 ```
 
-On first launch, the plugin will offer to add a **Keybindings Manager** entry to your Omarchy launcher (Setup → Keybindings → Keybindings Manager). You can accept or dismiss this — it only asks once per session.
+On first launch, the plugin will offer to add a **Keybindings Manager** entry to your Omarchy launcher (Setup → Keybindings → Keybindings Manager). You can accept or dismiss this — it only asks once per session. You can also toggle this anytime from the **📋 Add to Launcher** / **✓ In Launcher** button in the app's header bar.
 
 ---
 
