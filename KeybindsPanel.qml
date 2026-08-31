@@ -56,10 +56,6 @@ Item {
     loadData()
     // First-run menu entry setup
     if (!menuEntryChecked) {
-      menuSetupCheckProc.command = [
-        "bash", "-c",
-        'grep -q setup.keybindings.gui "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" 2>/dev/null && echo exists || true'
-      ]
       menuSetupCheckProc.running = true
     }
     Qt.callLater(function() {
@@ -350,12 +346,17 @@ Item {
   // --- First-run: menu entry setup ---
   Process {
     id: menuSetupCheckProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-check"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        // exitCode 0 from grep = entry exists; the echo ensures onStreamFinished fires
-        if (text.trim() !== "exists") {
-          menuSetupDialog.opened = true
+        try {
+          var parsed = JSON.parse(text)
+          if (!parsed.exists) {
+            menuSetupDialog.opened = true
+          }
+        } catch (e) {
+          console.warn("KeybindsPanel: Failed to parse menu-check json:", e)
         }
         menuEntryChecked = true
       }
@@ -364,13 +365,24 @@ Item {
 
   Process {
     id: menuSetupWriteProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-install"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          if (parsed.success) {
+            root.showToast(parsed.message || "Added Keybindings Manager to launcher!")
+            refreshMenuProc.running = true
+          } else {
+            root.showToast(parsed.message || "Failed to add menu entry.")
+          }
+        } catch (e) {
+          console.warn("KeybindsPanel: Failed to parse menu-install json:", e)
+          root.showToast("Failed to add menu entry.")
+        }
         menuEntryChecked = true
         menuSetupDialog.opened = false
-        root.showToast("Added Keybindings Manager to launcher!")
-        refreshMenuProc.running = true
       }
     }
   }
@@ -1458,10 +1470,6 @@ Item {
         confirmText: "Add"
         cancelText: "Not now"
         onConfirmed: {
-          menuSetupWriteProc.command = [
-            "bash", "-c",
-            'grep -q setup.keybindings.gui "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" 2>/dev/null || cat > "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc" << \'MENU\'\n{\n  // Keybindings Manager \u2014 added by meviusisback.keybinds\n  "setup.keybindings.gui": { "icon": "\uf464", "label": "Keybindings Manager", "action": "omarchy-shell shell summon meviusisback.keybinds" },\n}\nMENU'
-          ]
           menuSetupWriteProc.running = true
         }
         onCanceled: {
