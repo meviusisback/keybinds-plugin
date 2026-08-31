@@ -1222,6 +1222,24 @@ def install_menu_entry():
     return {"success": True, "message": "Added Keybindings Manager to launcher."}
 
 
+def remove_menu_entry():
+    """Safely remove the launcher menu entry if present."""
+    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+    if contents is None:
+        return {"success": True, "message": "Config file not found — nothing to remove."}
+    try:
+        stripped = _strip_jsonc_comments(contents)
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    if MENU_ENTRY_KEY not in data:
+        return {"success": True, "message": "Menu entry not present — nothing to remove."}
+    del data[MENU_ENTRY_KEY]
+    out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _safe_atomic_write_file(MENU_CONFIG_PATH, out)
+    return {"success": True, "message": "Removed Keybindings Manager from launcher."}
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps(build_complete_model(), indent=2))
@@ -1279,6 +1297,10 @@ def main():
 
     elif cmd == "menu-install":
         res = install_menu_entry()
+        print(json.dumps(res))
+
+    elif cmd == "menu-remove":
+        res = remove_menu_entry()
         print(json.dumps(res))
 
     else:
