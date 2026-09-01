@@ -160,6 +160,104 @@ class TestKeybindsBackend(unittest.TestCase):
             if os.path.exists(tmp_path + ".bak"):
                 os.remove(tmp_path + ".bak")
 
+    def test_swap_two_keybindings_preserves_first(self):
+        """Swapping two bindings' keys must keep the first binding's freshly written line.
+        Regression for issue #11 -- the second edit's old_key equals the key the first
+        edit just bound to, and key-only removal was dropping it as collateral."""
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua") as tmp:
+            tmp_path = tmp.name
+
+        orig_defaults = keybinds_manager.parse_default_bindings
+        orig_reload = keybinds_manager.reload_hyprland
+        orig_path = keybinds_manager.USER_BINDINGS_PATH
+        try:
+            keybinds_manager.USER_BINDINGS_PATH = tmp_path
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + F", "description": "Full screen",
+                 "action": 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'},
+                {"key": "SUPER + ALT + F", "description": "Full width",
+                 "action": 'hl.dsp.window.fullscreen({ mode = "maximized" })'},
+            ]
+            keybinds_manager.reload_hyprland = lambda: {"success": True, "reload_output": "", "config_errors": ""}
+
+            with open(tmp_path, "w") as f:
+                f.write("")
+
+            # Step 2: move "Full screen" SUPER + F -> SUPER + ALT + F
+            keybinds_manager.set_keybinding(
+                key="SUPER + ALT + F", description="Full screen", command="",
+                action='hl.dsp.window.fullscreen({ mode = "fullscreen" })', old_key="SUPER + F")
+            # Step 3: move "Full width" SUPER + ALT + F -> SUPER + F (the swap)
+            keybinds_manager.set_keybinding(
+                key="SUPER + F", description="Full width", command="",
+                action='hl.dsp.window.fullscreen({ mode = "maximized" })', old_key="SUPER + ALT + F")
+
+            with open(tmp_path) as f:
+                content = f.read()
+
+            self.assertIn('o.bind("SUPER + ALT + F", "Full screen"', content)
+            self.assertIn('mode = "fullscreen"', content)
+            self.assertIn('o.bind("SUPER + F", "Full width"', content)
+            self.assertIn('mode = "maximized"', content)
+        finally:
+            keybinds_manager.USER_BINDINGS_PATH = orig_path
+            keybinds_manager.parse_default_bindings = orig_defaults
+            keybinds_manager.reload_hyprland = orig_reload
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if os.path.exists(tmp_path + ".bak"):
+                os.remove(tmp_path + ".bak")
+
+    def test_in_place_action_edit_removes_old_line(self):
+        """Editing a binding's action in place (same key, same description, new
+        action) must replace the old o.bind line, not leave a stale one behind.
+        Guards the preserve_entry identity match against matching on the NEW
+        action, which would wrongly keep the old line."""
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua") as tmp:
+            tmp_path = tmp.name
+
+        orig_defaults = keybinds_manager.parse_default_bindings
+        orig_reload = keybinds_manager.reload_hyprland
+        orig_path = keybinds_manager.USER_BINDINGS_PATH
+        try:
+            keybinds_manager.USER_BINDINGS_PATH = tmp_path
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + F", "description": "Full screen",
+                 "action": 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'},
+            ]
+            keybinds_manager.reload_hyprland = lambda: {"success": True, "reload_output": "", "config_errors": ""}
+
+            with open(tmp_path, "w") as f:
+                f.write("")
+
+            # First write with action A
+            keybinds_manager.set_keybinding(
+                key="SUPER + F", description="Full screen", command="",
+                action='hl.dsp.window.fullscreen({ mode = "fullscreen" })', old_key="SUPER + F")
+            # In-place edit: same key + description, new action
+            keybinds_manager.set_keybinding(
+                key="SUPER + F", description="Full screen", command="",
+                action='hl.dsp.window.fullscreen({ mode = "maximized" })', old_key="SUPER + F")
+
+            with open(tmp_path) as f:
+                content = f.read()
+
+            # Old action must be gone; exactly one Full screen bind, with the new action
+            self.assertNotIn('mode = "fullscreen"', content)
+            self.assertIn('o.bind("SUPER + F", "Full screen"', content)
+            self.assertIn('mode = "maximized"', content)
+            fullscreen_binds = [l for l in content.splitlines()
+                                if l.strip().startswith('o.bind("SUPER + F"')]
+            self.assertEqual(len(fullscreen_binds), 1)
+        finally:
+            keybinds_manager.USER_BINDINGS_PATH = orig_path
+            keybinds_manager.parse_default_bindings = orig_defaults
+            keybinds_manager.reload_hyprland = orig_reload
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if os.path.exists(tmp_path + ".bak"):
+                os.remove(tmp_path + ".bak")
+
 
 if __name__ == "__main__":
     unittest.main()

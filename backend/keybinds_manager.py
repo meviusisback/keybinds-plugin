@@ -911,12 +911,38 @@ def build_complete_model():
     }
 
 
-def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None):
+def _written_bind_identity(entry):
+    """Return the (description, action) pair a single o.bind line for ``entry``
+    will store on disk. Scoping key removal to this exact pair lets a rebind
+    drop only its own previous line, never a *different* binding that shares
+    the old key (e.g. the pair it is being swapped with)."""
+    desc = sanitize_lua_str(entry.get("description", ""))
+    cmd = entry.get("command", "")
+    action = entry.get("action", "")
+    if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
+        return desc, action.strip()[:MAX_CMD_LEN]
+    if cmd and (cmd.strip().startswith("{") or cmd.strip().startswith("hl.")):
+        return desc, cmd.strip()[:MAX_CMD_LEN]
+    raw_cmd = (cmd or action).strip()
+    if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
+        raw_cmd = raw_cmd[1:-1]
+    return desc, f'"{sanitize_lua_str(raw_cmd)}"'
+
+
+def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None, preserve_entry=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
+
+    ``preserve_entry``: when set, an existing o.bind/o.bind_toggle whose key is
+    in ``keys_to_remove`` is only removed if it is *the same binding* (matching
+    description OR action, mirroring build_complete_model's identity convention)
+    as this entry. Any other binding sharing the key is left intact (needed for
+    swaps, where one binding's old key is another binding's freshly written key,
+    and for in-place action edits, where the description is unchanged).
     """
     cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
+    preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
     os.makedirs(cfg_dir, exist_ok=True)
 
     existing_content = ""
@@ -985,7 +1011,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
             m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', stripped)
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
-                is_targeted = True
+                if preserve_identity is not None:
+                    _parsed = _parse_bind_line(stripped)
+                    if _parsed and ((_parsed[1] or "").strip().lower() == preserve_identity[0].lower()
+                            or (_parsed[2] or "").strip() == preserve_identity[1]):
+                        # Same binding being rewritten -> safe to drop its old line.
+                        is_targeted = True
+                    # Else: a different binding sharing this key (swap partner) -> keep.
+                else:
+                    is_targeted = True
 
         if not is_targeted:
             new_lines.append(line)
@@ -1087,7 +1121,8 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
         "action": action,
     }]
 
-    write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean)
+    write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
+                        preserve_entry=binds[0])
     reload_status = reload_hyprland()
 
     return {
