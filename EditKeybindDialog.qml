@@ -177,6 +177,7 @@ Item {
           spacing: Style.space(14)
 
           Text {
+            textFormat: Text.PlainText
             text: ""
             color: "white"
             font.family: Style.font.family
@@ -188,6 +189,7 @@ Item {
             spacing: Style.space(2)
 
             Text {
+              textFormat: Text.PlainText
               text: root.isEditing ? "Edit Keybinding" : "Create New Keybinding"
               color: root.foreground
               font.family: Style.font.family
@@ -196,6 +198,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: root.isEditing
                 ? "Update the shortcut combination or action details below."
                 : "Assign a shortcut to a system action or define a custom terminal command."
@@ -215,6 +218,7 @@ Item {
           spacing: Style.space(12)
 
           Text {
+            textFormat: Text.PlainText
             text: "Action Source:"
             color: root.foreground
             font.family: Style.font.family
@@ -249,6 +253,7 @@ Item {
           spacing: Style.space(6)
 
           Text {
+            textFormat: Text.PlainText
             text: "Popular Catalog Presets:"
             color: Util.alpha(root.foreground, 0.8)
             font.family: Style.font.family
@@ -293,6 +298,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   id: chipText
                   anchors.centerIn: parent
                   text: presetChip.modelData.name
@@ -312,6 +318,7 @@ Item {
           spacing: Style.space(4)
 
           Text {
+            textFormat: Text.PlainText
             text: "Action Name / Description:"
             color: root.foreground
             font.family: Style.font.family
@@ -335,6 +342,7 @@ Item {
           spacing: Style.space(4)
 
           Text {
+            textFormat: Text.PlainText
             text: "Command / Dispatcher:"
             color: root.foreground
             font.family: Style.font.family
@@ -357,6 +365,7 @@ Item {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             text: "Keyboard Shortcut:"
             color: root.foreground
             font.family: Style.font.family
@@ -384,11 +393,13 @@ Item {
               spacing: Style.space(6)
 
               Text {
+                textFormat: Text.PlainText
                 text: "💡"
                 font.pixelSize: Style.font.caption
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: "Suggested Free Shortcuts (Click to pick):"
                 color: Util.alpha(root.foreground, 0.75)
                 font.family: Style.font.family
@@ -434,11 +445,13 @@ Item {
                     spacing: Style.space(4)
 
                     Text {
+                      textFormat: Text.PlainText
                       text: "✨"
                       font.pixelSize: Style.font.caption - 2
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       text: suggestChip.modelData
                       color: root.accent
                       font.family: Style.font.family
