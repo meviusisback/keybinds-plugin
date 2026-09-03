@@ -77,6 +77,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: partRow.index < root.keyParts.length - 1
           anchors.verticalCenter: parent.verticalCenter
           text: "+"

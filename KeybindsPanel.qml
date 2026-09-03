@@ -144,6 +144,29 @@ Item {
     disableProc.running = true
   }
 
+  // Physically-held modifiers for the record-to-find capture (same
+  // modifier-stripping issue as KeyRecorder: Hyprland consumes bound chords).
+  property bool findHoldSuper: false
+  property bool findHoldCtrl: false
+  property bool findHoldAlt: false
+  property bool findHoldShift: false
+
+  // Qt ToolTip renders text as styled markup, so config-derived strings that
+  // reach tooltipText must be stripped of markup/control characters first.
+  function plainText(s) {
+    return String(s === undefined || s === null ? "" : s)
+      .replace(/[\x00-\x1F\x7F]/g, " ")
+      .replace(/[<>&"']/g, "")
+      .slice(0, 120)
+  }
+
+  function clearFindHolds() {
+    root.findHoldSuper = false
+    root.findHoldCtrl = false
+    root.findHoldAlt = false
+    root.findHoldShift = false
+  }
+
   function translateQtKey(event) {
     var key = event.key
     var text = event.text
@@ -450,38 +473,65 @@ Item {
         var isAlt = (event.modifiers & Qt.AltModifier) !== 0 || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
         var isShift = (event.modifiers & Qt.ShiftModifier) !== 0 || event.key === Qt.Key_Shift
 
-        // Escape cancels search recording
-        if (event.key === Qt.Key_Escape && !isSuper && !isCtrl && !isAlt && !isShift) {
+        // Escape cancels search recording (SUPER + ESCAPE is itself a bound
+        // chord, so held modifiers count here too)
+        if (event.key === Qt.Key_Escape && !isSuper && !isCtrl && !isAlt && !isShift
+            && !root.findHoldSuper && !root.findHoldCtrl && !root.findHoldAlt && !root.findHoldShift) {
           root.recordingSearch = false
+          root.clearFindHolds()
           event.accepted = true
           return
         }
 
-        // Ignore modifier-only keypresses alone
-        if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+        // Ignore modifier-only keypresses alone (but track them as held).
+        // Held flags come from physical key identity only — event.modifiers bits
+        // (e.g. AltGr's phantom ControlModifier) have no matching release to clear.
+        if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+          root.findHoldCtrl = event.key === Qt.Key_Control
+          root.findHoldShift = event.key === Qt.Key_Shift
+          root.findHoldAlt = event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
+          root.findHoldSuper = event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
           event.accepted = true
           return
         }
 
         var keyName = root.translateQtKey(event)
         if (keyName.length > 0) {
+          // Union of event modifiers and physically-held ones: Hyprland strips
+          // the modifier bits when it consumes an already-bound chord.
           var mods = []
-          if (isSuper) mods.push("SUPER")
-          if (isShift) mods.push("SHIFT")
-          if (isCtrl) mods.push("CTRL")
-          if (isAlt) mods.push("ALT")
+          if (isSuper || root.findHoldSuper) mods.push("SUPER")
+          if (isShift || root.findHoldShift) mods.push("SHIFT")
+          if (isCtrl || root.findHoldCtrl) mods.push("CTRL")
+          if (isAlt || root.findHoldAlt) mods.push("ALT")
 
           var chord = mods.length > 0 ? (mods.join(" + ") + " + " + keyName) : keyName
           root.searchQuery = chord
           searchInput.text = chord
           root.recordingSearch = false
+          root.clearFindHolds()
           event.accepted = true
         }
+      }
+
+      Keys.onReleased: function(event) {
+        if (!root.recordingSearch) return
+        if (event.key === Qt.Key_Control) root.findHoldCtrl = false
+        else if (event.key === Qt.Key_Shift) root.findHoldShift = false
+        else if (event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr) root.findHoldAlt = false
+        else if (event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) root.findHoldSuper = false
+      }
+
+      // Focus lost mid-chord (e.g. Alt+Tab): releases go elsewhere, so drop
+      // held state to keep a stale modifier out of the next captured chord.
+      onActiveFocusChanged: {
+        if (!activeFocus) root.clearFindHolds()
       }
 
       Keys.onEscapePressed: function(event) {
         if (root.recordingSearch) {
           root.recordingSearch = false
+          root.clearFindHolds()
         } else if (editDialog.opened) {
           editDialog.close()
         } else {
@@ -506,6 +556,7 @@ Item {
 
             // Clean white logo glyph without box
             Text {
+              textFormat: Text.PlainText
               text: ""
               color: "white"
               font.family: Style.font.family
@@ -516,6 +567,7 @@ Item {
               spacing: 0
 
               Text {
+                textFormat: Text.PlainText
                 text: "Keybindings"
                 color: root.foreground
                 font.family: Style.font.family
@@ -524,6 +576,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: "Hyprland Shortcut Manager"
                 color: Util.alpha(root.foreground, 0.55)
                 font.family: Style.font.family
@@ -559,6 +612,7 @@ Item {
                   root.searchQuery = ""
                   searchInput.text = ""
                   root.recordingSearch = false
+                  root.clearFindHolds()
                 }
               }
             }
@@ -691,6 +745,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   id: chipLabel
                   anchors.centerIn: parent
                   text: chip.modelData
@@ -717,8 +772,10 @@ Item {
             onClicked: {
               if (root.recordingSearch) {
                 root.recordingSearch = false
+                root.clearFindHolds()
               } else {
                 root.recordingSearch = true
+                root.clearFindHolds()
                 mainContainer.forceActiveFocus()
               }
             }
@@ -827,6 +884,7 @@ Item {
                       )
 
                       Text {
+                        textFormat: Text.PlainText
                         id: statusText
                         anchors.centerIn: parent
                         text: (activeRow.modelData && activeRow.modelData.is_conflict)
@@ -933,7 +991,7 @@ Item {
                       Button {
                         visible: Boolean(activeRow.modelData && activeRow.modelData.status === "modified")
                         iconText: "↺"
-                        tooltipText: "Reset to Default (" + ((activeRow.modelData && activeRow.modelData.default_key) || "") + ")"
+                        tooltipText: "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key)
@@ -985,6 +1043,7 @@ Item {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     visible: root.searchQuery.length > 0
                     text: "This shortcut combination is currently free and unassigned."
                     color: Util.alpha(root.foreground, 0.6)
@@ -1059,6 +1118,7 @@ Item {
                       borderSpec: Border.flat((st === "custom") ? "#4CAF50" : "#FF9800", 1)
 
                       Text {
+                        textFormat: Text.PlainText
                         id: modStatusText
                         anchors.centerIn: parent
                         text: (modRow.modelData && modRow.modelData.status ? modRow.modelData.status.toUpperCase() : "MODIFIED")
@@ -1139,7 +1199,7 @@ Item {
                       Button {
                         visible: Boolean(modRow.modelData && modRow.modelData.status === "modified")
                         iconText: "↺"
-                        tooltipText: "Reset to Default (" + ((modRow.modelData && modRow.modelData.default_key) || "") + ")"
+                        tooltipText: "Reset to Default (" + root.plainText(modRow.modelData && modRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key)
@@ -1160,6 +1220,7 @@ Item {
 
               // Empty state for modified tab
               Text {
+                textFormat: Text.PlainText
                 visible: root.filteredModified.length === 0
                 text: "No modified or custom keybindings found. All shortcuts are currently set to Omarchy defaults."
                 color: Util.alpha(root.foreground, 0.5)
@@ -1260,6 +1321,7 @@ Item {
                       spacing: Style.space(8)
 
                       Text {
+                        textFormat: Text.PlainText
                         visible: !catalogRow.modelData.is_bound && catalogRow.modelData.default_key
                         text: "Suggested:"
                         color: Util.alpha(root.foreground, 0.4)
@@ -1289,6 +1351,7 @@ Item {
 
               // Empty state for catalog
               Text {
+                textFormat: Text.PlainText
                 visible: root.filteredCatalog.length === 0
                 text: "No catalog actions match your search."
                 color: Util.alpha(root.foreground, 0.4)
@@ -1343,6 +1406,7 @@ Item {
                         borderSpec: Border.flat(root.urgent, 1)
 
                         Text {
+                          textFormat: Text.PlainText
                           id: confBadgeTxt
                           anchors.centerIn: parent
                           text: (conflictCard.modelData.bindings ? conflictCard.modelData.bindings.length : 2) + " ACTIONS COLLIDING"
@@ -1357,6 +1421,7 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       text: "The following actions are bound to this same shortcut. Click Rebind on one of them to resolve:"
                       color: Util.alpha(root.foreground, 0.8)
                       font.family: Style.font.family
@@ -1445,6 +1510,7 @@ Item {
                   spacing: Style.space(14)
 
                   Text {
+                    textFormat: Text.PlainText
                     text: "🎉"
                     font.pixelSize: Style.font.title + 8
                   }
@@ -1453,6 +1519,7 @@ Item {
                     spacing: Style.space(2)
 
                     Text {
+                      textFormat: Text.PlainText
                       text: "No Keybinding Conflicts Detected"
                       color: "#4CAF50"
                       font.family: Style.font.family
@@ -1461,6 +1528,7 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       text: "All active Hyprland shortcuts are cleanly mapped with zero collisions."
                       color: Util.alpha(root.foreground, 0.7)
                       font.family: Style.font.family
@@ -1488,6 +1556,7 @@ Item {
             spacing: Style.space(10)
 
             Text {
+              textFormat: Text.PlainText
               text: "✓"
               color: root.accent
               font.family: Style.font.family
@@ -1496,6 +1565,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: root.toastMessage
               color: root.foreground
               font.family: Style.font.family

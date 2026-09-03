@@ -24,6 +24,15 @@ Item {
   property bool modShift: false
   property string mainKey: ""
 
+  // Physically-held modifiers tracked from raw press/release events.
+  // Hyprland consumes bound chords (e.g. SUPER + A) and forwards the final
+  // key with its modifier bits stripped, so event.modifiers alone cannot be
+  // trusted; we rebuild the chord from the modifier keys we saw go down.
+  property bool holdSuper: false
+  property bool holdCtrl: false
+  property bool holdAlt: false
+  property bool holdShift: false
+
   signal keyChanged(string newKey)
 
   // List of all active bindings for real-time collision detection
@@ -164,12 +173,22 @@ Item {
     root.modAlt = false
     root.modShift = false
     root.mainKey = ""
+    root.holdSuper = false
+    root.holdCtrl = false
+    root.holdAlt = false
+    root.holdShift = false
     root.recording = true
     keyCaptureFocus.forceActiveFocus()
   }
 
   function stopRecording() {
     root.recording = false
+    // Modifier release events can be swallowed by the compositor once
+    // recording stops; drop held state so it never leaks into the next session.
+    root.holdSuper = false
+    root.holdCtrl = false
+    root.holdAlt = false
+    root.holdShift = false
     if (!root.value && root.previousValueBeforeRecord) {
       root.value = root.previousValueBeforeRecord
       parseCurrentValue(root.value)
@@ -265,6 +284,7 @@ Item {
 
         // Keyboard Icon
         Text {
+          textFormat: Text.PlainText
           text: ""
           color: root.recording ? root.accent : (root.hasConflict ? root.urgent : "white")
           font.family: Style.font.family
@@ -297,6 +317,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Listening for keys... Press combination (e.g. CTRL + O)"
               color: root.accent
               font.family: Style.font.family
@@ -321,6 +342,7 @@ Item {
 
           // Empty state
           Text {
+            textFormat: Text.PlainText
             visible: !root.recording && root.value.length === 0
             anchors.verticalCenter: parent.verticalCenter
             text: "Click Record or select modifier pills below..."
@@ -374,6 +396,7 @@ Item {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: "Modifiers:"
         color: Util.alpha(root.foreground, 0.7)
         font.family: Style.font.family
@@ -432,6 +455,7 @@ Item {
       Item { Layout.fillWidth: true }
 
       Text {
+        textFormat: Text.PlainText
         text: "Key:"
         color: Util.alpha(root.foreground, 0.7)
         font.family: Style.font.family
@@ -488,6 +512,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: chipTxt
             anchors.centerIn: parent
             text: quickKeyChip.modelData
@@ -524,6 +549,7 @@ Item {
           spacing: Style.space(12)
 
           Text {
+            textFormat: Text.PlainText
             text: "⚠️"
             font.pixelSize: Style.font.title
           }
@@ -533,6 +559,7 @@ Item {
             spacing: Style.space(2)
 
             Text {
+              textFormat: Text.PlainText
               text: "Shortcut Collision Detected"
               color: root.urgent
               font.family: Style.font.family
@@ -571,6 +598,17 @@ Item {
     Keys.enabled: root.recording
     Keys.priority: Keys.BeforeItem
 
+    // Focus lost mid-chord (e.g. Alt+Tab) means its release goes elsewhere:
+    // drop the held state so a stale modifier can't contaminate this session.
+    onActiveFocusChanged: {
+      if (!activeFocus && root.recording) {
+        root.holdSuper = false
+        root.holdCtrl = false
+        root.holdAlt = false
+        root.holdShift = false
+      }
+    }
+
     Keys.onPressed: function(event) {
       if (!root.recording) return
 
@@ -586,12 +624,19 @@ Item {
         return
       }
 
-      // Modifier-only keypress: live update modifier pills
-      if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
-        root.modSuper = isSuper
-        root.modCtrl = isCtrl
-        root.modAlt = isAlt
-        root.modShift = isShift
+      // Modifier-only keypress: track held state and live-update modifier pills.
+      // Held flags come from the physical key identity only, never from
+      // event.modifiers: AltGr reports ControlModifier+AltModifier but releases
+      // as a single Alt event, which would latch a phantom CTRL that nothing clears.
+      if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift || event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+        root.holdCtrl = event.key === Qt.Key_Control
+        root.holdShift = event.key === Qt.Key_Shift
+        root.holdAlt = event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr
+        root.holdSuper = event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
+        root.modSuper = isSuper || root.holdSuper
+        root.modCtrl = isCtrl || root.holdCtrl
+        root.modAlt = isAlt || root.holdAlt
+        root.modShift = isShift || root.holdShift
         root.mainKey = ""
         root.composeKey()
         event.accepted = true
@@ -600,17 +645,38 @@ Item {
 
       var keyName = root.translateQtKey(event)
       if (keyName.length > 0) {
-        // Strictly set the modifiers from the incoming event so old ones are not preserved
-        root.modSuper = (event.modifiers & Qt.MetaModifier) !== 0
-        root.modCtrl = (event.modifiers & Qt.ControlModifier) !== 0
-        root.modAlt = (event.modifiers & Qt.AltModifier) !== 0
-        root.modShift = (event.modifiers & Qt.ShiftModifier) !== 0
+        // Union of the event's modifiers and the physically-tracked ones:
+        // Hyprland strips modifier bits when it consumes a bound chord, so
+        // event.modifiers alone would record bare "A" for a SUPER + A chord.
+        var superOn = (event.modifiers & Qt.MetaModifier) !== 0 || root.holdSuper
+        var ctrlOn = (event.modifiers & Qt.ControlModifier) !== 0 || root.holdCtrl
+        var altOn = (event.modifiers & Qt.AltModifier) !== 0 || root.holdAlt
+        var shiftOn = (event.modifiers & Qt.ShiftModifier) !== 0 || root.holdShift
+        root.modSuper = superOn
+        root.modCtrl = ctrlOn
+        root.modAlt = altOn
+        root.modShift = shiftOn
         root.mainKey = keyName
         manualKeyField.text = keyName
         root.composeKey()
         root.recording = false
+        // Chord committed: drop held state so it cannot leak into the next session
+        root.holdSuper = false
+        root.holdCtrl = false
+        root.holdAlt = false
+        root.holdShift = false
         event.accepted = true
       }
+    }
+
+    Keys.onReleased: function(event) {
+      if (!root.recording) return
+      // Clear tracked state when a modifier physically goes up, so a chord
+      // typed after releasing Super doesn't inherit it.
+      if (event.key === Qt.Key_Control) root.holdCtrl = false
+      else if (event.key === Qt.Key_Shift) root.holdShift = false
+      else if (event.key === Qt.Key_Alt || event.key === Qt.Key_AltGr) root.holdAlt = false
+      else if (event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) root.holdSuper = false
     }
   }
 }
