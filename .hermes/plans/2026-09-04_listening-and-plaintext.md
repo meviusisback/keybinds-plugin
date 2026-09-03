@@ -49,3 +49,20 @@ Then reply on #4577 with the fix commit for re-verification.
 - Release events for swallowed chords (Super released after consumed A) may not arrive →
   a stale tracked-Super could leak into the *next* keypress; mitigate by clearing tracked
   state at startRecording() and on commit.
+
+## Review verdicts (all passed)
+- Plan security review (subagent): safe=true. Applied: clear holds on stop/cancel/focus
+  loss; sanitized the two config-derived tooltipText interpolations (Qt ToolTip uses
+  StyledText internally — outside the PlainText sweep's reach).
+- Logic reviewer: passed, 0 logic errors. Applied: symmetric clearFindHolds() at every
+  exit path (Escape, toggle-off, clear-X, commit, re-arm, focus loss).
+- Security reviewer: passed, 2 low findings. Fixed: AltGr phantom-CTRL latch (holds now
+  set from physical key identity only, never from event.modifiers bits) +
+  onActiveFocusChanged reset. Noted pre-existing (out of scope, not widened by this
+  diff): backend raw-Lua passthrough for action strings starting with '{' or 'hl.' in
+  write_user_bindings — recommend a follow-up issue.
+- QML specialist: passed; PlainText sweep verified complete (53/53 Text blocks across
+  all 4 repo QML files), no rich-text regressions.
+- Known accepted edge case: re-arming Record while Super is still physically held can
+  under-record (missed keydown); self-heals on next chord, UI previews the chord
+  before Save.
