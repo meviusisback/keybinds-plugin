@@ -258,6 +258,60 @@ class TestKeybindsBackend(unittest.TestCase):
             if os.path.exists(tmp_path + ".bak"):
                 os.remove(tmp_path + ".bak")
 
+    def test_get_installed_apps(self):
+        apps = keybinds_manager.get_installed_apps()
+        self.assertIsInstance(apps, list)
+        if apps:
+            first = apps[0]
+            self.assertIn("name", first)
+            self.assertIn("exec", first)
+            self.assertIn("icon", first)
+            self.assertIn("terminal", first)
+            # Verify alphabetical ordering
+            names = [a["name"].lower() for a in apps]
+            self.assertEqual(names, sorted(names))
+
+    def test_expanded_catalog(self):
+        catalog_ids = {p["id"] for p in keybinds_manager.PRESET_CATALOG}
+        self.assertIn("ws.switch_1", catalog_ids)
+        self.assertIn("ws.switch_10", catalog_ids)
+        self.assertIn("ws.move_1", catalog_ids)
+        self.assertIn("win.swap_left", catalog_ids)
+        self.assertIn("media.play_pause", catalog_ids)
+        self.assertIn("media.brightness_up", catalog_ids)
+
+    def test_normalize_key_chord_punctuation(self):
+        """Verify commas, pluses, and punctuation keys are preserved."""
+        self.assertEqual(keybinds_manager.normalize_key_chord("SUPER + ,"), "SUPER + comma")
+        self.assertEqual(keybinds_manager.normalize_key_chord("CTRL + +"), "CTRL + plus")
+        self.assertEqual(keybinds_manager.normalize_key_chord("SUPER + comma"), "SUPER + comma")
+        self.assertEqual(keybinds_manager.normalize_key_chord("SUPER + COMMA"), "SUPER + comma")
+        self.assertEqual(keybinds_manager.normalize_key_chord("SUPER + ."), "SUPER + period")
+
+    def test_sanitize_lua_str_max_len(self):
+        """Verify sanitize_lua_str respects max_len parameter."""
+        long_cmd = "echo " + ("a" * 500)
+        default_sanitized = keybinds_manager.sanitize_lua_str(long_cmd)
+        self.assertEqual(len(default_sanitized), keybinds_manager.MAX_TEXT_LEN)
+        cmd_sanitized = keybinds_manager.sanitize_lua_str(long_cmd, max_len=keybinds_manager.MAX_CMD_LEN)
+        self.assertEqual(len(cmd_sanitized), len(long_cmd))
+
+    def test_preset_catalog_valid_dispatchers(self):
+        """Verify no non-existent hierarchical function paths exist in catalog."""
+        invalid_patterns = ["hl.dsp.focus.left", "hl.dsp.focus.right", "hl.dsp.focus.up", "hl.dsp.focus.down",
+                            "hl.dsp.window.fullwidth", "hl.dsp.special_workspace"]
+        for preset in keybinds_manager.PRESET_CATALOG:
+            dsp = preset.get("dispatcher", "")
+            for pat in invalid_patterns:
+                self.assertNotIn(pat, dsp, f"Invalid dispatcher pattern '{pat}' in preset {preset['id']}")
+
+    def test_new_presets_included(self):
+        catalog_ids = {p["id"] for p in keybinds_manager.PRESET_CATALOG}
+        self.assertIn("mon.focus_next", catalog_ids)
+        self.assertIn("mon.move_ws_left", catalog_ids)
+        self.assertIn("win.pin", catalog_ids)
+        self.assertIn("ws.previous_history", catalog_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

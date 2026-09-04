@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import stat
+import glob
+import configparser
 
 DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
 USER_BINDINGS_PATH = os.path.expanduser("~/.config/hypr/bindings.lua")
@@ -40,11 +42,11 @@ MENU_ENTRY_VALUE = {
 _JSONC_LINE_COMMENT_RE = re.compile(r'//.*$')
 _JSONC_BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.DOTALL)
 
-def sanitize_lua_str(s: str) -> str:
+def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
     s = (s or "").replace("\r", " ").replace("\n", " ")
-    if len(s) > MAX_TEXT_LEN:
-        s = s[:MAX_TEXT_LEN]
+    if len(s) > max_len:
+        s = s[:max_len]
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
@@ -167,7 +169,7 @@ PRESET_CATALOG = [
         "category": "Window Management",
         "name": "Toggle Full Width",
         "description": "Expand window across the full screen width",
-        "dispatcher": "hl.dsp.window.fullwidth()",
+        "dispatcher": 'hl.dsp.window.fullscreen({ mode = "maximized" })',
         "command": "hyprctl dispatch fullscreen 2",
         "default_key": "SUPER + ALT + F",
     },
@@ -199,6 +201,15 @@ PRESET_CATALOG = [
         "default_key": "SUPER + O",
     },
     {
+        "id": "win.pin",
+        "category": "Window Management",
+        "name": "Pin Active Window",
+        "description": "Pin focused window across all workspaces",
+        "dispatcher": "hl.dsp.window.pin()",
+        "command": "hyprctl dispatch pin",
+        "default_key": "SUPER + ALT + P",
+    },
+    {
         "id": "win.transparency",
         "category": "Window Management",
         "name": "Toggle Window Transparency",
@@ -221,7 +232,7 @@ PRESET_CATALOG = [
         "category": "Window Management",
         "name": "Focus Window Left",
         "description": "Move focus to the window on the left",
-        "dispatcher": "hl.dsp.focus.left()",
+        "dispatcher": 'hl.dsp.focus({ direction = "l" })',
         "command": "hyprctl dispatch movefocus l",
         "default_key": "SUPER + LEFT",
     },
@@ -230,7 +241,7 @@ PRESET_CATALOG = [
         "category": "Window Management",
         "name": "Focus Window Right",
         "description": "Move focus to the window on the right",
-        "dispatcher": "hl.dsp.focus.right()",
+        "dispatcher": 'hl.dsp.focus({ direction = "r" })',
         "command": "hyprctl dispatch movefocus r",
         "default_key": "SUPER + RIGHT",
     },
@@ -239,7 +250,7 @@ PRESET_CATALOG = [
         "category": "Window Management",
         "name": "Focus Window Up",
         "description": "Move focus to the window above",
-        "dispatcher": "hl.dsp.focus.up()",
+        "dispatcher": 'hl.dsp.focus({ direction = "u" })',
         "command": "hyprctl dispatch movefocus u",
         "default_key": "SUPER + UP",
     },
@@ -248,9 +259,18 @@ PRESET_CATALOG = [
         "category": "Window Management",
         "name": "Focus Window Down",
         "description": "Move focus to the window below",
-        "dispatcher": "hl.dsp.focus.down()",
+        "dispatcher": 'hl.dsp.focus({ direction = "d" })',
         "command": "hyprctl dispatch movefocus d",
         "default_key": "SUPER + DOWN",
+    },
+    {
+        "id": "mon.focus_next",
+        "category": "Window Management",
+        "name": "Focus Next Monitor",
+        "description": "Switch active focus to the next physical monitor",
+        "dispatcher": 'hl.dsp.focus({ monitor = "+1" })',
+        "command": "hyprctl dispatch focusmonitor +1",
+        "default_key": "CTRL + ALT + TAB",
     },
     {
         "id": "win.move_left",
@@ -259,7 +279,7 @@ PRESET_CATALOG = [
         "description": "Move active window to the left in tiling layout",
         "dispatcher": "hl.dsp.window.move({ direction = \"left\" })",
         "command": "hyprctl dispatch movewindow l",
-        "default_key": "SUPER + SHIFT + LEFT",
+        "default_key": "SUPER + ALT + LEFT",
     },
     {
         "id": "win.move_right",
@@ -268,7 +288,7 @@ PRESET_CATALOG = [
         "description": "Move active window to the right in tiling layout",
         "dispatcher": "hl.dsp.window.move({ direction = \"right\" })",
         "command": "hyprctl dispatch movewindow r",
-        "default_key": "SUPER + SHIFT + RIGHT",
+        "default_key": "SUPER + ALT + RIGHT",
     },
     {
         "id": "win.move_up",
@@ -277,7 +297,7 @@ PRESET_CATALOG = [
         "description": "Move active window up in tiling layout",
         "dispatcher": "hl.dsp.window.move({ direction = \"up\" })",
         "command": "hyprctl dispatch movewindow u",
-        "default_key": "SUPER + SHIFT + UP",
+        "default_key": "SUPER + ALT + UP",
     },
     {
         "id": "win.move_down",
@@ -286,7 +306,7 @@ PRESET_CATALOG = [
         "description": "Move active window down in tiling layout",
         "dispatcher": "hl.dsp.window.move({ direction = \"down\" })",
         "command": "hyprctl dispatch movewindow d",
-        "default_key": "SUPER + SHIFT + DOWN",
+        "default_key": "SUPER + ALT + DOWN",
     },
 
     # Workspaces
@@ -309,11 +329,29 @@ PRESET_CATALOG = [
         "default_key": "SUPER + SHIFT + TAB",
     },
     {
+        "id": "ws.previous_history",
+        "category": "Workspaces",
+        "name": "Previous Visited Workspace",
+        "description": "Toggle focus back to the previously active workspace",
+        "dispatcher": 'hl.dsp.focus({ workspace = "previous" })',
+        "command": "hyprctl dispatch workspace previous",
+        "default_key": "SUPER + GRAVE",
+    },
+    {
+        "id": "mon.move_ws_left",
+        "category": "Workspaces",
+        "name": "Move Workspace to Left Monitor",
+        "description": "Shift current workspace onto the monitor to the left",
+        "dispatcher": 'hl.dsp.workspace.move({ monitor = "l" })',
+        "command": "hyprctl dispatch movecurrentworkspacetomonitor l",
+        "default_key": "SUPER + SHIFT + ALT + LEFT",
+    },
+    {
         "id": "ws.scratchpad_toggle",
         "category": "Workspaces",
         "name": "Toggle Special Scratchpad",
         "description": "Toggle overlay special workspace (scratchpad)",
-        "dispatcher": "hl.dsp.special_workspace.focus({ name = \"scratchpad\" })",
+        "dispatcher": 'hl.dsp.workspace.toggle_special("scratchpad")',
         "command": "hyprctl dispatch togglespecialworkspace scratchpad",
         "default_key": "SUPER + S",
     },
@@ -322,7 +360,7 @@ PRESET_CATALOG = [
         "category": "Workspaces",
         "name": "Move to Scratchpad",
         "description": "Move focused window into special scratchpad",
-        "dispatcher": "hl.dsp.special_workspace.move_window({ name = \"scratchpad\" })",
+        "dispatcher": 'hl.dsp.window.move({ workspace = "special:scratchpad", follow = false })',
         "command": "hyprctl dispatch movetoworkspace special:scratchpad",
         "default_key": "SUPER + ALT + S",
     },
@@ -566,7 +604,196 @@ PRESET_CATALOG = [
         "command": "omarchy-capture-text",
         "default_key": "SUPER + CTRL + PRINT",
     },
+    # Workspaces 1-10 Switching & Window Movement
+    *[
+        {
+            "id": f"ws.switch_{i}",
+            "category": "Workspaces",
+            "name": f"Switch to Workspace {i}",
+            "description": f"Switch active focus to workspace {i}",
+            "dispatcher": f'hl.dsp.focus({{ workspace = "{i}" }})',
+            "command": f"hyprctl dispatch workspace {i}",
+            "default_key": f"SUPER + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    *[
+        {
+            "id": f"ws.move_{i}",
+            "category": "Workspaces",
+            "name": f"Move Window to Workspace {i}",
+            "description": f"Move active window to workspace {i}",
+            "dispatcher": f'hl.dsp.window.move({{ workspace = "{i}" }})',
+            "command": f"hyprctl dispatch movetoworkspace {i}",
+            "default_key": f"SUPER + SHIFT + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    *[
+        {
+            "id": f"ws.movesilent_{i}",
+            "category": "Workspaces",
+            "name": f"Move Window to Workspace {i} (Silent)",
+            "description": f"Move active window to workspace {i} without switching focus",
+            "dispatcher": f'hl.dsp.window.move({{ workspace = "{i}", follow = false }})',
+            "command": f"hyprctl dispatch movetoworkspacesilent {i}",
+            "default_key": f"SUPER + SHIFT + ALT + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    # Window Swapping
+    {
+        "id": "win.swap_left",
+        "category": "Window Management",
+        "name": "Swap Window Left",
+        "description": "Swap active window with the window to the left",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "l" })',
+        "command": "hyprctl dispatch swapwindow l",
+        "default_key": "SUPER + SHIFT + LEFT",
+    },
+    {
+        "id": "win.swap_right",
+        "category": "Window Management",
+        "name": "Swap Window Right",
+        "description": "Swap active window with the window to the right",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "r" })',
+        "command": "hyprctl dispatch swapwindow r",
+        "default_key": "SUPER + SHIFT + RIGHT",
+    },
+    {
+        "id": "win.swap_up",
+        "category": "Window Management",
+        "name": "Swap Window Up",
+        "description": "Swap active window with the window above",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "u" })',
+        "command": "hyprctl dispatch swapwindow u",
+        "default_key": "SUPER + SHIFT + UP",
+    },
+    {
+        "id": "win.swap_down",
+        "category": "Window Management",
+        "name": "Swap Window Down",
+        "description": "Swap active window with the window below",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "d" })',
+        "command": "hyprctl dispatch swapwindow d",
+        "default_key": "SUPER + SHIFT + DOWN",
+    },
+    # Media Playback Controls
+    {
+        "id": "media.play_pause",
+        "category": "Media & Audio",
+        "name": "Play / Pause Media",
+        "description": "Toggle media playback",
+        "dispatcher": "exec",
+        "command": "playerctl play-pause",
+        "default_key": "XF86AudioPlay",
+    },
+    {
+        "id": "media.next_track",
+        "category": "Media & Audio",
+        "name": "Next Track",
+        "description": "Skip to next media track",
+        "dispatcher": "exec",
+        "command": "playerctl next",
+        "default_key": "XF86AudioNext",
+    },
+    {
+        "id": "media.prev_track",
+        "category": "Media & Audio",
+        "name": "Previous Track",
+        "description": "Return to previous media track",
+        "dispatcher": "exec",
+        "command": "playerctl previous",
+        "default_key": "XF86AudioPrev",
+    },
+    # Display Brightness
+    {
+        "id": "media.brightness_up",
+        "category": "Media & Audio",
+        "name": "Raise Brightness",
+        "description": "Increase display brightness by 5%",
+        "dispatcher": "exec",
+        "command": "omarchy-brightness raise || brightnessctl set +5%",
+        "default_key": "XF86MonBrightnessUp",
+    },
+    {
+        "id": "media.brightness_down",
+        "category": "Media & Audio",
+        "name": "Lower Brightness",
+        "description": "Decrease display brightness by 5%",
+        "dispatcher": "exec",
+        "command": "omarchy-brightness lower || brightnessctl set 5%-",
+        "default_key": "XF86MonBrightnessDown",
+    },
 ]
+
+_INSTALLED_APPS_CACHE = None
+
+def get_installed_apps():
+    """Scan standard XDG application directories for launchable applications.
+    Returns a sorted list of unique applications: [{'name': ..., 'exec': ..., 'icon': ..., 'comment': ..., 'terminal': bool}]
+    """
+    global _INSTALLED_APPS_CACHE
+    if _INSTALLED_APPS_CACHE is not None:
+        return _INSTALLED_APPS_CACHE
+
+    apps = []
+    seen = set()
+    dirs = [
+        os.path.expanduser("~/.local/share/applications"),
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+    ]
+
+    for app_dir in dirs:
+        if not os.path.isdir(app_dir):
+            continue
+        for desktop_file in sorted(glob.glob(os.path.join(app_dir, "*.desktop"))):
+            cp = configparser.RawConfigParser()
+            try:
+                cp.read(desktop_file, encoding="utf-8")
+                if not cp.has_section("Desktop Entry"):
+                    continue
+                entry = cp["Desktop Entry"]
+                if entry.get("Type", "Application") != "Application":
+                    continue
+                if entry.get("NoDisplay", "false").lower() == "true":
+                    continue
+                if entry.get("Hidden", "false").lower() == "true":
+                    continue
+
+                name = entry.get("Name", "").strip()
+                exec_cmd = entry.get("Exec", "").strip()
+                if not name or not exec_cmd:
+                    continue
+
+                # Strip field codes like %u, %f, %F, %U, --uri=%u, and trailing --
+                clean_exec = re.sub(r'--\w+=%[a-zA-Z%]', '', exec_cmd)
+                clean_exec = re.sub(r'["\']?%[a-zA-Z%]["\']?', '', clean_exec)
+                clean_exec = re.sub(r'\s+--\s*$', '', clean_exec.strip())
+                clean_exec = " ".join(clean_exec.split())
+                if not clean_exec:
+                    clean_exec = exec_cmd
+
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                apps.append({
+                    "name": name,
+                    "exec": clean_exec,
+                    "icon": entry.get("Icon", "").strip(),
+                    "comment": entry.get("Comment", "").strip(),
+                    "terminal": entry.get("Terminal", "false").lower() == "true",
+                })
+            except Exception:
+                continue
+
+    apps.sort(key=lambda x: x["name"].lower())
+    _INSTALLED_APPS_CACHE = apps
+    return apps
+
 
 
 def normalize_key_chord(key_chord: str) -> str:
@@ -574,7 +801,18 @@ def normalize_key_chord(key_chord: str) -> str:
     if not key_chord:
         return ""
 
-    raw_parts = [p.strip() for p in key_chord.replace(",", "+").split("+") if p.strip()]
+    chord = key_chord.strip()
+    trailing_key = None
+    if chord.endswith("++"):
+        chord = chord[:-1]
+        trailing_key = "+"
+    elif chord.endswith("+") and chord != "+":
+        trailing_key = "+"
+        chord = chord[:-1]
+
+    raw_parts = [p.strip() for p in chord.split("+") if p.strip()]
+    if trailing_key:
+        raw_parts.append(trailing_key)
     if not raw_parts:
         return ""
 
@@ -600,16 +838,34 @@ def normalize_key_chord(key_chord: str) -> str:
 
     mods.sort(key=lambda m: MODIFIER_ORDER.get(m, 99))
 
+    SYMBOL_MAP = {
+        ",": "comma",
+        ".": "period",
+        "/": "slash",
+        "-": "minus",
+        "=": "equal",
+        "[": "bracketleft",
+        "]": "bracketright",
+        ";": "semicolon",
+        "'": "apostrophe",
+        "\\": "backslash",
+        "`": "grave",
+        "+": "plus",
+    }
+
     if main_key:
         upper_k = main_key.upper()
+        lower_k = main_key.lower()
         if upper_k in ("RETURN", "ENTER", "SPACE", "ESCAPE", "TAB", "BACKSPACE", "DELETE", "PRINT"):
             main_key = upper_k
         elif upper_k in ("LEFT", "RIGHT", "UP", "DOWN"):
             main_key = upper_k
         elif upper_k.startswith("F") and upper_k[1:].isdigit():
             main_key = upper_k
-        elif main_key in ("comma", "period", "slash", "minus", "equal", "bracketleft", "bracketright", "semicolon", "apostrophe", "backslash"):
-            pass
+        elif main_key in SYMBOL_MAP:
+            main_key = SYMBOL_MAP[main_key]
+        elif lower_k in SYMBOL_MAP.values():
+            main_key = lower_k
         elif len(main_key) == 1:
             main_key = main_key.upper()
 
@@ -683,6 +939,9 @@ def parse_default_bindings():
             raw_key, desc, action_raw, opts_raw = parsed
 
             norm_key = normalize_key_chord(raw_key)
+            if stripped.startswith("o.bind_toggle"):
+                clean_target = action_raw.strip('"\'')
+                action_raw = f'"omarchy-toggle-{clean_target}"'
             if not desc:
                 desc = action_raw.strip('"\'')
 
@@ -903,6 +1162,7 @@ def build_complete_model():
         "active": all_active,
         "catalog": catalog,
         "conflicts": conflicts,
+        "apps": get_installed_apps(),
         "total_active": len([b for b in all_active if b.get("status") != "disabled"]),
         "total_modified": total_modified,
         "total_conflicts": len(conflicts),
@@ -1013,10 +1273,13 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
                 if preserve_identity is not None:
                     _parsed = _parse_bind_line(stripped)
-                    if _parsed and ((_parsed[1] or "").strip().lower() == preserve_identity[0].lower()
-                            or (_parsed[2] or "").strip() == preserve_identity[1]):
-                        # Same binding being rewritten -> safe to drop its old line.
-                        is_targeted = True
+                    if _parsed:
+                        norm_parsed_action = (_parsed[2] or "").strip().strip('"\'')
+                        norm_pres_action = preserve_identity[1].strip().strip('"\'')
+                        if ((_parsed[1] or "").strip().lower() == preserve_identity[0].lower()
+                                or norm_parsed_action == norm_pres_action
+                                or normalize_key_chord(m_bind.group(1)) in [normalize_key_chord(e.get("key", "")) for e in (lines_to_add or [])]):
+                            is_targeted = True
                     # Else: a different binding sharing this key (swap partner) -> keep.
                 else:
                     is_targeted = True
@@ -1046,7 +1309,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 raw_cmd = (cmd or action).strip()
                 if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
                     raw_cmd = raw_cmd[1:-1]
-                escaped_cmd = sanitize_lua_str(raw_cmd)
+                escaped_cmd = sanitize_lua_str(raw_cmd, max_len=MAX_CMD_LEN)
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
 
 
@@ -1337,6 +1600,9 @@ def main():
     elif cmd == "menu-remove":
         res = remove_menu_entry()
         print(json.dumps(res))
+
+    elif cmd == "apps":
+        print(json.dumps(get_installed_apps()))
 
     else:
         print(json.dumps({"success": False, "error": f"Unknown command {cmd}"}))
