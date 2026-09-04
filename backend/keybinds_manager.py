@@ -685,7 +685,7 @@ PRESET_CATALOG = [
         "name": "Play / Pause Media",
         "description": "Toggle media playback",
         "dispatcher": "exec",
-        "command": "playerctl play-pause",
+        "command": "omarchy-shell media playPause",
         "default_key": "XF86AudioPlay",
     },
     {
@@ -694,7 +694,7 @@ PRESET_CATALOG = [
         "name": "Next Track",
         "description": "Skip to next media track",
         "dispatcher": "exec",
-        "command": "playerctl next",
+        "command": "omarchy-shell media next",
         "default_key": "XF86AudioNext",
     },
     {
@@ -703,7 +703,7 @@ PRESET_CATALOG = [
         "name": "Previous Track",
         "description": "Return to previous media track",
         "dispatcher": "exec",
-        "command": "playerctl previous",
+        "command": "omarchy-shell media previous",
         "default_key": "XF86AudioPrev",
     },
     # Display Brightness
@@ -713,7 +713,7 @@ PRESET_CATALOG = [
         "name": "Raise Brightness",
         "description": "Increase display brightness by 5%",
         "dispatcher": "exec",
-        "command": "omarchy-brightness raise || brightnessctl set +5%",
+        "command": "omarchy-brightness-display +5%",
         "default_key": "XF86MonBrightnessUp",
     },
     {
@@ -722,7 +722,7 @@ PRESET_CATALOG = [
         "name": "Lower Brightness",
         "description": "Decrease display brightness by 5%",
         "dispatcher": "exec",
-        "command": "omarchy-brightness lower || brightnessctl set 5%-",
+        "command": "omarchy-brightness-display 5%-",
         "default_key": "XF86MonBrightnessDown",
     },
 ]

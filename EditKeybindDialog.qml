@@ -1030,9 +1030,9 @@ Item {
                 { name: "Volume Down", cmd: "omarchy-audio-output-volume lower", key: "XF86AudioLowerVolume", icon: "🔉" },
                 { name: "Mute Audio", cmd: "omarchy-audio-output-volume mute-toggle", key: "XF86AudioMute", icon: "🔇" },
                 { name: "Mute Microphone", cmd: "omarchy-audio-input-mute", key: "XF86AudioMicMute", icon: "🎤" },
-                { name: "Play / Pause", cmd: "playerctl play-pause", key: "XF86AudioPlay", icon: "⏯️" },
-                { name: "Next Track", cmd: "playerctl next", key: "XF86AudioNext", icon: "⏭️" },
-                { name: "Previous Track", cmd: "playerctl previous", key: "XF86AudioPrev", icon: "⏮️" }
+                { name: "Play / Pause", cmd: "omarchy-shell media playPause", key: "XF86AudioPlay", icon: "⏯️" },
+                { name: "Next Track", cmd: "omarchy-shell media next", key: "XF86AudioNext", icon: "⏭️" },
+                { name: "Previous Track", cmd: "omarchy-shell media previous", key: "XF86AudioPrev", icon: "⏮️" }
               ]
 
               BorderSurface {
