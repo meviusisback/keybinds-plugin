@@ -6,11 +6,12 @@ import qs.Ui
 
 // Modal dialog for adding or modifying a keybinding
 // Features a Smart Action Builder with:
-//  - Installed Applications discovery & search (from .desktop files)
-//  - Full Presets Catalog with categorized filtering
-//  - Interactive Workspace Target Builder (1-10, Next, Prev, Scratchpad)
-//  - Advanced Custom Command input with quick dispatcher helper chips
-//  - Smart Suggested Free Shortcuts & live conflict detection
+//  - 🚀 Launch App: Searchable list of installed apps (.desktop) with 1-click select
+//  - 🪟 Window & Layout: 1-click controls for close, fullscreen, float, split, and focus/swap directions
+//  - 📑 Workspaces: 1-click generator for Switch (1-10, Next, Prev, Scratchpad) and Move
+//  - ⚡ Media & System: 1-click controls for volume, brightness, media, screenshots, lock
+//  - 💻 Custom Command: Manual text editor with quick syntax insert chips (+exec, +killactive...)
+//  - Smart Suggested Free Shortcuts & live collision detection
 Item {
   id: root
 
@@ -24,26 +25,15 @@ Item {
   property string actionTitle: ""
   property string actionCommand: ""
   property string actionDispatcher: ""
-  property string actionCategory: "Custom"
+  property string actionCategory: "Applications"
   property string actionKey: ""
   property string oldKey: ""
-  property string actionType: "app" // "app" | "preset" | "workspace" | "custom"
+  property string actionType: "app" // "app" | "window" | "workspace" | "system" | "custom"
 
   // Builder state
   property bool runInTerminal: false
   property string appSearchQuery: ""
-  property string catalogSearchQuery: ""
-  property string catalogCategoryFilter: "All"
   property string workspaceSubAction: "switch" // "switch" | "move" | "silent"
-
-  readonly property var catalogCategories: [
-    "All",
-    "Window Management",
-    "Workspaces",
-    "Menus & System",
-    "Applications",
-    "Media & Audio"
-  ]
 
   property color background: Color.background
   property color foreground: Color.foreground
@@ -67,27 +57,6 @@ Item {
         out.push(a)
         if (out.length >= 36) break
       }
-    }
-    return out
-  }
-
-  // Filtered Catalog Presets
-  readonly property var filteredPresets: {
-    var list = root.catalog || []
-    var cat = root.catalogCategoryFilter
-    var q = (root.catalogSearchQuery || "").trim().toLowerCase()
-    var out = []
-    for (var i = 0; i < list.length; i++) {
-      var p = list[i]
-      if (cat !== "All" && p.category !== cat) continue
-      if (q.length > 0 &&
-          p.name.toLowerCase().indexOf(q) === -1 &&
-          p.description.toLowerCase().indexOf(q) === -1 &&
-          p.category.toLowerCase().indexOf(q) === -1) {
-        continue
-      }
-      out.push(p)
-      if (out.length >= 30) break
     }
     return out
   }
@@ -156,8 +125,6 @@ Item {
     root.oldKey = ""
     root.runInTerminal = false
     root.appSearchQuery = ""
-    root.catalogSearchQuery = ""
-    root.catalogCategoryFilter = "All"
     root.workspaceSubAction = "switch"
 
     if (presetItem) {
@@ -166,7 +133,16 @@ Item {
       root.actionDispatcher = presetItem.dispatcher || ""
       root.actionCategory = presetItem.category || "General"
       root.actionKey = presetItem.default_key || ""
-      root.actionType = "preset"
+
+      if (presetItem.category === "Workspaces") {
+        root.actionType = "workspace"
+      } else if (presetItem.category === "Window Management") {
+        root.actionType = "window"
+      } else if (presetItem.category === "Media & Audio" || presetItem.category === "Menus & System") {
+        root.actionType = "system"
+      } else {
+        root.actionType = "app"
+      }
     } else {
       root.actionTitle = ""
       root.actionCommand = ""
@@ -192,7 +168,6 @@ Item {
     root.actionType = "custom"
     root.runInTerminal = false
     root.appSearchQuery = ""
-    root.catalogSearchQuery = ""
 
     keyRecorder.value = root.actionKey
     root.opened = true
@@ -209,20 +184,32 @@ Item {
     root.actionCategory = "Applications"
   }
 
-  function selectPreset(preset) {
-    root.actionTitle = preset.name
-    root.actionCommand = preset.command
-    root.actionDispatcher = preset.dispatcher || ""
-    root.actionCategory = preset.category
-    if (!keyRecorder.value && preset.default_key) {
-      keyRecorder.value = preset.default_key
+  function selectWindowAction(name, cmd, dsp, defKey) {
+    root.actionTitle = name
+    root.actionCommand = cmd
+    root.actionDispatcher = dsp
+    root.actionCategory = "Window Management"
+    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
+  }
+
+  function selectDirectional(mode, dir, defKey) {
+    var dirName = dir === "l" ? "Left" : (dir === "r" ? "Right" : (dir === "u" ? "Up" : "Down"))
+    if (mode === "focus") {
+      root.actionTitle = "Focus Window " + dirName
+      root.actionCommand = "hyprctl dispatch movefocus " + dir
+      root.actionDispatcher = "hl.dsp.focus." + (dir === "l" ? "left()" : (dir === "r" ? "right()" : (dir === "u" ? "up()" : "down()")))
+    } else {
+      root.actionTitle = "Swap Window " + dirName
+      root.actionCommand = "hyprctl dispatch swapwindow " + dir
+      root.actionDispatcher = 'hl.dsp.window.swap({ direction = "' + dir + '" })'
     }
+    root.actionCategory = "Window Management"
+    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
   }
 
   function selectWorkspace(target) {
     var mode = root.workspaceSubAction
     var isSpecial = (target === "Scratchpad")
-    var isRelative = (target === "e+1" || target === "e-1")
 
     if (mode === "switch") {
       if (isSpecial) {
@@ -275,6 +262,14 @@ Item {
       }
     }
     root.actionCategory = "Workspaces"
+  }
+
+  function selectSystemAction(name, cmd, defKey) {
+    root.actionTitle = name
+    root.actionCommand = cmd
+    root.actionDispatcher = "exec"
+    root.actionCategory = "Media & Audio"
+    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
   }
 
   function appendDispatcher(snippet) {
@@ -359,7 +354,7 @@ Item {
               textFormat: Text.PlainText
               text: root.isEditing
                 ? "Update the shortcut chord or command parameters below."
-                : "Pick an application, preset action, workspace control, or custom command."
+                : "Select an action below — command & dispatcher are configured automatically."
               color: Util.alpha(root.foreground, 0.6)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -369,56 +364,56 @@ Item {
 
         PanelSeparator { Layout.fillWidth: true }
 
-        // 2. Action Source Mode Selector (When creating new)
+        // 2. Action Category Tabs (When creating new)
         RowLayout {
           visible: !root.isEditing
           Layout.fillWidth: true
           spacing: Style.space(6)
 
-          Text {
-            textFormat: Text.PlainText
-            text: "Mode:"
-            color: root.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            font.bold: true
-          }
-
           Button {
-            text: "🚀 Application"
+            text: "🚀 Launch App"
             selected: root.actionType === "app"
-            horizontalPadding: Style.space(12)
+            horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
             onClicked: root.actionType = "app"
           }
 
           Button {
-            text: "⚡ Presets"
-            selected: root.actionType === "preset"
-            horizontalPadding: Style.space(12)
+            text: "🪟 Window Control"
+            selected: root.actionType === "window"
+            horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
-            onClicked: root.actionType = "preset"
+            onClicked: root.actionType = "window"
           }
 
           Button {
             text: "📑 Workspace"
             selected: root.actionType === "workspace"
-            horizontalPadding: Style.space(12)
+            horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
             onClicked: root.actionType = "workspace"
           }
 
           Button {
-            text: "💻 Custom / Raw"
+            text: "⚡ System & Audio"
+            selected: root.actionType === "system"
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(4)
+            onClicked: root.actionType = "system"
+          }
+
+          Button {
+            text: "💻 Custom Script"
             selected: root.actionType === "custom"
-            horizontalPadding: Style.space(12)
+            horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
             onClicked: root.actionType = "custom"
           }
         }
 
-        // 3. Dynamic Mode Content Section
-        // --- MODE A: Installed Applications ---
+        // 3. Structured Selection Panels (NO raw command typing needed!)
+
+        // --- PANEL 1: Launch Application ---
         ColumnLayout {
           visible: !root.isEditing && root.actionType === "app"
           Layout.fillWidth: true
@@ -483,7 +478,6 @@ Item {
             }
           }
 
-          // Scrollable App Chips
           ScrollView {
             id: appScrollView
             Layout.fillWidth: true
@@ -546,127 +540,143 @@ Item {
           }
         }
 
-        // --- MODE B: Presets Catalog ---
+        // --- PANEL 2: Window & Layout Controls ---
         ColumnLayout {
-          visible: !root.isEditing && root.actionType === "preset"
+          visible: !root.isEditing && root.actionType === "window"
           Layout.fillWidth: true
           spacing: Style.space(8)
 
-          RowLayout {
-            Layout.fillWidth: true
-            spacing: Style.space(8)
-
-            TextField {
-              id: presetSearchInput
-              Layout.fillWidth: true
-              placeholderText: "Search catalog presets (e.g. Fullscreen, Close, Focus, Volume)..."
-              text: root.catalogSearchQuery
-              onTextChanged: root.catalogSearchQuery = text
-            }
+          Text {
+            textFormat: Text.PlainText
+            text: "Window Actions (Click to select):"
+            color: Util.alpha(root.foreground, 0.75)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
           }
 
-          // Category Filter Pills
           Flow {
             Layout.fillWidth: true
             spacing: Style.space(6)
 
             Repeater {
-              model: root.catalogCategories
+              model: [
+                { name: "Close Window", cmd: "hyprctl dispatch killactive", dsp: "hl.dsp.window.close()", key: "SUPER + W" },
+                { name: "Toggle Fullscreen", cmd: "hyprctl dispatch fullscreen", dsp: "hl.dsp.window.fullscreen()", key: "SUPER + F" },
+                { name: "Toggle Floating", cmd: "hyprctl dispatch togglefloating", dsp: "hl.dsp.window.float({ action = \"toggle\" })", key: "SUPER + T" },
+                { name: "Toggle Split", cmd: "hyprctl dispatch layoutmsg togglesplit", dsp: "hl.dsp.layout(\"togglesplit\")", key: "SUPER + J" },
+                { name: "Pop Window Out (Pin)", cmd: "omarchy-hyprland-window-pop", dsp: "exec", key: "SUPER + O" },
+                { name: "Close All Windows", cmd: "omarchy-hyprland-window-close-all", dsp: "exec", key: "CTRL + ALT + DELETE" },
+                { name: "Toggle Transparency", cmd: "omarchy-hyprland-window-transparency-toggle", dsp: "exec", key: "SUPER + BACKSPACE" },
+                { name: "Toggle Gaps", cmd: "omarchy-hyprland-window-gaps-toggle", dsp: "exec", key: "SUPER + SHIFT + BACKSPACE" }
+              ]
 
               BorderSurface {
-                id: catPill
-                required property string modelData
-                height: Style.space(22)
-                width: catPillText.implicitWidth + Style.space(14)
+                id: winChip
+                required property var modelData
+                height: Style.space(26)
+                width: winChipText.implicitWidth + Style.space(16)
                 radius: Style.cornerRadius
-                color: root.catalogCategoryFilter === modelData
+                color: root.actionTitle === modelData.name
                   ? Util.alpha(root.accent, 0.25)
-                  : (catMouse.containsMouse ? Util.alpha(root.foreground, 0.1) : Util.alpha(root.foreground, 0.04))
-                borderSpec: Border.flat(
-                  root.catalogCategoryFilter === modelData ? root.accent : Util.alpha(root.foreground, 0.15),
-                  1
-                )
+                  : (winMouse.containsMouse ? Util.alpha(root.foreground, 0.12) : Util.alpha(root.foreground, 0.05))
+                borderSpec: Border.flat(root.actionTitle === modelData.name ? root.accent : Util.alpha(root.foreground, 0.18), 1)
 
                 MouseArea {
-                  id: catMouse
+                  id: winMouse
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.catalogCategoryFilter = catPill.modelData
+                  onClicked: root.selectWindowAction(winChip.modelData.name, winChip.modelData.cmd, winChip.modelData.dsp, winChip.modelData.key)
                 }
 
                 Text {
-                  id: catPillText
+                  id: winChipText
                   anchors.centerIn: parent
-                  text: catPill.modelData
-                  color: root.catalogCategoryFilter === catPill.modelData ? root.accent : root.foreground
+                  text: winChip.modelData.name
+                  color: root.actionTitle === winChip.modelData.name ? root.accent : root.foreground
                   font.family: Style.font.family
-                  font.pixelSize: Style.font.caption - 1
-                  font.bold: root.catalogCategoryFilter === catPill.modelData
+                  font.pixelSize: Style.font.caption
+                  font.bold: root.actionTitle === winChip.modelData.name
                 }
               }
             }
           }
 
-          // Scrollable Preset Chips
-          ScrollView {
-            id: presetScrollView
-            Layout.fillWidth: true
-            Layout.preferredHeight: Style.space(110)
-            clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+          Text {
+            textFormat: Text.PlainText
+            text: "Move Focus / Swap Window Direction:"
+            color: Util.alpha(root.foreground, 0.75)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
 
-            Flow {
-              width: presetScrollView.availableWidth
-              spacing: Style.space(6)
+          RowLayout {
+            spacing: Style.space(6)
 
-              Repeater {
-                model: root.filteredPresets
+            Button {
+              text: "Focus ⬅️ Left"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("focus", "l", "SUPER + LEFT")
+            }
+            Button {
+              text: "Focus ➡️ Right"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("focus", "r", "SUPER + RIGHT")
+            }
+            Button {
+              text: "Focus ⬆️ Up"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("focus", "u", "SUPER + UP")
+            }
+            Button {
+              text: "Focus ⬇️ Down"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("focus", "d", "SUPER + DOWN")
+            }
+          }
 
-                BorderSurface {
-                  id: presetChip
-                  required property var modelData
-                  height: Style.space(26)
-                  width: presetChipText.implicitWidth + Style.space(16)
-                  radius: Style.cornerRadius
-                  color: root.actionTitle === modelData.name
-                    ? Util.alpha(root.accent, 0.25)
-                    : (presetMouse.containsMouse ? Util.alpha(root.foreground, 0.12) : Util.alpha(root.foreground, 0.05))
-                  borderSpec: Border.flat(
-                    root.actionTitle === modelData.name ? root.accent : Util.alpha(root.foreground, 0.18),
-                    1
-                  )
+          RowLayout {
+            spacing: Style.space(6)
 
-                  MouseArea {
-                    id: presetMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.selectPreset(presetChip.modelData)
-                  }
-
-                  Text {
-                    id: presetChipText
-                    anchors.centerIn: parent
-                    text: presetChip.modelData.name
-                    color: root.actionTitle === presetChip.modelData.name ? root.accent : root.foreground
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    font.bold: root.actionTitle === presetChip.modelData.name
-                  }
-                }
-              }
+            Button {
+              text: "Swap ⬅️ Left"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("swap", "l", "SUPER + SHIFT + LEFT")
+            }
+            Button {
+              text: "Swap ➡️ Right"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("swap", "r", "SUPER + SHIFT + RIGHT")
+            }
+            Button {
+              text: "Swap ⬆️ Up"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("swap", "u", "SUPER + SHIFT + UP")
+            }
+            Button {
+              text: "Swap ⬇️ Down"
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(3)
+              onClicked: root.selectDirectional("swap", "d", "SUPER + SHIFT + DOWN")
             }
           }
         }
 
-        // --- MODE C: Workspace Action Builder ---
+        // --- PANEL 3: Workspace Builder ---
         ColumnLayout {
           visible: !root.isEditing && root.actionType === "workspace"
           Layout.fillWidth: true
           spacing: Style.space(8)
 
-          // Sub-action toggle
           RowLayout {
             spacing: Style.space(8)
 
@@ -704,7 +714,6 @@ Item {
             }
           }
 
-          // Target workspace chips
           Text {
             textFormat: Text.PlainText
             text: "Target Workspace (Click to apply):"
@@ -752,35 +761,159 @@ Item {
           }
         }
 
-        // 4. Details Fields (Action Name & Command)
+        // --- PANEL 4: Media & System Controls ---
         ColumnLayout {
+          visible: !root.isEditing && root.actionType === "system"
           Layout.fillWidth: true
-          spacing: Style.space(4)
+          spacing: Style.space(8)
 
           Text {
             textFormat: Text.PlainText
-            text: "Action Name / Description:"
-            color: root.foreground
+            text: "Common System Shortcuts (Click to select):"
+            color: Util.alpha(root.foreground, 0.75)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             font.bold: true
           }
 
-          TextField {
-            id: descInput
+          Flow {
             Layout.fillWidth: true
-            text: root.actionTitle
-            placeholderText: "e.g. Launch Terminal, Toggle Fullscreen, My Script"
-            onTextChanged: root.actionTitle = text
+            spacing: Style.space(6)
+
+            Repeater {
+              model: [
+                { name: "Volume Up", cmd: "omarchy-audio-output-volume raise", key: "XF86AudioRaiseVolume" },
+                { name: "Volume Down", cmd: "omarchy-audio-output-volume lower", key: "XF86AudioLowerVolume" },
+                { name: "Mute Audio", cmd: "omarchy-audio-output-volume mute-toggle", key: "XF86AudioMute" },
+                { name: "Mute Microphone", cmd: "omarchy-audio-input-mute", key: "XF86AudioMicMute" },
+                { name: "Play / Pause Media", cmd: "playerctl play-pause", key: "XF86AudioPlay" },
+                { name: "Next Track", cmd: "playerctl next", key: "XF86AudioNext" },
+                { name: "Previous Track", cmd: "playerctl previous", key: "XF86AudioPrev" },
+                { name: "Raise Brightness", cmd: "brightnessctl set +5%", key: "XF86MonBrightnessUp" },
+                { name: "Lower Brightness", cmd: "brightnessctl set 5%-", key: "XF86MonBrightnessDown" },
+                { name: "Capture Screenshot", cmd: "omarchy-capture-screenshot", key: "PRINT" },
+                { name: "Screenrecord", cmd: "omarchy-capture-screenrecording", key: "ALT + PRINT" },
+                { name: "Color Picker", cmd: "pkill hyprpicker || hyprpicker -a", key: "SUPER + PRINT" },
+                { name: "Lock Screen", cmd: "omarchy-system-lock", key: "SUPER + CTRL + L" },
+                { name: "Clipboard Manager", cmd: "omarchy-shell shell toggle omarchy.clipboard", key: "SUPER + CTRL + V" },
+                { name: "Emoji Picker", cmd: "omarchy-shell shell toggle omarchy.emojis", key: "SUPER + CTRL + E" },
+                { name: "Omarchy Menu", cmd: "omarchy-menu toggle", key: "SUPER + SPACE" }
+              ]
+
+              BorderSurface {
+                id: sysChip
+                required property var modelData
+                height: Style.space(26)
+                width: sysChipText.implicitWidth + Style.space(16)
+                radius: Style.cornerRadius
+                color: root.actionTitle === modelData.name
+                  ? Util.alpha(root.accent, 0.25)
+                  : (sysMouse.containsMouse ? Util.alpha(root.foreground, 0.12) : Util.alpha(root.foreground, 0.05))
+                borderSpec: Border.flat(root.actionTitle === modelData.name ? root.accent : Util.alpha(root.foreground, 0.18), 1)
+
+                MouseArea {
+                  id: sysMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.selectSystemAction(sysChip.modelData.name, sysChip.modelData.cmd, sysChip.modelData.key)
+                }
+
+                Text {
+                  id: sysChipText
+                  anchors.centerIn: parent
+                  text: sysChip.modelData.name
+                  color: root.actionTitle === sysChip.modelData.name ? root.accent : root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: root.actionTitle === sysChip.modelData.name
+                }
+              }
+            }
           }
         }
 
-        ColumnLayout {
+        // --- AUTOMATED ACTION SUMMARY BADGE (Shown for structured modes) ---
+        BorderSurface {
+          visible: root.actionType !== "custom" && root.actionTitle.length > 0
           Layout.fillWidth: true
-          spacing: Style.space(4)
+          height: Style.space(40)
+          radius: Style.cornerRadius
+          color: Util.alpha(root.accent, 0.12)
+          borderSpec: Border.flat(root.accent, 1)
 
           RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "✓"
+              color: root.accent
+              font.bold: true
+              font.pixelSize: Style.font.body
+            }
+
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 0
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.actionTitle
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body - 1
+                font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: "Configured: " + (root.actionDispatcher ? root.actionDispatcher : root.actionCommand)
+                color: Util.alpha(root.foreground, 0.65)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption - 2
+                elide: Text.ElideRight
+              }
+            }
+          }
+        }
+
+        // --- PANEL 5: Custom Script & Manual Command (ONLY in custom mode or when editing) ---
+        ColumnLayout {
+          visible: root.actionType === "custom" || root.isEditing
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          ColumnLayout {
             Layout.fillWidth: true
+            spacing: Style.space(3)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "Action Name / Description:"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            TextField {
+              id: descInput
+              Layout.fillWidth: true
+              text: root.actionTitle
+              placeholderText: "e.g. My Custom Script"
+              onTextChanged: root.actionTitle = text
+            }
+          }
+
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(3)
+
             Text {
               textFormat: Text.PlainText
               text: "Command / Dispatcher:"
@@ -790,79 +923,67 @@ Item {
               font.bold: true
             }
 
-            Item { Layout.fillWidth: true }
-
-            Text {
-              textFormat: Text.PlainText
-              visible: root.actionDispatcher.length > 0 && root.actionDispatcher !== "exec"
-              text: "Lua Dispatcher: " + root.actionDispatcher
-              color: root.accent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption - 2
-            }
-          }
-
-          TextField {
-            id: cmdInput
-            Layout.fillWidth: true
-            text: root.actionCommand
-            placeholderText: "e.g. ghostty, hyprctl dispatch killactive, omarchy capture screenshot"
-            onTextChanged: {
-              root.actionCommand = text
-              if (root.actionType === "custom") {
-                root.actionDispatcher = ""
+            TextField {
+              id: cmdInput
+              Layout.fillWidth: true
+              text: root.actionCommand
+              placeholderText: "e.g. ghostty -e btop, hyprctl dispatch killactive"
+              onTextChanged: {
+                root.actionCommand = text
+                if (root.actionType === "custom") {
+                  root.actionDispatcher = ""
+                }
               }
             }
-          }
 
-          // Quick Dispatcher Insert Chips (For Custom / Raw mode or Editing)
-          Flow {
-            visible: root.actionType === "custom" || root.isEditing
-            Layout.fillWidth: true
-            spacing: Style.space(6)
+            // Quick Dispatcher Helper Chips
+            Flow {
+              Layout.fillWidth: true
+              spacing: Style.space(6)
 
-            Repeater {
-              model: [
-                { label: "+ exec", val: "ghostty -e " },
-                { label: "+ killactive", val: "hyprctl dispatch killactive" },
-                { label: "+ togglefloating", val: "hyprctl dispatch togglefloating" },
-                { label: "+ fullscreen", val: "hyprctl dispatch fullscreen 0" },
-                { label: "+ movefocus l", val: "hyprctl dispatch movefocus l" },
-                { label: "+ swapwindow l", val: "hyprctl dispatch swapwindow l" },
-                { label: "+ workspace", val: "hyprctl dispatch workspace " }
-              ]
+              Repeater {
+                model: [
+                  { label: "+ exec", val: "ghostty -e " },
+                  { label: "+ killactive", val: "hyprctl dispatch killactive" },
+                  { label: "+ togglefloating", val: "hyprctl dispatch togglefloating" },
+                  { label: "+ fullscreen", val: "hyprctl dispatch fullscreen 0" },
+                  { label: "+ movefocus l", val: "hyprctl dispatch movefocus l" },
+                  { label: "+ swapwindow l", val: "hyprctl dispatch swapwindow l" },
+                  { label: "+ workspace", val: "hyprctl dispatch workspace " }
+                ]
 
-              BorderSurface {
-                id: insertChip
-                required property var modelData
-                height: Style.space(22)
-                width: insertChipText.implicitWidth + Style.space(12)
-                radius: Style.cornerRadius
-                color: insertMouse.containsMouse ? Util.alpha(root.accent, 0.2) : Util.alpha(root.foreground, 0.05)
-                borderSpec: Border.flat(insertMouse.containsMouse ? root.accent : Util.alpha(root.foreground, 0.15), 1)
+                BorderSurface {
+                  id: insertChip
+                  required property var modelData
+                  height: Style.space(22)
+                  width: insertChipText.implicitWidth + Style.space(12)
+                  radius: Style.cornerRadius
+                  color: insertMouse.containsMouse ? Util.alpha(root.accent, 0.2) : Util.alpha(root.foreground, 0.05)
+                  borderSpec: Border.flat(insertMouse.containsMouse ? root.accent : Util.alpha(root.foreground, 0.15), 1)
 
-                MouseArea {
-                  id: insertMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.appendDispatcher(insertChip.modelData.val)
-                }
+                  MouseArea {
+                    id: insertMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.appendDispatcher(insertChip.modelData.val)
+                  }
 
-                Text {
-                  id: insertChipText
-                  anchors.centerIn: parent
-                  text: insertChip.modelData.label
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption - 1
+                  Text {
+                    id: insertChipText
+                    anchors.centerIn: parent
+                    text: insertChip.modelData.label
+                    color: root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption - 1
+                  }
                 }
               }
             }
           }
         }
 
-        // 5. Interactive Shortcut Key Input & Suggestions
+        // 4. Interactive Shortcut Key Input & Suggestions
         ColumnLayout {
           Layout.fillWidth: true
           spacing: Style.space(6)
@@ -970,7 +1091,7 @@ Item {
 
         PanelSeparator { Layout.fillWidth: true }
 
-        // 6. Modal Footer Buttons
+        // 5. Modal Footer Buttons
         RowLayout {
           Layout.fillWidth: true
           spacing: Style.space(12)
