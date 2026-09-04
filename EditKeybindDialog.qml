@@ -184,10 +184,13 @@ Item {
   }
 
   function selectApp(app) {
+    if (!app) return
     root.selectedActionId = "app:" + app.name
     root.actionTitle = app.name
-    var cmd = app.exec
-    if (root.runInTerminal && !app.terminal) {
+    var needsTerminal = app.terminal || root.runInTerminal
+    root.runInTerminal = needsTerminal
+    var cmd = app.exec || ""
+    if (needsTerminal && !cmd.startsWith("ghostty -e ")) {
       cmd = "ghostty -e " + cmd
     }
     root.actionCommand = cmd
@@ -201,7 +204,10 @@ Item {
     root.actionCommand = cmd
     root.actionDispatcher = dsp
     root.actionCategory = "Window Management"
-    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
+    if (!keyRecorder.value && defKey) {
+      keyRecorder.value = defKey
+      root.actionKey = defKey
+    }
   }
 
   function selectDirectional(mode, dir, defKey) {
@@ -210,14 +216,17 @@ Item {
     if (mode === "focus") {
       root.actionTitle = "Focus Window " + dirName
       root.actionCommand = "hyprctl dispatch movefocus " + dir
-      root.actionDispatcher = "hl.dsp.focus." + (dir === "l" ? "left()" : (dir === "r" ? "right()" : (dir === "u" ? "up()" : "down()")))
+      root.actionDispatcher = 'hl.dsp.focus({ direction = "' + dir + '" })'
     } else {
       root.actionTitle = "Swap Window " + dirName
       root.actionCommand = "hyprctl dispatch swapwindow " + dir
       root.actionDispatcher = 'hl.dsp.window.swap({ direction = "' + dir + '" })'
     }
     root.actionCategory = "Window Management"
-    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
+    if (!keyRecorder.value && defKey) {
+      keyRecorder.value = defKey
+      root.actionKey = defKey
+    }
   }
 
   function selectWorkspace(target) {
@@ -231,49 +240,69 @@ Item {
         root.actionTitle = "Toggle Scratchpad"
         root.actionCommand = "hyprctl dispatch togglespecialworkspace scratchpad"
         root.actionDispatcher = 'hl.dsp.workspace.toggle_special("scratchpad")'
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + S"
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + S"; root.actionKey = "SUPER + S" }
       } else if (target === "e+1") {
         root.actionTitle = "Next Workspace"
         root.actionCommand = "hyprctl dispatch workspace e+1"
         root.actionDispatcher = 'hl.dsp.focus({ workspace = "e+1" })'
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + TAB"
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + TAB"; root.actionKey = "SUPER + TAB" }
       } else if (target === "e-1") {
         root.actionTitle = "Previous Workspace"
         root.actionCommand = "hyprctl dispatch workspace e-1"
         root.actionDispatcher = 'hl.dsp.focus({ workspace = "e-1" })'
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + SHIFT + TAB"
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + TAB"; root.actionKey = "SUPER + SHIFT + TAB" }
       } else {
         root.actionTitle = "Switch to Workspace " + target
         root.actionCommand = "hyprctl dispatch workspace " + target
         root.actionDispatcher = 'hl.dsp.focus({ workspace = "' + target + '" })'
         var num = parseInt(target) % 10
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + " + num
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + " + num; root.actionKey = "SUPER + " + num }
       }
     } else if (mode === "move") {
       if (isSpecial) {
         root.actionTitle = "Move Window to Scratchpad"
         root.actionCommand = "hyprctl dispatch movetoworkspace special:scratchpad"
         root.actionDispatcher = 'hl.dsp.window.move({ workspace = "special:scratchpad" })'
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + ALT + S"
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + ALT + S"; root.actionKey = "SUPER + ALT + S" }
+      } else if (target === "e+1") {
+        root.actionTitle = "Move Window to Next Workspace"
+        root.actionCommand = "hyprctl dispatch movetoworkspace e+1"
+        root.actionDispatcher = 'hl.dsp.window.move({ workspace = "e+1" })'
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + RIGHT"; root.actionKey = "SUPER + SHIFT + RIGHT" }
+      } else if (target === "e-1") {
+        root.actionTitle = "Move Window to Previous Workspace"
+        root.actionCommand = "hyprctl dispatch movetoworkspace e-1"
+        root.actionDispatcher = 'hl.dsp.window.move({ workspace = "e-1" })'
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + LEFT"; root.actionKey = "SUPER + SHIFT + LEFT" }
       } else {
         root.actionTitle = "Move Window to Workspace " + target
         root.actionCommand = "hyprctl dispatch movetoworkspace " + target
         root.actionDispatcher = 'hl.dsp.window.move({ workspace = "' + target + '" })'
         var n = parseInt(target) % 10
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + SHIFT + " + n
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + " + n; root.actionKey = "SUPER + SHIFT + " + n }
       }
     } else if (mode === "silent") {
       if (isSpecial) {
         root.actionTitle = "Move Window to Scratchpad (Silent)"
         root.actionCommand = "hyprctl dispatch movetoworkspacesilent special:scratchpad"
         root.actionDispatcher = 'hl.dsp.window.move({ workspace = "special:scratchpad", follow = false })'
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + SHIFT + ALT + S"
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + ALT + S"; root.actionKey = "SUPER + SHIFT + ALT + S" }
+      } else if (target === "e+1") {
+        root.actionTitle = "Move Window to Next Workspace (Silent)"
+        root.actionCommand = "hyprctl dispatch movetoworkspacesilent e+1"
+        root.actionDispatcher = 'hl.dsp.window.move({ workspace = "e+1", follow = false })'
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + ALT + RIGHT"; root.actionKey = "SUPER + SHIFT + ALT + RIGHT" }
+      } else if (target === "e-1") {
+        root.actionTitle = "Move Window to Previous Workspace (Silent)"
+        root.actionCommand = "hyprctl dispatch movetoworkspacesilent e-1"
+        root.actionDispatcher = 'hl.dsp.window.move({ workspace = "e-1", follow = false })'
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + ALT + LEFT"; root.actionKey = "SUPER + SHIFT + ALT + LEFT" }
       } else {
         root.actionTitle = "Move Window to Workspace " + target + " (Silent)"
         root.actionCommand = "hyprctl dispatch movetoworkspacesilent " + target
         root.actionDispatcher = 'hl.dsp.window.move({ workspace = "' + target + '", follow = false })'
         var ns = parseInt(target) % 10
-        if (!keyRecorder.value) keyRecorder.value = "SUPER + SHIFT + ALT + " + ns
+        if (!keyRecorder.value) { keyRecorder.value = "SUPER + SHIFT + ALT + " + ns; root.actionKey = "SUPER + SHIFT + ALT + " + ns }
       }
     }
     root.actionCategory = "Workspaces"
@@ -285,7 +314,10 @@ Item {
     root.actionCommand = cmd
     root.actionDispatcher = "exec"
     root.actionCategory = "Media & Audio"
-    if (!keyRecorder.value && defKey) keyRecorder.value = defKey
+    if (!keyRecorder.value && defKey) {
+      keyRecorder.value = defKey
+      root.actionKey = defKey
+    }
   }
 
   function appendDispatcher(snippet) {
@@ -300,6 +332,12 @@ Item {
     root.opened = false
     keyRecorder.stopRecording()
     root.canceled()
+  }
+
+  onOpenedChanged: {
+    if (!opened) {
+      keyRecorder.stopRecording()
+    }
   }
 
   visible: opened
@@ -348,7 +386,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: ""
-            color: "white"
+            color: root.accent
             font.family: Style.font.family
             font.pixelSize: Style.font.title + 6
           }
@@ -569,7 +607,7 @@ Item {
 
                     ToolTip.visible: appMouse.containsMouse
                     ToolTip.delay: 500
-                    ToolTip.text: appChip.modelData.cmd ? ("Command: " + appChip.modelData.cmd) : appChip.modelData.name
+                    ToolTip.text: appChip.modelData.exec ? ("Command: " + appChip.modelData.exec) : appChip.modelData.name
                   }
 
                   RowLayout {
@@ -1214,7 +1252,7 @@ Item {
 
               Text {
                 textFormat: Text.PlainText
-                text: "Configured: " + (root.actionDispatcher ? root.actionDispatcher : root.actionCommand)
+                text: "Configured: " + (root.actionDispatcher && root.actionDispatcher !== "exec" ? root.actionDispatcher : root.actionCommand)
                 color: Util.alpha(root.foreground, 0.65)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption - 1
@@ -1395,6 +1433,11 @@ Item {
             onKeyChanged: function(newK) {
               root.actionKey = newK
             }
+            onValueChanged: {
+              if (keyRecorder.value && keyRecorder.value !== root.actionKey) {
+                root.actionKey = keyRecorder.value
+              }
+            }
           }
 
           // Smart Suggested Free Combinations Card
@@ -1501,7 +1544,7 @@ Item {
             selected: true
             horizontalPadding: Style.space(22)
             verticalPadding: Style.space(6)
-            enabled: root.actionTitle.length > 0 && root.actionKey.length > 0
+            enabled: root.actionTitle.trim().length > 0 && root.actionKey.trim().length > 0 && (root.actionCommand.trim().length > 0 || (root.actionDispatcher && root.actionDispatcher.trim().length > 0))
             onClicked: {
               root.saved(
                 root.actionKey,
@@ -1511,6 +1554,7 @@ Item {
                 root.oldKey,
                 true
               )
+              keyRecorder.stopRecording()
               root.opened = false
             }
           }
