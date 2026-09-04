@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import stat
+import glob
+import configparser
 
 DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
 USER_BINDINGS_PATH = os.path.expanduser("~/.config/hypr/bindings.lua")
@@ -566,7 +568,195 @@ PRESET_CATALOG = [
         "command": "omarchy-capture-text",
         "default_key": "SUPER + CTRL + PRINT",
     },
+    # Workspaces 1-10 Switching & Window Movement
+    *[
+        {
+            "id": f"ws.switch_{i}",
+            "category": "Workspaces",
+            "name": f"Switch to Workspace {i}",
+            "description": f"Switch active focus to workspace {i}",
+            "dispatcher": f'hl.dsp.focus({{ workspace = "{i}" }})',
+            "command": f"hyprctl dispatch workspace {i}",
+            "default_key": f"SUPER + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    *[
+        {
+            "id": f"ws.move_{i}",
+            "category": "Workspaces",
+            "name": f"Move Window to Workspace {i}",
+            "description": f"Move active window to workspace {i}",
+            "dispatcher": f'hl.dsp.window.move({{ workspace = "{i}" }})',
+            "command": f"hyprctl dispatch movetoworkspace {i}",
+            "default_key": f"SUPER + SHIFT + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    *[
+        {
+            "id": f"ws.movesilent_{i}",
+            "category": "Workspaces",
+            "name": f"Move Window to Workspace {i} (Silent)",
+            "description": f"Move active window to workspace {i} without switching focus",
+            "dispatcher": f'hl.dsp.window.move({{ workspace = "{i}", follow = false }})',
+            "command": f"hyprctl dispatch movetoworkspacesilent {i}",
+            "default_key": f"SUPER + SHIFT + ALT + {i % 10}",
+        }
+        for i in range(1, 11)
+    ],
+    # Window Swapping
+    {
+        "id": "win.swap_left",
+        "category": "Window Management",
+        "name": "Swap Window Left",
+        "description": "Swap active window with the window to the left",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "l" })',
+        "command": "hyprctl dispatch swapwindow l",
+        "default_key": "SUPER + SHIFT + LEFT",
+    },
+    {
+        "id": "win.swap_right",
+        "category": "Window Management",
+        "name": "Swap Window Right",
+        "description": "Swap active window with the window to the right",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "r" })',
+        "command": "hyprctl dispatch swapwindow r",
+        "default_key": "SUPER + SHIFT + RIGHT",
+    },
+    {
+        "id": "win.swap_up",
+        "category": "Window Management",
+        "name": "Swap Window Up",
+        "description": "Swap active window with the window above",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "u" })',
+        "command": "hyprctl dispatch swapwindow u",
+        "default_key": "SUPER + SHIFT + UP",
+    },
+    {
+        "id": "win.swap_down",
+        "category": "Window Management",
+        "name": "Swap Window Down",
+        "description": "Swap active window with the window below",
+        "dispatcher": 'hl.dsp.window.swap({ direction = "d" })',
+        "command": "hyprctl dispatch swapwindow d",
+        "default_key": "SUPER + SHIFT + DOWN",
+    },
+    # Media Playback Controls
+    {
+        "id": "media.play_pause",
+        "category": "Media & Audio",
+        "name": "Play / Pause Media",
+        "description": "Toggle media playback",
+        "dispatcher": "exec",
+        "command": "playerctl play-pause",
+        "default_key": "XF86AudioPlay",
+    },
+    {
+        "id": "media.next_track",
+        "category": "Media & Audio",
+        "name": "Next Track",
+        "description": "Skip to next media track",
+        "dispatcher": "exec",
+        "command": "playerctl next",
+        "default_key": "XF86AudioNext",
+    },
+    {
+        "id": "media.prev_track",
+        "category": "Media & Audio",
+        "name": "Previous Track",
+        "description": "Return to previous media track",
+        "dispatcher": "exec",
+        "command": "playerctl previous",
+        "default_key": "XF86AudioPrev",
+    },
+    # Display Brightness
+    {
+        "id": "media.brightness_up",
+        "category": "Media & Audio",
+        "name": "Raise Brightness",
+        "description": "Increase display brightness by 5%",
+        "dispatcher": "exec",
+        "command": "omarchy-brightness raise || brightnessctl set +5%",
+        "default_key": "XF86MonBrightnessUp",
+    },
+    {
+        "id": "media.brightness_down",
+        "category": "Media & Audio",
+        "name": "Lower Brightness",
+        "description": "Decrease display brightness by 5%",
+        "dispatcher": "exec",
+        "command": "omarchy-brightness lower || brightnessctl set 5%-",
+        "default_key": "XF86MonBrightnessDown",
+    },
 ]
+
+_INSTALLED_APPS_CACHE = None
+
+def get_installed_apps():
+    """Scan standard XDG application directories for launchable applications.
+    Returns a sorted list of unique applications: [{'name': ..., 'exec': ..., 'icon': ..., 'comment': ..., 'terminal': bool}]
+    """
+    global _INSTALLED_APPS_CACHE
+    if _INSTALLED_APPS_CACHE is not None:
+        return _INSTALLED_APPS_CACHE
+
+    apps = []
+    seen = set()
+    dirs = [
+        os.path.expanduser("~/.local/share/applications"),
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+    ]
+
+    for app_dir in dirs:
+        if not os.path.isdir(app_dir):
+            continue
+        for desktop_file in sorted(glob.glob(os.path.join(app_dir, "*.desktop"))):
+            cp = configparser.RawConfigParser()
+            try:
+                cp.read(desktop_file, encoding="utf-8")
+                if not cp.has_section("Desktop Entry"):
+                    continue
+                entry = cp["Desktop Entry"]
+                if entry.get("Type", "Application") != "Application":
+                    continue
+                if entry.get("NoDisplay", "false").lower() == "true":
+                    continue
+                if entry.get("Hidden", "false").lower() == "true":
+                    continue
+
+                name = entry.get("Name", "").strip()
+                exec_cmd = entry.get("Exec", "").strip()
+                if not name or not exec_cmd:
+                    continue
+
+                # Strip field codes like %u, %f, %F, %U
+                parts = exec_cmd.split()
+                clean_parts = [p for p in parts if not (p.startswith("%") and len(p) == 2)]
+                clean_exec = " ".join(clean_parts)
+                if not clean_exec:
+                    clean_exec = exec_cmd
+
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                apps.append({
+                    "name": name,
+                    "exec": clean_exec,
+                    "icon": entry.get("Icon", "").strip(),
+                    "comment": entry.get("Comment", "").strip(),
+                    "terminal": entry.get("Terminal", "false").lower() == "true",
+                })
+            except Exception:
+                continue
+
+    apps.sort(key=lambda x: x["name"].lower())
+    _INSTALLED_APPS_CACHE = apps
+    return apps
+
 
 
 def normalize_key_chord(key_chord: str) -> str:
@@ -903,6 +1093,7 @@ def build_complete_model():
         "active": all_active,
         "catalog": catalog,
         "conflicts": conflicts,
+        "apps": get_installed_apps(),
         "total_active": len([b for b in all_active if b.get("status") != "disabled"]),
         "total_modified": total_modified,
         "total_conflicts": len(conflicts),
@@ -1337,6 +1528,9 @@ def main():
     elif cmd == "menu-remove":
         res = remove_menu_entry()
         print(json.dumps(res))
+
+    elif cmd == "apps":
+        print(json.dumps(get_installed_apps()))
 
     else:
         print(json.dumps({"success": False, "error": f"Unknown command {cmd}"}))

@@ -1597,6 +1597,7 @@ Item {
         anchors.fill: parent
         allBindings: root.modelData.active
         catalog: root.modelData.catalog
+        apps: (root.modelData && root.modelData.apps) || []
         onSaved: function(key, desc, cmd, act, oldK, overrideConf) {
           root.saveKeybinding(key, desc, cmd, act, oldK, overrideConf)
         }

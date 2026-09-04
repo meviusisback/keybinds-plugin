@@ -258,6 +258,33 @@ class TestKeybindsBackend(unittest.TestCase):
             if os.path.exists(tmp_path + ".bak"):
                 os.remove(tmp_path + ".bak")
 
+    def test_get_installed_apps(self):
+        apps = keybinds_manager.get_installed_apps()
+        self.assertIsInstance(apps, list)
+        if apps:
+            first = apps[0]
+            self.assertIn("name", first)
+            self.assertIn("exec", first)
+            self.assertIn("icon", first)
+            self.assertIn("terminal", first)
+            # Verify alphabetical ordering
+            names = [a["name"].lower() for a in apps]
+            self.assertEqual(names, sorted(names))
+
+    def test_expanded_catalog(self):
+        catalog_ids = {p["id"] for p in keybinds_manager.PRESET_CATALOG}
+        self.assertIn("ws.switch_1", catalog_ids)
+        self.assertIn("ws.switch_10", catalog_ids)
+        self.assertIn("ws.move_1", catalog_ids)
+        self.assertIn("win.swap_left", catalog_ids)
+        self.assertIn("media.play_pause", catalog_ids)
+        self.assertIn("media.brightness_up", catalog_ids)
+
+    def test_build_complete_model_includes_apps(self):
+        model = keybinds_manager.build_complete_model()
+        self.assertIn("apps", model)
+        self.assertIsInstance(model["apps"], list)
+
 
 if __name__ == "__main__":
     unittest.main()
