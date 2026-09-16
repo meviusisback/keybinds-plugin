@@ -30,5 +30,19 @@ if [[ ! -d "$HOME/.config/omarchy/plugins/$PLUGIN_ID" ]]; then
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 fi
 
-# Summon the GUI panel
-omarchy-shell shell summon "$PLUGIN_ID" '{}'
+# Summon the GUI panel. The IPC replies "ok" on success and "unknown" when the
+# shell refuses the summon (e.g. the plugin is disabled), with exit code 0 in
+# both cases — so fail loudly here instead of leaving a silent no-op.
+summon_reply="$(omarchy-shell shell summon "$PLUGIN_ID" '{}')"
+if [[ $? -ne 0 ]]; then
+  echo "omarchy-keybinds: cannot reach omarchy-shell (is the shell running?)" >&2
+  exit 1
+fi
+if [[ "$summon_reply" != "ok" ]]; then
+  echo "omarchy-keybinds: omarchy-shell refused the summon (reply: '${summon_reply:-(empty)}')." >&2
+  echo "The plugin is most likely disabled. Enable it with:" >&2
+  echo "  omarchy plugin enable $PLUGIN_ID" >&2
+  echo "If it still refuses, check the shell log:" >&2
+  echo "  journalctl --user --identifier omarchy-shell -f" >&2
+  exit 1
+fi
