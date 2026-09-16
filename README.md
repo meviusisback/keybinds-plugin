@@ -64,6 +64,11 @@ Or summon via the shell IPC:
 omarchy-shell shell summon meviusisback.keybinds '{}'
 ```
 
+Note: as a `panel` plugin, nothing appears until it is summoned, and the raw IPC
+exits 0 even when the shell refuses it (it answers `ok` / `unknown` — e.g. while
+the plugin is disabled). The wrapper turns a refusal into a visible error with
+the matching `omarchy plugin enable` hint.
+
 ---
 
 ## 🛠️ CLI Command Reference
