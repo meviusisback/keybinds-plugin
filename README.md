@@ -1,84 +1,71 @@
-# Omarchy Keybindings Plugin (`meviusisback.keybinds`)
+<div align="center">
 
-![](infographic.png)
+# Keybindings
 
-[![Omarchy Linux](https://img.shields.io/badge/Omarchy-Hyprland%20Plugin-blue)](https://omarchy.org)
-[![Quickshell](https://img.shields.io/badge/Frontend-Quickshell%20%2F%20QML-orange)](https://quickshell.outfoxxed.me/)
-[![Python 3.10+](https://img.shields.io/badge/Backend-Python%203-green)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+**A graphical frontend for Omarchy keybindings: view, search, modify and create Hyprland shortcuts with live key recording, smart free-key recommendations, collision detection and safe Lua sync.**
 
-A modern, intuitive graphical frontend plugin for **[Omarchy Linux](https://omarchy.org)** to view, search, modify, and create Hyprland keybindings with live interactive key recording, smart free key recommendations, collision detection, and safe Lua synchronization.
+[![License: MIT](https://img.shields.io/github/license/meviusisback/keybinds-plugin)](LICENSE)
+![Linux](https://img.shields.io/badge/linux-supported-1793d1)
 
----
+![Keybindings manager panel](preview.png)
+![Keybindings feature overview](infographic.png)
 
-## ✨ Features
+</div>
 
-- **🚀 On-Demand Launch**: Summon the floating manager anytime via `omarchy-shell shell summon meviusisback.keybinds` (or bind it to a key) — no top status bar clutter.
-- **🔤 Alphabetical Sorting**: All active keybindings and catalog presets are strictly sorted in case-insensitive alphabetical order by action name.
-- **⭐ Dedicated Modified & Custom Section**: Easily review and manage all personal shortcut overrides and custom keybindings in one place with 1-click **↺ Reset to Default** and **🗑️ Delete**.
-- **💡 Smart Free Key Recommendations**: When creating or editing an action, the modal automatically scans for 100% free, unassigned shortcuts matching the action's first letter (e.g. `SUPER + S`, `SUPER + SHIFT + S` for *Spotify*) and offers 1-click suggestion chips.
-- **⌨️ Multi-Method Key Recorder**:
-  - Live keyboard capture: click to record and press any combination.
-  - Modifier toggle pills: toggle <kbd>SUPER</kbd>, <kbd>CTRL</kbd>, <kbd>ALT</kbd>, or <kbd>SHIFT</kbd> with ease.
-  - Quick-key chips: instantly select common special keys (<kbd>RETURN</kbd>, <kbd>SPACE</kbd>, <kbd>ESCAPE</kbd>, <kbd>TAB</kbd>, <kbd>F1-F12</kbd>).
-- **⚠️ Collision Detection & 1-Click Rebind**: Detects shortcut collisions in real-time, displays detailed conflict cards, and offers 1-click rebind options for colliding actions.
-- **📜 Actions Catalog**: Browse pre-configured Hyprland / Omarchy window management, workspace, media, and system presets ready to bind.
-- **🖱️ Mouse Scroll Sync**: Automatically respects your configured scroll sensitivity multiplier (`scroll_factor`) and direction (`natural_scroll`) from the [Mouse Settings](https://github.com/meviusisback/mouse-settings) plugin (`meviusisback.mouse-settings`).
-- **🔍 Record-to-Find Shortcut Lookup**: Click **Record to Find** next to the search bar and press any key chord on your keyboard to instantly locate its assigned action (or reveal that it's unassigned with a 1-click **+ Create Keybinding** shortcut).
-- **🔄 Safe Lua Sync & Live Reload**: Writes directly to `~/.config/hypr/bindings.lua` (with automatic `.bak` backups) and invokes `hyprctl reload` for instantaneous application without session restarts.
+## Why
 
----
+Editing Hyprland keybindings by hand means memorizing chords, guessing free combinations and hoping your Lua still parses. This plugin replaces that loop with a visual manager: see every binding sorted and searchable, record a new chord by pressing it, get told about collisions before they bite, and let the plugin write `bindings.lua` safely — with a backup every time and a live reload, no session restart.
 
-## 🚀 Installation
+## Features
 
-Install directly from the marketplace with the Omarchy CLI (it clones and links the plugin into `~/.config/omarchy/plugins/`):
+- **On-demand launch** — summon the floating manager anytime via `omarchy-shell shell summon meviusisback.keybinds` (or bind it to a key); as a `panel` plugin, nothing sits in the top bar until summoned.
+- **Alphabetical sorting** — all active keybindings and catalog presets, strictly case-insensitive by action name.
+- **Dedicated Modified & Custom section** — review all personal shortcut overrides and custom keybindings in one place, with 1-click **↺ Reset to Default** and **🗑️ Delete**.
+- **Smart free-key recommendations** — when creating or editing an action, the modal scans for 100% free, unassigned shortcuts matching the action's first letter (e.g. `SUPER + S`, `SUPER + SHIFT + S` for Spotify) with 1-click suggestion chips.
+- **Multi-method key recorder** — live keyboard capture (click to record, press any combination); modifier toggle pills (<kbd>SUPER</kbd>, <kbd>CTRL</kbd>, <kbd>ALT</kbd>, <kbd>SHIFT</kbd>); quick-key chips for special keys (<kbd>RETURN</kbd>, <kbd>SPACE</kbd>, <kbd>ESCAPE</kbd>, <kbd>TAB</kbd>, <kbd>F1-F12</kbd>).
+- **Collision detection & 1-click rebind** — shortcut conflicts surface in real time as detailed cards with 1-click rebind options for the colliding actions.
+- **Actions catalog** — pre-configured Hyprland / Omarchy window-management, workspace, media and system presets ready to bind.
+- **Mouse scroll sync** — respects your scroll sensitivity multiplier (`scroll_factor`) and direction (`natural_scroll`) from the [Mouse Settings](https://github.com/meviusisback/mouse-settings) plugin (`meviusisback.mouse-settings`).
+- **Record-to-find lookup** — press **Record to Find** next to the search bar and hit any key chord to locate its assigned action instantly (or get a 1-click **+ Create Keybinding** when it's unassigned).
+- **Safe Lua sync & live reload** — writes directly to `~/.config/hypr/bindings.lua` (with automatic `.bak` backups) and invokes `hyprctl reload` for instantaneous application without session restarts.
+
+## Install
+
 ```bash
 omarchy plugin add https://github.com/meviusisback/keybinds-plugin --enable
 ```
 
-On first launch, the plugin will offer to add a **Keybindings Manager** entry to your Omarchy launcher (Setup → Keybindings → Keybindings Manager). You can accept or dismiss this — it only asks once per session. You can also toggle this anytime from the **📋 Add to Launcher** / **✓ In Launcher** button in the app's header bar.
+On first launch, the plugin offers to add a **Keybindings Manager** entry to your Omarchy launcher (Setup → Keybindings → Keybindings Manager). It asks once per session — accept or dismiss — and you can toggle it anytime from the **📋 Add to Launcher** / **✓ In Launcher** button in the header bar.
 
----
+## Usage
 
-## 📖 Usage
+From the desktop: summon with `omarchy-shell shell summon meviusisback.keybinds` (or your launcher/keybinding), then search by shortcut (e.g. `SUPER + W`), action name (e.g. `Terminal`), category or command.
 
-### From the Graphical Desktop
-1. Summon the plugin via `omarchy-shell shell summon meviusisback.keybinds` (or your configured launcher/keybinding).
-2. Search by shortcut (e.g. `SUPER + W`), action name (e.g. `Terminal`), category, or command.
+From the terminal — the `bin/` directory is **not** on `PATH` by default (Omarchy only puts `/usr/share/omarchy/bin` there). Either call the wrapper by its installed path:
 
-### From the Terminal
-
-The plugin's `bin/` directory is **not** on `PATH` by default — Omarchy only puts
-`/usr/share/omarchy/bin` there. Either call the wrapper by its installed path:
 ```bash
 ~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds
 ```
+
 or link it once into your personal bin (the wrapper resolves symlinks correctly):
+
 ```bash
 mkdir -p ~/.local/bin
 ln -s ~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds ~/.local/bin/omarchy-keybinds
 omarchy-keybinds   # launch the GUI directly
 ```
+
 Or summon via the shell IPC:
+
 ```bash
-omarchy-shell shell summon meviusisback.keybinds '{}'
+omarchy-shell shell summon meviusisback.keybinds
 ```
 
-Note: as a `panel` plugin, nothing appears until it is summoned, and the raw IPC
-exits 0 even when the shell refuses it (it answers `ok` / `unknown` — e.g. while
-the plugin is disabled). The wrapper turns a refusal into a visible error with
-the matching `omarchy plugin enable` hint.
+Note: the raw IPC exits 0 even when the shell refuses it (it answers `ok` / `unknown` — e.g. while the plugin is disabled). The wrapper turns a refusal into a visible error with the matching `omarchy plugin enable` hint, instead of exiting 0 silently.
 
----
-
-## 🛠️ CLI Command Reference
-
-The plugin includes a full-featured CLI backend engine:
+CLI reference (full backend engine):
 
 ```bash
-# One-time setup if you want the short command name (see "From the Terminal"):
-#   ln -s ~/.config/omarchy/plugins/meviusisback.keybinds/bin/omarchy-keybinds ~/.local/bin/omarchy-keybinds
-
 # List all active keybindings, presets, conflicts, and mouse settings in JSON
 omarchy-keybinds list
 
@@ -100,69 +87,35 @@ omarchy-keybinds enable "SUPER + W"
 omarchy-keybinds reload
 ```
 
----
+## Requirements
 
-## ⚙️ Configuration & Lua Sync
+- Omarchy Linux with Hyprland (bindings live in `~/.config/hypr/bindings.lua`; reload via `hyprctl`)
+- Quickshell / QML shell for the graphical frontend
+- Python 3.10+ (backend engine, standard library)
+
+## Configuration
 
 The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
-- **Custom / Rebound Keybindings**: Generated with standard `o.bind(...)` directives.
-- **Disabled Keybindings**: Generated with `hl.unbind(...)` directives.
-- **Safety Backups**: A backup (`bindings.lua.bak`) is created automatically before any write operation.
-- **Comment Preservation**: Personal comments and manual custom blocks in `bindings.lua` are preserved.
+- **Custom / rebound keybindings** — generated with standard `o.bind(...)` directives.
+- **Disabled keybindings** — generated with `hl.unbind(...)` directives.
+- **Safety backups** — a backup (`bindings.lua.bak`) is created automatically before any write operation.
+- **Comment preservation** — personal comments and manual custom blocks in `bindings.lua` are preserved.
 
----
+## How it works
 
-## 🧪 Testing
+The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back with validated, escaped values via atomic rename (invalid chords that could break out of a Lua literal are rejected). The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, only your keybinding files are read — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
-Automated unit tests cover key normalization, Lua parser safety, comment handling, unbind detection, and conflict evaluation:
+Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 14 tests covering key normalization, Lua parser safety, comment handling, unbind detection and conflict evaluation.
 
-```bash
-python3 -m unittest discover -s tests -p "test_*.py"
-```
-
----
-
----
-
-## 🗑️ Removal
+## Removal
 
 ```bash
-# Remove the plugin from Omarchy (keeps your personal ~/.config/hypr/bindings.lua untouched)
-omarchy-shell shell hide meviusisback.keybinds >/dev/null 2>&1 || true
-omarchy-shell shell removePlugin meviusisback.keybinds >/dev/null 2>&1 || true
-rm -f ~/.config/omarchy/plugins/meviusisback.keybinds
+omarchy plugin remove meviusisback.keybinds
 ```
 
----
+Keeps your personal `~/.config/hypr/bindings.lua` untouched.
 
-## 🔒 Security & Privacy
+## License
 
-- **Local-only**: The plugin runs entirely on your machine. It has **no network access**, no telemetry, and reads only your Hyprland keybinding configuration (`~/.config/hypr/bindings.lua` and the Omarchy default bindings).
-- **No keylogging**: The interactive recorder captures keystrokes only in-memory to display the pressed chord; nothing is persisted to disk or transmitted.
-- **Safe Lua writes**: All key chords, descriptions, and commands are validated and escaped before being written to `bindings.lua`. Invalid chords (containing characters that could break out of a Lua literal) are rejected, and string values are escaped so a crafted binding description cannot inject arbitrary Lua.
-- **Automatic backups**: Every write first copies the existing `bindings.lua` to `bindings.lua.bak` and applies the change atomically via an atomic rename.
-
-## 🏗️ Architecture
-
-```
-keybinds-plugin/
-├── manifest.json                 # Omarchy plugin manifest (declares kind: ["panel"], keepLoaded: true)
-├── KeybindsPanel.qml             # Main GUI window with search, category tabs, and active key list
-├── EditKeybindDialog.qml         # Modal dialog for creating/editing shortcuts with smart free recommendations
-├── KeyRecorder.qml               # Interactive keyboard event catcher, modifier pills, and live conflict check
-├── KeyBadge.qml                  # Visual keyboard chord badge renderer
-├── bin/
-│   └── omarchy-keybinds          # CLI wrapper script
-├── backend/
-│   └── keybinds_manager.py       # Python engine for parsing defaults, user Lua config, conflicts, and mouse sync
-├── tests/
-│   └── test_backend.py           # Unit tests for parser and backend operations
-└── README.md                     # Documentation
-```
-
----
-
-## 📄 License
-
-Distributed under the **MIT License**. See `LICENSE` for details.
+MIT — see [LICENSE](LICENSE).
