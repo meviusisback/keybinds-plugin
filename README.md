@@ -104,9 +104,9 @@ The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
 ## How it works
 
-The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back with validated, escaped values via atomic rename (invalid chords that could break out of a Lua literal are rejected). The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, only your keybinding files are read — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
+The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and plain commands are escaped, while a command that is already Lua (starting with `hl.` or `{`) is inserted as written. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin also rewrites when you add an app action to it) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
-Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 14 tests covering key normalization, Lua parser safety, comment handling, unbind detection and conflict evaluation.
+Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 14 tests covering key normalization, Lua parser safety, comment handling and unbind detection.
 
 ## Removal
 
