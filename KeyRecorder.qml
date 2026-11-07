@@ -466,6 +466,7 @@ Item {
       TextField {
         id: manualKeyField
         Layout.preferredWidth: Style.space(110)
+        readOnly: !activeFocus
         text: root.mainKey
         placeholderText: "e.g. A, TAB"
         onTextChanged: {

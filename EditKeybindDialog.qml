@@ -488,6 +488,9 @@ Item {
           TextField {
             id: appSearchInput
             Layout.fillWidth: true
+            // Inert until focused: a writable TextInput makes Qt pull every
+            // clipboard offer, even while this dialog is closed.
+            readOnly: !activeFocus
             placeholderText: "Search installed apps (e.g. Firefox, Spotify, Ghostty)..."
             text: root.appSearchQuery
             onTextChanged: root.appSearchQuery = text
@@ -1303,6 +1306,7 @@ Item {
             TextField {
               id: descInput
               Layout.fillWidth: true
+              readOnly: !activeFocus
               text: root.actionTitle
               placeholderText: "e.g. My Custom Script"
               onTextChanged: root.actionTitle = text
@@ -1325,6 +1329,7 @@ Item {
             TextField {
               id: cmdInput
               Layout.fillWidth: true
+              readOnly: !activeFocus
               text: root.actionCommand
               placeholderText: "e.g. ghostty -e btop, hyprctl dispatch killactive"
               onTextChanged: {
