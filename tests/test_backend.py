@@ -3,6 +3,7 @@ import unittest
 import os
 import sys
 import tempfile
+import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 import keybinds_manager
@@ -45,6 +46,34 @@ class TestKeybindsBackend(unittest.TestCase):
             keybinds_manager.USER_BINDINGS_PATH = old_path
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def test_write_user_bindings_oversized_file_refused(self):
+        # Same defect class as the menu cap (round-2 filesystem review): the
+        # text-mode read(n) counted CHARACTERS, so a >64 KiB bindings file was
+        # silently truncated on edit — the tail lost in BOTH the rewrite and
+        # the .bak. Byte-exact cap refuses instead of destroying data.
+        old_path = keybinds_manager.USER_BINDINGS_PATH
+        tmp = tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua")
+        tmp.close()
+        try:
+            keybinds_manager.USER_BINDINGS_PATH = tmp.name
+            original = "-- pad\n-- " + ("a" * 70000) + "\n"   # >64 KiB bytes+chars
+            with open(tmp.name, "w", encoding="utf-8") as f:
+                f.write(original)
+            with open(tmp.name, "rb") as f:
+                raw_before = f.read()
+            self.assertGreater(len(raw_before), keybinds_manager.MAX_FILE_BYTES)
+            with self.assertRaises(ValueError):
+                keybinds_manager.write_user_bindings(
+                    lines_to_add=[{"key": "SUPER + Z", "description": "X",
+                                   "command": "x"}],
+                    unbinds_to_add=["SUPER + Z"])
+            with open(tmp.name, "rb") as f:
+                self.assertEqual(f.read(), raw_before)   # no truncating rewrite
+        finally:
+            keybinds_manager.USER_BINDINGS_PATH = old_path
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
     def test_write_and_parse_user_bindings(self):
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua") as tmp:
@@ -311,6 +340,267 @@ class TestKeybindsBackend(unittest.TestCase):
         self.assertIn("mon.move_ws_left", catalog_ids)
         self.assertIn("win.pin", catalog_ids)
         self.assertIn("ws.previous_history", catalog_ids)
+
+
+class TestMenuEntry(unittest.TestCase):
+    """Launcher-menu install/remove/check must never destroy or silently skip
+    the user's omarchy-menu.jsonc (marketplace finding #13661)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._saved_path = keybinds_manager.MENU_CONFIG_PATH
+        keybinds_manager.MENU_CONFIG_PATH = os.path.join(
+            self._tmpdir.name, "omarchy-menu.jsonc")
+
+    def tearDown(self):
+        keybinds_manager.MENU_CONFIG_PATH = self._saved_path
+        self._tmpdir.cleanup()
+
+    def _write(self, content):
+        with open(keybinds_manager.MENU_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def _read_bytes(self):
+        with open(keybinds_manager.MENU_CONFIG_PATH, "rb") as f:
+            return f.read()
+
+    def _load(self):
+        import json
+        return json.loads(keybinds_manager._strip_jsonc_comments(
+            self._read_bytes().decode("utf-8")))
+
+    # -- the #13661 clobber -------------------------------------------------
+
+    def test_menu_install_preserves_url_entries(self):
+        self._write(
+            '{\n'
+            '  "other.site": {"label": "Site", "action": "https://example.com/a"},\n'
+            '  "another.one": {"label": "Two", "action": "https://two.example/x"},\n'
+            '  "third.one": {"label": "Three", "action": "https://three.example/y"}\n'
+            '}\n')
+        res = keybinds_manager.install_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertIn("other.site", data)
+        self.assertIn("another.one", data)
+        self.assertIn("third.one", data)
+        self.assertIn(keybinds_manager.MENU_ENTRY_KEY, data)
+        self.assertEqual(data["other.site"]["action"], "https://example.com/a")
+
+    def test_menu_install_unparseable_file_is_not_written(self):
+        original = b"{{{ this is not json at all"
+        self._write(original.decode("utf-8"))
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("message", res)
+        self.assertIn("error", res)
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_non_object_top_level_refused(self):
+        original = b'["not", "an", "object"]'
+        self._write(original.decode("utf-8"))
+        res = keybinds_manager.install_menu_entry()   # used to raise TypeError
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("message", res)
+        # Pin the diagnostic, not just the failure: the broad except would
+        # otherwise mask this guard (mutation sweep: "top-level must be object").
+        self.assertIn("top level is not a JSON object", res["message"])
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_remove_unparseable_file_is_not_written(self):
+        original = b"{{{ this is not json at all"
+        self._write(original.decode("utf-8"))
+        res = keybinds_manager.remove_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("message", res)
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_remove_preserves_other_entries(self):
+        self._write(
+            '{\n'
+            '  "other.site": {"label": "Site", "action": "https://example.com/a"},\n'
+            f'  "{keybinds_manager.MENU_ENTRY_KEY}": {{"label": "KM", "action": "x"}}\n'
+            '}\n')
+        res = keybinds_manager.remove_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertNotIn(keybinds_manager.MENU_ENTRY_KEY, data)
+        self.assertEqual(data["other.site"]["action"], "https://example.com/a")
+
+    def test_menu_check_reports_failure_on_unparseable_file(self):
+        self._write("{{{ not json")
+        res = keybinds_manager.check_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertFalse(res.get("exists"))
+        self.assertIn("message", res)
+
+    def test_menu_check_happy_path_reports_entry(self):
+        # The success contract had no test at all (review round): present ->
+        # exists True, absent -> exists False, both with success True.
+        self._write('{"other.site": {"label": "Site"}}\n')
+        res = keybinds_manager.check_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        self.assertFalse(res.get("exists"))
+        self._write(json.dumps({keybinds_manager.MENU_ENTRY_KEY:
+                                {"label": "KM", "action": "x"}}))
+        res2 = keybinds_manager.check_menu_entry()
+        self.assertTrue(res2.get("success"), res2)
+        self.assertTrue(res2.get("exists"))
+
+    # -- every menu path answers JSON (no empty stdout for the QML) ---------
+
+    def test_menu_check_symlink_returns_json_not_exception(self):
+        target = os.path.join(self._tmpdir.name, "real.jsonc")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        link = keybinds_manager.MENU_CONFIG_PATH
+        os.symlink(target, link)
+        res = keybinds_manager.check_menu_entry()   # must not raise
+        self.assertIsInstance(res, dict)
+        self.assertFalse(res.get("success"))
+        self.assertFalse(res.get("exists"))
+        res2 = keybinds_manager.install_menu_entry()  # must not raise either
+        self.assertFalse(res2.get("success"))
+        self.assertIn("message", res2)
+
+    def test_menu_install_write_failure_returns_json(self):
+        self._write('{"other.site": {"label": "Site"}}\n')
+        original = self._read_bytes()
+        import unittest.mock
+        with unittest.mock.patch.object(
+                keybinds_manager, "_safe_atomic_write_file",
+                side_effect=OSError("read-only filesystem")):
+            res = keybinds_manager.install_menu_entry()   # must not raise
+        self.assertFalse(res.get("success"))
+        self.assertIn("message", res)
+        self.assertEqual(self._read_bytes(), original)
+
+    # -- string-aware JSONC scanner ----------------------------------------
+
+    def test_strip_preserves_urls_escapes_and_comment_quotes(self):
+        src = ('{\n'
+               '  // a line comment with \'quotes\' and // slashes\n'
+               '  "url": "https://example.com/a//b",\n'
+               '  "win": "C:\\\\dir\\\\file",\n'
+               '  "notcomment": "/* stays */ and // this too" /* real block // comment */\n'
+               '}\n')
+        import json
+        data = json.loads(keybinds_manager._strip_jsonc_comments(src))
+        self.assertEqual(data["url"], "https://example.com/a//b")
+        self.assertEqual(data["win"], "C:\\dir\\file")
+        self.assertEqual(data["notcomment"], "/* stays */ and // this too")
+
+    def test_strip_block_comment_containing_slashes(self):
+        import json
+        src = '/* a // b \n c */ {"a": 1}'
+        data = json.loads(keybinds_manager._strip_jsonc_comments(src))
+        self.assertEqual(data, {"a": 1})
+
+    def test_strip_line_comment_at_eof_without_newline_is_valid(self):
+        import json
+        data = json.loads(keybinds_manager._strip_jsonc_comments('{"a": 1} // tail'))
+        self.assertEqual(data, {"a": 1})
+
+    def test_strip_unterminated_string_raises(self):
+        with self.assertRaises(ValueError):
+            keybinds_manager._strip_jsonc_comments('{"a": "oops')
+
+    def test_strip_unterminated_block_comment_raises(self):
+        with self.assertRaises(ValueError):
+            keybinds_manager._strip_jsonc_comments('{"a": 1} /* oops')
+
+    def test_menu_install_refuses_unterminated_string(self):
+        original = b'{"a": "oops'
+        self._write(original.decode("utf-8"))
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_refuses_unterminated_block_comment(self):
+        original = b'{"a": 1} /* oops'
+        self._write(original.decode("utf-8"))
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_realistic_jsonc_fixture(self):
+        self._write(
+            '{\n'
+            '  // Omarchy launcher entries\n'
+            f'  "{keybinds_manager.MENU_ENTRY_KEY}": {{\n'
+            '    "icon": "\uf464",\n'
+            '    "label": "Keybindings Manager",\n'
+            '    "action": "omarchy-shell shell summon meviusisback.keybinds"\n'
+            '  },\n'
+            '  "web.thing": {\n'
+            '    "label": "Docs",\n'
+            '    "action": "https://docs.example/guide//latest"  // trailing comment\n'
+            '  }\n'
+            '}\n')
+        res = keybinds_manager.remove_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertNotIn(keybinds_manager.MENU_ENTRY_KEY, data)
+        self.assertEqual(data["web.thing"]["action"],
+                         "https://docs.example/guide//latest")
+
+    def test_menu_install_line_comment_at_eof_is_valid(self):
+        self._write('{"other.site": {"label": "Site"}} // note')  # no newline
+        res = keybinds_manager.install_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertIn("other.site", data)
+        self.assertIn(keybinds_manager.MENU_ENTRY_KEY, data)
+
+    # -- size cap: refuse oversized, accept exact-fit -----------------------
+
+    def test_menu_install_oversized_file_refused(self):
+        base = '{"other.site": {"label": "Site"}}'
+        pad = keybinds_manager.MAX_FILE_BYTES + 1 - len(base)
+        content = base + (" " * pad)
+        self.assertEqual(len(content), keybinds_manager.MAX_FILE_BYTES + 1)
+        self._write(content)
+        original = self._read_bytes()
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("refus", res.get("message", "").lower())
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_multibyte_oversized_refused(self):
+        # 40 000 two-byte chars = ~80 000 UTF-8 bytes but only 40 012
+        # CHARACTERS: a text-mode cap (pre-fix) accepted this at 4x the
+        # documented 64 KiB byte limit — three reviewers flagged it.
+        content = '{"pad": "' + ("é" * 40000) + '"}'
+        self.assertGreater(len(content.encode("utf-8")),
+                           keybinds_manager.MAX_FILE_BYTES)
+        self.assertLess(len(content), keybinds_manager.MAX_FILE_BYTES)
+        self._write(content)
+        original = self._read_bytes()
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("refus", res.get("message", "").lower())
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_multibyte_under_cap_accepted(self):
+        self._write(json.dumps({"café.menu": {"label": "Café ☕",
+                                              "action": "https://café.example/ünïcode"}}))
+        res = keybinds_manager.install_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertIn("café.menu", data)
+        self.assertIn(keybinds_manager.MENU_ENTRY_KEY, data)
+
+    def test_menu_install_exact_cap_file_accepted(self):
+        base = '{"other.site": {"label": "Site"}}'
+        pad = keybinds_manager.MAX_FILE_BYTES - len(base)
+        content = base + (" " * pad)
+        self.assertEqual(len(content), keybinds_manager.MAX_FILE_BYTES)
+        self._write(content)
+        res = keybinds_manager.install_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertIn("other.site", data)
+        self.assertIn(keybinds_manager.MENU_ENTRY_KEY, data)
 
 
 if __name__ == "__main__":
