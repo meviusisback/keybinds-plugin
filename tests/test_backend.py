@@ -3,6 +3,7 @@ import unittest
 import os
 import sys
 import tempfile
+import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 import keybinds_manager
@@ -405,6 +406,19 @@ class TestMenuEntry(unittest.TestCase):
         self.assertFalse(res.get("exists"))
         self.assertIn("message", res)
 
+    def test_menu_check_happy_path_reports_entry(self):
+        # The success contract had no test at all (review round): present ->
+        # exists True, absent -> exists False, both with success True.
+        self._write('{"other.site": {"label": "Site"}}\n')
+        res = keybinds_manager.check_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        self.assertFalse(res.get("exists"))
+        self._write(json.dumps({keybinds_manager.MENU_ENTRY_KEY:
+                                {"label": "KM", "action": "x"}}))
+        res2 = keybinds_manager.check_menu_entry()
+        self.assertTrue(res2.get("success"), res2)
+        self.assertTrue(res2.get("exists"))
+
     # -- every menu path answers JSON (no empty stdout for the QML) ---------
 
     def test_menu_check_symlink_returns_json_not_exception(self):
@@ -523,6 +537,30 @@ class TestMenuEntry(unittest.TestCase):
         self.assertFalse(res.get("success"), res)
         self.assertIn("refus", res.get("message", "").lower())
         self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_multibyte_oversized_refused(self):
+        # 40 000 two-byte chars = ~80 000 UTF-8 bytes but only 40 012
+        # CHARACTERS: a text-mode cap (pre-fix) accepted this at 4x the
+        # documented 64 KiB byte limit — three reviewers flagged it.
+        content = '{"pad": "' + ("é" * 40000) + '"}'
+        self.assertGreater(len(content.encode("utf-8")),
+                           keybinds_manager.MAX_FILE_BYTES)
+        self.assertLess(len(content), keybinds_manager.MAX_FILE_BYTES)
+        self._write(content)
+        original = self._read_bytes()
+        res = keybinds_manager.install_menu_entry()
+        self.assertFalse(res.get("success"), res)
+        self.assertIn("refus", res.get("message", "").lower())
+        self.assertEqual(self._read_bytes(), original)
+
+    def test_menu_install_multibyte_under_cap_accepted(self):
+        self._write(json.dumps({"café.menu": {"label": "Café ☕",
+                                              "action": "https://café.example/ünïcode"}}))
+        res = keybinds_manager.install_menu_entry()
+        self.assertTrue(res.get("success"), res)
+        data = self._load()
+        self.assertIn("café.menu", data)
+        self.assertIn(keybinds_manager.MENU_ENTRY_KEY, data)
 
     def test_menu_install_exact_cap_file_accepted(self):
         base = '{"other.site": {"label": "Site"}}'

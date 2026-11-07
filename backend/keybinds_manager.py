@@ -1527,14 +1527,20 @@ def _safe_read_regular_file(path: str):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"refusing non-regular file: {path}")
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
-            content = f.read(MAX_FILE_BYTES + 1)
-        if len(content) > MAX_FILE_BYTES:
-            # One extra byte distinguishes an exact-fit file (accepted) from a
-            # truncated read, which could silently parse and be rewritten.
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            # Byte-exact: read in BINARY so the cap counts UTF-8 bytes, not
+            # decoded characters (a text-mode read(n) returns n CHARACTERS and
+            # would accept up to ~260 KiB of 4-byte glyphs — three reviewers
+            # flagged this). The +1 byte distinguishes an exact-fit file
+            # (accepted) from an oversized one; no read that passes can be
+            # truncated, so nothing is ever parsed-and-rewritten half a file.
             raise ValueError(
                 f"file exceeds the {MAX_FILE_BYTES}-byte cap, refusing to edit: {path}")
-        return content
+        # UnicodeDecodeError (a ValueError) on non-UTF-8 content propagates to
+        # the menu-* wrappers, which refuse without writing.
+        return raw.decode("utf-8")
     except BaseException:
         try:
             os.close(fd)
