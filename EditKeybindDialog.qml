@@ -337,6 +337,14 @@ Item {
   onOpenedChanged: {
     if (!opened) {
       keyRecorder.stopRecording()
+      // A hidden native field can retain keyboard focus (Qt 6.12 keeps the
+      // focus item across visibility changes), and a writable TextInput then
+      // pulls every clipboard offer on Wayland. Drop focus on close so the
+      // readOnly gate below cannot be bypassed by a stale focus item.
+      if (appSearchInput) appSearchInput.focus = false
+      if (descInput) descInput.focus = false
+      if (cmdInput) cmdInput.focus = false
+      keyRecorder.clearFocus()
     }
   }
 
@@ -488,9 +496,10 @@ Item {
           TextField {
             id: appSearchInput
             Layout.fillWidth: true
-            // Inert until focused: a writable TextInput makes Qt pull every
-            // clipboard offer, even while this dialog is closed.
-            readOnly: !activeFocus
+            // Inert until focused while this dialog is open and the field is
+            // actually visible: a writable TextInput makes Qt pull every
+            // clipboard offer, even behind a hidden surface.
+            readOnly: !activeFocus || !root.opened || !visible
             placeholderText: "Search installed apps (e.g. Firefox, Spotify, Ghostty)..."
             text: root.appSearchQuery
             onTextChanged: root.appSearchQuery = text
@@ -1306,7 +1315,7 @@ Item {
             TextField {
               id: descInput
               Layout.fillWidth: true
-              readOnly: !activeFocus
+              readOnly: !activeFocus || !root.opened || !visible
               text: root.actionTitle
               placeholderText: "e.g. My Custom Script"
               onTextChanged: root.actionTitle = text
@@ -1329,7 +1338,7 @@ Item {
             TextField {
               id: cmdInput
               Layout.fillWidth: true
-              readOnly: !activeFocus
+              readOnly: !activeFocus || !root.opened || !visible
               text: root.actionCommand
               placeholderText: "e.g. ghostty -e btop, hyprctl dispatch killactive"
               onTextChanged: {

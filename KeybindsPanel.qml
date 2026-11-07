@@ -455,8 +455,14 @@ Item {
     minimumSize: Qt.size(Style.space(700), Style.space(520))
 
     onVisibleChanged: {
-      if (!visible && !root.closingFromHost && root.shell && typeof root.shell.hide === "function") {
-        root.shell.hide((root.manifest && root.manifest.id) || "meviusisback.keybinds")
+      if (!visible) {
+        // The dialog lives inside this window: close it with the panel so its
+        // fields cannot stay focused and writable behind a hidden surface.
+        if (editDialog.opened) editDialog.close()
+        if (searchInput && searchInput.activeFocus) searchInput.focus = false
+        if (!root.closingFromHost && root.shell && typeof root.shell.hide === "function") {
+          root.shell.hide((root.manifest && root.manifest.id) || "meviusisback.keybinds")
+        }
       }
     }
 
@@ -599,8 +605,10 @@ Item {
               text: root.searchQuery
               // Qt's TextInput probes the clipboard (and on Wayland pulls the
               // whole offer body) on every clipboard change while writable.
-              // Stay read-only until the user actually focuses this field.
-              readOnly: !activeFocus
+              // Stay read-only until the user focuses this field while the
+              // panel is actually open and the field is visible: hidden
+              // surfaces keep their focus item.
+              readOnly: !activeFocus || !root.opened || !visible
               onTextChanged: root.searchQuery = text
 
               // Clear button

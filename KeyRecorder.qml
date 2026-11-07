@@ -181,6 +181,12 @@ Item {
     keyCaptureFocus.forceActiveFocus()
   }
 
+  // Called by the dialog when it closes: a hidden field that keeps activeFocus
+  // stays writable and makes Qt pull every clipboard offer on Wayland.
+  function clearFocus() {
+    if (manualKeyField) manualKeyField.focus = false
+  }
+
   function stopRecording() {
     root.recording = false
     // Modifier release events can be swallowed by the compositor once
@@ -466,7 +472,9 @@ Item {
       TextField {
         id: manualKeyField
         Layout.preferredWidth: Style.space(110)
-        readOnly: !activeFocus
+        // Inert while hidden: a writable TextInput pulls clipboard offers even
+        // when its surface is closed.
+        readOnly: !activeFocus || !visible
         text: root.mainKey
         placeholderText: "e.g. A, TAB"
         onTextChanged: {
