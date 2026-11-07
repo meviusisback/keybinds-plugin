@@ -597,6 +597,10 @@ Item {
                 ? "Listening... Press any shortcut combination (e.g. CTRL + O)"
                 : "Search shortcuts, actions, commands..."
               text: root.searchQuery
+              // Qt's TextInput probes the clipboard (and on Wayland pulls the
+              // whole offer body) on every clipboard change while writable.
+              // Stay read-only until the user actually focuses this field.
+              readOnly: !activeFocus
               onTextChanged: root.searchQuery = text
 
               // Clear button
