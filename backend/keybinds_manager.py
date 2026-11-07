@@ -39,8 +39,6 @@ MENU_ENTRY_VALUE = {
     "label": "Keybindings Manager",
     "action": "omarchy-shell shell summon meviusisback.keybinds",
 }
-_JSONC_LINE_COMMENT_RE = re.compile(r'//.*$')
-_JSONC_BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.DOTALL)
 
 def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
@@ -1440,12 +1438,82 @@ def enable_keybinding(key: str):
 
 
 def _strip_jsonc_comments(text: str) -> str:
-    """Remove JSONC (JSON with Comments) style comments."""
-    text = _JSONC_BLOCK_COMMENT_RE.sub('', text)
-    lines = []
-    for line in text.splitlines():
-        lines.append(_JSONC_LINE_COMMENT_RE.sub('', line))
-    return '\n'.join(lines)
+    """Remove JSONC comments, never touching the inside of a quoted string.
+
+    Single-pass state machine: `//` and `/*…*/` are only comments in NORMAL
+    state, so URLs (https://…), Windows paths (C:\\…) and comment-looking
+    text inside string values survive intact. A LINE_COMMENT ends at newline
+    OR EOF (a file ending in `// note` is valid JSONC); an unterminated string
+    or block comment raises ValueError — malformed input is a parse failure the
+    caller must refuse, never "accidentally parseable" output.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    state = "normal"  # normal | string | line_comment | block_comment
+    while i < n:
+        c = text[i]
+        if state == "normal":
+            if c == '"':
+                state = "string"
+                out.append(c)
+            elif c == "/" and i + 1 < n and text[i + 1] == "/":
+                state = "line_comment"
+                i += 1
+            elif c == "/" and i + 1 < n and text[i + 1] == "*":
+                state = "block_comment"
+                i += 1
+            else:
+                out.append(c)
+        elif state == "string":
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                state = "normal"
+                out.append(c)
+            else:
+                out.append(c)
+        elif state == "line_comment":
+            if c == "\n":
+                state = "normal"
+                out.append(c)
+        else:  # block_comment
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                state = "normal"
+                i += 1
+        i += 1
+    if state == "string":
+        raise ValueError("unterminated string in JSONC input")
+    if state == "block_comment":
+        raise ValueError("unterminated block comment in JSONC input")
+    return "".join(out)
+
+
+def _parse_menu_config(contents: str) -> dict:
+    """Strip JSONC comments string-aware and parse as a JSON object.
+
+    Raises ValueError on anything that cannot be parsed with confidence — the
+    menu entry writers must refuse instead of treating a parse error as an
+    empty object (marketplace finding #13661: that fallback rewrote the file
+    with only this plugin's entry, destroying every other launcher entry).
+    """
+    try:
+        stripped = _strip_jsonc_comments(contents)
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"cannot parse {MENU_CONFIG_PATH}: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"cannot parse {MENU_CONFIG_PATH}: top level is not a JSON object")
+    return data
+
+
+def _menu_refusal(exc: BaseException) -> dict:
+    """Failure result that always carries both keys the QML toasts read."""
+    text = f"Refusing to touch {MENU_CONFIG_PATH}: {exc}. No changes were made."
+    return {"success": False, "message": text, "error": text}
 
 
 def _safe_read_regular_file(path: str):
@@ -1460,7 +1528,13 @@ def _safe_read_regular_file(path: str):
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"refusing non-regular file: {path}")
         with os.fdopen(fd, "r", encoding="utf-8") as f:
-            return f.read(MAX_FILE_BYTES)
+            content = f.read(MAX_FILE_BYTES + 1)
+        if len(content) > MAX_FILE_BYTES:
+            # One extra byte distinguishes an exact-fit file (accepted) from a
+            # truncated read, which could silently parse and be rewritten.
+            raise ValueError(
+                f"file exceeds the {MAX_FILE_BYTES}-byte cap, refusing to edit: {path}")
+        return content
     except BaseException:
         try:
             os.close(fd)
@@ -1490,52 +1564,63 @@ def _safe_atomic_write_file(path: str, content: str):
 
 
 def check_menu_entry():
-    """Return whether the launcher menu entry already exists."""
-    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
-    if contents is None:
-        return {"exists": False}
+    """Return whether the launcher menu entry already exists.
+
+    Always returns JSON: any read/parse problem answers
+    `{exists: False, success: False, message/error}` instead of raising
+    (an exception here used to leave stdout empty and the QML silently
+    skipped the first-run dialog).
+    """
     try:
-        stripped = _strip_jsonc_comments(contents)
-        data = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        data = {}
-    return {"exists": MENU_ENTRY_KEY in data}
+        contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+        if contents is None:
+            return {"exists": False, "success": True}
+        data = _parse_menu_config(contents)
+        return {"exists": MENU_ENTRY_KEY in data, "success": True}
+    except Exception as e:  # noqa: BLE001 — every menu path must answer JSON
+        res = _menu_refusal(e)
+        res["exists"] = False
+        return res
 
 
 def install_menu_entry():
-    """Safely add the launcher menu entry without destroying existing entries."""
-    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
-    data = {}
-    if contents is not None:
-        try:
-            stripped = _strip_jsonc_comments(contents)
-            data = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            data = {}
-    if MENU_ENTRY_KEY in data:
-        return {"success": True, "message": "Menu entry already exists."}
-    data[MENU_ENTRY_KEY] = dict(MENU_ENTRY_VALUE)
-    out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    _safe_atomic_write_file(MENU_CONFIG_PATH, out)
-    return {"success": True, "message": "Added Keybindings Manager to launcher."}
+    """Safely add the launcher menu entry without destroying existing entries.
+
+    Fail closed: if the existing file cannot be parsed with confidence, or the
+    write fails, nothing is written and a refusal is returned — the previous
+    parse-error fallback (`data = {}`) rewrote the file with only this entry.
+    """
+    try:
+        contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+        data = {} if contents is None else _parse_menu_config(contents)
+        if MENU_ENTRY_KEY in data:
+            return {"success": True, "message": "Menu entry already exists."}
+        data[MENU_ENTRY_KEY] = dict(MENU_ENTRY_VALUE)
+        out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        _safe_atomic_write_file(MENU_CONFIG_PATH, out)
+        return {"success": True, "message": "Added Keybindings Manager to launcher."}
+    except Exception as e:  # noqa: BLE001 — every menu path must answer JSON
+        return _menu_refusal(e)
 
 
 def remove_menu_entry():
-    """Safely remove the launcher menu entry if present."""
-    contents = _safe_read_regular_file(MENU_CONFIG_PATH)
-    if contents is None:
-        return {"success": True, "message": "Config file not found — nothing to remove."}
+    """Safely remove the launcher menu entry if present.
+
+    Fail closed like install: an unparseable file is refused, never rewritten.
+    """
     try:
-        stripped = _strip_jsonc_comments(contents)
-        data = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        data = {}
-    if MENU_ENTRY_KEY not in data:
-        return {"success": True, "message": "Menu entry not present — nothing to remove."}
-    del data[MENU_ENTRY_KEY]
-    out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    _safe_atomic_write_file(MENU_CONFIG_PATH, out)
-    return {"success": True, "message": "Removed Keybindings Manager from launcher."}
+        contents = _safe_read_regular_file(MENU_CONFIG_PATH)
+        if contents is None:
+            return {"success": True, "message": "Config file not found — nothing to remove."}
+        data = _parse_menu_config(contents)
+        if MENU_ENTRY_KEY not in data:
+            return {"success": True, "message": "Menu entry not present — nothing to remove."}
+        del data[MENU_ENTRY_KEY]
+        out = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        _safe_atomic_write_file(MENU_CONFIG_PATH, out)
+        return {"success": True, "message": "Removed Keybindings Manager from launcher."}
+    except Exception as e:  # noqa: BLE001 — every menu path must answer JSON
+        return _menu_refusal(e)
 
 
 def main():
