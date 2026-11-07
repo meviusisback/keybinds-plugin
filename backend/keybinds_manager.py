@@ -1217,8 +1217,17 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             if not stat.S_ISREG(os.fstat(src_fd).st_mode):
                 os.close(src_fd)
                 raise ValueError(f"refusing non-regular file: {USER_BINDINGS_PATH}")
-            with os.fdopen(src_fd, "r", encoding="utf-8") as f:
-                existing_content = f.read(MAX_FILE_BYTES)
+            with os.fdopen(src_fd, "rb") as f:
+                raw = f.read(MAX_FILE_BYTES + 1)
+            if len(raw) > MAX_FILE_BYTES:
+                # Byte-exact cap like the menu path (round-2 filesystem
+                # review): a text-mode read(n) counts CHARACTERS, so a
+                # >64 KiB file used to be silently truncated here — the tail
+                # lost in BOTH the rewrite and the .bak. Refuse instead of
+                # destroying data.
+                raise ValueError(
+                    f"file exceeds the {MAX_FILE_BYTES}-byte cap, refusing to edit: {USER_BINDINGS_PATH}")
+            existing_content = raw.decode("utf-8")
         except BaseException:
             raise
         backup_path = USER_BINDINGS_PATH + ".bak"

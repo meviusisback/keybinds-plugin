@@ -47,6 +47,34 @@ class TestKeybindsBackend(unittest.TestCase):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    def test_write_user_bindings_oversized_file_refused(self):
+        # Same defect class as the menu cap (round-2 filesystem review): the
+        # text-mode read(n) counted CHARACTERS, so a >64 KiB bindings file was
+        # silently truncated on edit — the tail lost in BOTH the rewrite and
+        # the .bak. Byte-exact cap refuses instead of destroying data.
+        old_path = keybinds_manager.USER_BINDINGS_PATH
+        tmp = tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua")
+        tmp.close()
+        try:
+            keybinds_manager.USER_BINDINGS_PATH = tmp.name
+            original = "-- pad\n-- " + ("a" * 70000) + "\n"   # >64 KiB bytes+chars
+            with open(tmp.name, "w", encoding="utf-8") as f:
+                f.write(original)
+            with open(tmp.name, "rb") as f:
+                raw_before = f.read()
+            self.assertGreater(len(raw_before), keybinds_manager.MAX_FILE_BYTES)
+            with self.assertRaises(ValueError):
+                keybinds_manager.write_user_bindings(
+                    lines_to_add=[{"key": "SUPER + Z", "description": "X",
+                                   "command": "x"}],
+                    unbinds_to_add=["SUPER + Z"])
+            with open(tmp.name, "rb") as f:
+                self.assertEqual(f.read(), raw_before)   # no truncating rewrite
+        finally:
+            keybinds_manager.USER_BINDINGS_PATH = old_path
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+
     def test_write_and_parse_user_bindings(self):
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".lua") as tmp:
             tmp_path = tmp.name
