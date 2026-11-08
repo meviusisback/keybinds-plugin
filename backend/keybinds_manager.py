@@ -5,6 +5,7 @@ Provides parsing, catalog discovery, conflict detection, mouse scroll integratio
 """
 
 import os
+import errno
 import sys
 import re
 import json
@@ -1210,8 +1211,14 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         src_fd = None
-    except OSError:
-        raise ValueError(f"refusing to operate on non-regular/symlink path: {USER_BINDINGS_PATH}")
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            # Path is a symlink (e.g. dotfile management symlink); open
+            # without O_NOFOLLOW and verify the target is a regular file
+            # instead of refusing outright.
+            src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NONBLOCK)
+        else:
+            raise ValueError(f"refusing to operate on non-regular/symlink path: {USER_BINDINGS_PATH}")
     if src_fd is not None:
         try:
             if not stat.S_ISREG(os.fstat(src_fd).st_mode):
@@ -1531,8 +1538,14 @@ def _safe_read_regular_file(path: str):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
-    except OSError:
-        raise ValueError(f"refusing to operate on non-regular/symlink path: {path}")
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            # Path is a symlink (e.g. dotfile management symlink); open
+            # without O_NOFOLLOW and verify the target is a regular file
+            # instead of refusing outright.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        else:
+            raise ValueError(f"refusing to operate on non-regular/symlink path: {path}")
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"refusing non-regular file: {path}")
