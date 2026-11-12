@@ -15,7 +15,6 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import stat
-import glob
 import configparser
 
 DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
@@ -51,12 +50,37 @@ def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# Pre-compiled regex for the o.bind() header: matches the function call
-# up to and including the opening of the 3rd argument.
-_BIND_HEADER_RE = re.compile(
-    r"o\.bind(?:_toggle)?\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*"
-    r"(?:[\"']([^\"']+)[\"']|nil)\s*,\s*"
-)
+_BIND_HEAD_RE = re.compile(r"o\.bind(?:_toggle)?\s*\(")
+
+
+def _read_lua_string(text: str, pos: int):
+    """Read one Lua string literal (or ``nil``) starting at ``pos``.
+
+    Returns ``(value, next_pos, ok)`` and decodes escapes, so a description the
+    plugin wrote with ``\\"`` comes back as the user's original text. The old
+    ``[^"']+`` header regex stopped at any quote and made every such binding
+    invisible to the plugin.
+    """
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    if text.startswith("nil", pos):
+        return None, pos + 3, True
+    if pos >= len(text) or text[pos] not in "\"'":
+        return None, pos, False
+    quote = text[pos]
+    pos += 1
+    out = []
+    while pos < len(text):
+        ch = text[pos]
+        if ch == "\\" and pos + 1 < len(text):
+            out.append(text[pos + 1])
+            pos += 2
+            continue
+        if ch == quote:
+            return "".join(out), pos + 1, True
+        out.append(ch)
+        pos += 1
+    return None, pos, False  # unterminated literal
 
 
 def _parse_bind_line(line: str):
@@ -66,13 +90,32 @@ def _parse_bind_line(line: str):
     correctly handle actions containing nested parentheses and curly
     braces (e.g. ``hl.dsp.window.move({ direction = "left" })``).
     """
-    m = _BIND_HEADER_RE.match(line)
+    m = _BIND_HEAD_RE.match(line)
     if not m:
         return None
 
-    raw_key = m.group(1).strip()
-    desc = (m.group(2) or "").strip()
     pos = m.end()
+    key_value, pos, ok = _read_lua_string(line, pos)
+    if not ok or key_value is None:
+        return None
+    while pos < len(line) and line[pos].isspace():
+        pos += 1
+    if pos >= len(line) or line[pos] != ",":
+        return None
+    pos += 1
+    desc_value, pos, ok = _read_lua_string(line, pos)
+    if not ok:
+        return None
+    while pos < len(line) and line[pos].isspace():
+        pos += 1
+    if pos >= len(line) or line[pos] != ",":
+        return None
+    pos += 1
+    while pos < len(line) and line[pos].isspace():
+        pos += 1
+
+    raw_key = key_value.strip()
+    desc = (desc_value or "").strip()
 
     depth_paren = 0
     depth_brace = 0
@@ -169,7 +212,7 @@ def _lua_units(lines):
 
     def flush():
         nonlocal raw, code, has_code
-        text = re.sub(r"\s+", " ", "".join(code)).strip()
+        text = re.sub(r"[ \t]*\n[ \t]*", " ", "".join(code)).strip()
         units.append((raw, text, not has_code))
         raw, code, has_code = [], [], False
 
@@ -232,6 +275,9 @@ def _lua_units(lines):
             i += 1
         code.append(
             "\n" if depth or in_string is not None or long_close is not None else " ")
+        # A trailing backslash escapes the newline it ends, not the first
+        # character of the next physical line.
+        escape = False
         if not depth and in_string is None and long_close is None:
             flush()
     if raw:
@@ -894,8 +940,20 @@ def get_installed_apps(dirs=None):
     for app_dir in dirs:
         if not os.path.isdir(app_dir):
             continue
-        for desktop_file in sorted(glob.glob(os.path.join(app_dir, "*.desktop"))):
-            if file_count >= MAX_APP_FILES or total_read > MAX_APP_TOTAL_READ:
+        # scandir stops at MAX_APP_FILES: glob would materialise (and sort) the
+        # whole directory before either cap was consulted.
+        try:
+            with os.scandir(app_dir) as entries:
+                names = []
+                for entry in entries:
+                    if entry.name.endswith(".desktop"):
+                        names.append(entry.path)
+                        if len(names) >= MAX_APP_FILES:
+                            break
+        except OSError:
+            continue
+        for desktop_file in sorted(names):
+            if total_read > MAX_APP_TOTAL_READ:
                 break
             file_count += 1
             try:
@@ -1334,7 +1392,10 @@ def _written_bind_identity(entry):
     will store on disk. Scoping key removal to this exact pair lets a rebind
     drop only its own previous line, never a *different* binding that shares
     the old key (e.g. the pair it is being swapped with)."""
-    desc = sanitize_lua_str(entry.get("description", ""))
+    # Decoded (flattened, length-capped) description: this is what a parsed
+    # line yields, so identity comparisons stay on the same side of the
+    # escaping the writer applies.
+    desc = (entry.get("description") or "").replace("\r", " ").replace("\n", " ")[:MAX_TEXT_LEN]
     cmd = entry.get("command", "")
     action = entry.get("action", "")
     if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
@@ -1479,7 +1540,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                     if _parsed:
                         norm_parsed_action = (_parsed[2] or "").strip().strip('"\'')
                         norm_pres_action = preserve_identity[1].strip().strip('"\'')
-                        if ((_parsed[1] or "").strip().lower() == preserve_identity[0].lower()
+                        if ((_parsed[1] or "").strip().lower() == preserve_identity[0].strip().lower()
                                 or norm_parsed_action == norm_pres_action
                                 or normalize_key_chord(m_bind.group(1)) in [normalize_key_chord(e.get("key", "")) for e in (lines_to_add or [])]):
                             is_targeted = True

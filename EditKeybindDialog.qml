@@ -1571,11 +1571,18 @@ Item {
             verticalPadding: Style.space(6)
             enabled: root.actionTitle.trim().length > 0 && root.actionKey.trim().length > 0 && (root.actionCommand.trim().length > 0 || (root.actionDispatcher && root.actionDispatcher.trim().length > 0))
             onClicked: {
+              var cmd = root.actionCommand
+              var dsp = root.actionDispatcher || ""
+              // The backend emits raw Lua only from the dispatcher slot. A
+              // dispatcher the user typed into the command field is code they
+              // chose, so route it there; app commands keep dsp = "exec" and
+              // stay literal, so a .desktop Exec can never become code.
+              if (!dsp && /^\s*(hl\.|\{)/.test(cmd)) dsp = cmd
               root.saved(
                 root.actionKey,
                 root.actionTitle,
-                root.actionCommand,
-                root.actionDispatcher || "",
+                cmd,
+                dsp,
                 root.oldKey,
                 true
               )

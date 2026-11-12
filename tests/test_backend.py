@@ -3,6 +3,7 @@ import unittest
 import os
 import sys
 import tempfile
+import threading
 import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
@@ -696,6 +697,9 @@ class TestSecurityRegressions(unittest.TestCase):
         self.assertIn(
             r'o.bind("SUPER + Z", "x\"); os.execute(\"id\") --", "true")',
             content)
+        reparsed = keybinds_manager.parse_user_bindings()["binds"]
+        self.assertEqual(len(reparsed), 1)
+        self.assertEqual(reparsed[0]["description"], 'x"); os.execute("id") --')
 
     def test_command_is_literal_action_is_dispatcher(self):
         # Raw Lua must come only from the explicit dispatcher field: a
@@ -730,6 +734,42 @@ class TestSecurityRegressions(unittest.TestCase):
         self.assertEqual(keybinds_manager.parse_user_bindings()["unbinds"], set())
         keybinds_manager.write_user_bindings(keys_to_remove=["SUPER + X"])
         self.assertIn(commented.strip(), self._read())
+
+    def test_escaped_newline_string_does_not_swallow_following_binds(self):
+        # A backslash at end of line escapes the newline, not the first
+        # character of the next line; leaking that state merged the rest of
+        # the file into one unit and a targeted write deleted it.
+        self._write('o.bind("SUPER + X", "X", "echo hi\\\n'
+                    '")\n'
+                    'o.bind("SUPER + Y", "Y", "keep")\n')
+        keys = [b["key"] for b in keybinds_manager.parse_user_bindings()["binds"]]
+        self.assertEqual(keys, ["SUPER + X", "SUPER + Y"])
+        keybinds_manager.write_user_bindings(keys_to_remove=["SUPER + X"])
+        content = self._read()
+        self.assertNotIn("SUPER + X", content)
+        self.assertIn('o.bind("SUPER + Y", "Y", "keep")', content)
+
+    def test_description_whitespace_preserved(self):
+        self._write('o.bind("SUPER + W", "Close  Window", "cmd  x")\n')
+        binds = keybinds_manager.parse_user_bindings()["binds"]
+        self.assertEqual(binds[0]["description"], "Close  Window")
+        keybinds_manager.write_user_bindings(
+            lines_to_add=[{"key": "SUPER + N", "description": "N", "command": "true"}])
+        self.assertIn('o.bind("SUPER + W", "Close  Window", "cmd  x")', self._read())
+
+    def test_description_with_quotes_roundtrip(self):
+        # Descriptions the plugin itself writes must stay parseable: the old
+        # [^"']+ header regex hid every binding whose description had a quote.
+        desc = 'Bob\'s "Editor"'
+        self._write("-- original\n")
+        keybinds_manager.write_user_bindings(
+            lines_to_add=[{"key": "SUPER + B", "description": desc,
+                           "command": "bobs"}],
+            unbinds_to_add=["SUPER + B"])
+        binds = keybinds_manager.parse_user_bindings()["binds"]
+        self.assertEqual([b["description"] for b in binds], [desc])
+        self.assertEqual(keybinds_manager._written_bind_identity(
+            {"key": "SUPER + B", "description": desc, "command": "bobs"})[0], desc)
 
     # -- backup safety net ---------------------------------------------------
 
@@ -785,11 +825,59 @@ class TestSecurityRegressions(unittest.TestCase):
 
     def test_fifo_bindings_do_not_block_and_are_refused_for_writing(self):
         os.mkfifo(self.path)
-        parsed = keybinds_manager.parse_user_bindings()
-        self.assertEqual(parsed["binds"], [])
-        self.assertEqual(parsed["unbinds"], set())
+        # Everything that opens the FIFO runs in a worker: with O_NONBLOCK
+        # dropped the open blocks forever, so the join deadline turns a hung
+        # test run into a fast, named failure.
+        result = {}
+
+        def read_fifo():
+            # Non-regular targets must be refused by the reader itself, not
+            # merely skipped because an empty FIFO happens to read as "".
+            result["reader"] = keybinds_manager._read_bounded_regular_file(self.path)
+            result["parsed"] = keybinds_manager.parse_user_bindings()
+
+        worker = threading.Thread(target=read_fifo, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "reading a FIFO blocked the reader")
+        self.assertIsNone(result["reader"])
+        self.assertEqual(result["parsed"]["binds"], [])
+        self.assertEqual(result["parsed"]["unbinds"], set())
         with self.assertRaises(ValueError):
             keybinds_manager.write_user_bindings(unbinds_to_add=["SUPER + Z"])
+
+    def test_installed_apps_scan_caps_are_enforced(self):
+        app_dir = tempfile.mkdtemp(dir=self._tmpdir.name)
+        for name in ("One", "Two", "Three"):
+            with open(os.path.join(app_dir, name.lower() + ".desktop"), "w",
+                      encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        f"Name={name}\nExec={name.lower()}\n")
+        saved_files = keybinds_manager.MAX_APP_FILES
+        saved_bytes = keybinds_manager.MAX_APP_TOTAL_READ
+        try:
+            keybinds_manager.MAX_APP_FILES = 2
+            self.assertEqual(
+                len(keybinds_manager.get_installed_apps(dirs=[app_dir])), 2)
+            keybinds_manager.MAX_APP_FILES = saved_files
+            keybinds_manager.MAX_APP_TOTAL_READ = 10
+            self.assertEqual(
+                len(keybinds_manager.get_installed_apps(dirs=[app_dir])), 1)
+        finally:
+            keybinds_manager.MAX_APP_FILES = saved_files
+            keybinds_manager.MAX_APP_TOTAL_READ = saved_bytes
+
+    def test_written_identity_treats_command_as_literal(self):
+        # Half of the raw-vs-literal rule lives in the identity helper: a
+        # command that looks like a dispatcher must still be quoted there.
+        _desc, action = keybinds_manager._written_bind_identity(
+            {"key": "SUPER + X", "description": "d",
+             "command": "hl.dsp.window.close()"})
+        self.assertEqual(action, '"hl.dsp.window.close()"')
+        _desc, raw = keybinds_manager._written_bind_identity(
+            {"key": "SUPER + X", "description": "d", "command": "",
+             "action": "hl.dsp.window.close()"})
+        self.assertEqual(raw, "hl.dsp.window.close()")
 
 
 if __name__ == "__main__":
