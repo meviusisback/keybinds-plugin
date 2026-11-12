@@ -194,22 +194,21 @@ Item {
     // Mirroring the action here rewrote shipped helper calls
     // (o.bind(..., o.launch_terminal())) as the literal command
     // "o.launch_terminal()" and silently broke the shortcut.
-    var storedAction = (bindingItem && bindingItem.action) || ""
+    // The backend hands over the DECODED literal command (model field
+    // "command"); unescaping a Lua literal here double-escaped every save of a
+    // command containing a quote.
     root.actionCommand = (bindingItem && bindingItem.command) || ""
-    if (!root.actionCommand && storedAction && storedAction !== "exec"
-        && !isRawAction(storedAction)) {
-      // A command stored as the action (a quoted literal) belongs in the command
-      // field, unquoted; otherwise it was neither visible nor editable and Save
-      // would have dropped it.
-      root.actionCommand = storedAction.replace(/^["']|["']$/g, "")
-    }
     root.actionDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionCategory = (bindingItem && bindingItem.category) || "Custom"
     root.actionKey = (bindingItem && bindingItem.key) || ""
     root.oldKey = (bindingItem && bindingItem.key) || ""
     // Identity of the row being edited. Several bindings can share a chord, so
     // the backend needs this to replace exactly this line and not a sibling.
-    root.oldTitle = root.actionTitle
+    // RAW description as written in the file: a nil/empty description is what the
+    // identity has to match, not the label synthesised for display.
+    root.oldTitle = (bindingItem && bindingItem.description_raw !== undefined)
+      ? (bindingItem.description_raw || "")
+      : root.actionTitle
     root.oldCommand = (bindingItem && bindingItem.command) || ""
     root.oldDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionType = "custom"

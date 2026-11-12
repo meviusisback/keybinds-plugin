@@ -446,7 +446,7 @@ Item {
           }
         } catch (e) {
           console.warn("KeybindsPanel: Failed to parse menu-install json:", e)
-          root.showToast("Failed to add menu entry.")
+          root.showToast("Failed to add menu entry.", true)
         }
         menuEntryChecked = true
         menuSetupDialog.opened = false
@@ -472,11 +472,11 @@ Item {
             root.showToast(parsed.message || "Removed from launcher.")
             refreshMenuProc.running = true
           } else {
-            root.showToast(parsed.message || "Failed to remove menu entry.")
+            root.showToast(parsed.message || "Failed to remove menu entry.", true)
           }
         } catch (e) {
           console.warn("KeybindsPanel: Failed to parse menu-remove json:", e)
-          root.showToast("Failed to remove menu entry.")
+          root.showToast("Failed to remove menu entry.", true)
         }
       }
     }
@@ -1639,8 +1639,8 @@ Item {
         id: toastCard
         visible: root.toastVisible
         anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: Style.space(14)
+        anchors.top: parent.top
+        anchors.topMargin: Style.space(14)
         width: Math.min(parent.width - Style.space(44), toastRow.implicitWidth + Style.space(32))
         height: Style.space(38)
         z: 100

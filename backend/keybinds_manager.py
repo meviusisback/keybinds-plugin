@@ -133,6 +133,28 @@ def _lua_single_expression_problem(expr: str) -> str:
     return ""
 
 
+_MODIFIER_NAMES = {"SUPER", "SHIFT", "CTRL", "ALT"}
+
+
+def _key_is_plausible(norm_key: str) -> bool:
+    """True when a normalised chord can actually bind something.
+
+    Hyprland keys are modifiers plus a keysym (``SUPER + RETURN``, ``code:34``,
+    ``mouse:272``). Anything else - a leading dash, an empty part, stray
+    whitespace - would be written and reported as saved while binding nothing.
+    """
+    parts = [p.strip() for p in (norm_key or "").split("+")]
+    if not parts or any(not p for p in parts):
+        return False
+    for part in parts[:-1]:
+        if part.upper() not in _MODIFIER_NAMES:
+            return False
+    return re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.:-]*", parts[-1]) is not None
+
+
+_NESTED_BIND_RE = re.compile(r"^\s*o\s*\.\s*bind(?:_toggle)?\s*\(")
+
+
 def _is_raw_dispatcher(action: str) -> bool:
     """True for the shapes Omarchy stores as code, not as a command string.
 
@@ -144,6 +166,91 @@ def _is_raw_dispatcher(action: str) -> bool:
     stripped = (action or "").strip()
     return (stripped.startswith("{") or stripped.startswith("hl.")
             or re.match(r"^o\.[A-Za-z_][A-Za-z0-9_.]*\s*\(", stripped) is not None)
+
+
+def _code_mask(text: str):
+    """Mask of the positions in ``text`` that are Lua code, not string content.
+
+    Detection could not simply search the flattened unit: a bind mentioned inside
+    a long string (``[[hl.unbind("SUPER + X")]]``) is data, and an anchored match
+    was blind to a bind that follows another statement. Searching the code mask
+    gives both: tolerant, and never fooled by a literal.
+    """
+    mask = [True] * len(text)
+    i, n = 0, len(text)
+    quote = None
+    long_close = None
+    while i < n:
+        ch = text[i]
+        if long_close is not None:
+            mask[i] = False
+            if text.startswith(long_close, i):
+                for k in range(i, min(n, i + len(long_close))):
+                    mask[k] = False
+                i += len(long_close)
+                long_close = None
+                continue
+            i += 1
+            continue
+        if quote is not None:
+            mask[i] = False
+            if ch == "\\":
+                if i + 1 < n:
+                    mask[i + 1] = False
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            mask[i] = False
+            i += 1
+            continue
+        if ch == "[":
+            m = re.match(r"\[(=*)\[", text[i:])
+            if m:
+                delimit = len(m.group(1))
+                for k in range(i, min(n, i + len(m.group(0)))):
+                    mask[k] = False
+                long_close = "]" + "=" * delimit + "]"
+                i += len(m.group(0))
+                continue
+        i += 1
+    return mask
+
+
+def _search_in_code(pattern: str, text: str):
+    """First match of ``pattern`` whose start is Lua code, or None."""
+    mask = _code_mask(text)
+    for m in re.finditer(pattern, text):
+        if m.start() < len(mask) and mask[m.start()]:
+            return m
+    return None
+
+
+def _file_mentions_unbind(content: str, norm_key: str) -> bool:
+    """True when a unit calls any unbind form for this chord (code, not text).
+
+    ``hl["unbind"]("K")`` is valid Lua that Hyprland honours but the anchored
+    parser does not recognise; "enable" must know the key is still disabled rather
+    than reporting success.
+    """
+    for _unit, text, is_comment in _lua_units(_split_lines(content)[0]):
+        if is_comment or not text:
+            continue
+        mask = _code_mask(text)
+        # The token may sit inside a literal (`hl["unbind"]`), so test the mask at
+        # the CALL PAREN — that is code in every spelling — then read the chord
+        # from the call's own window.
+        for m in re.finditer(r'unbind["\']?\s*\]?\s*\(', text):
+            at = m.end() - 1
+            if at < len(mask) and mask[at]:
+                window = text[at:at + 200]
+                if re.search(r'["\']' + re.escape(norm_key) + r'["\']', window):
+                    return True
+    return False
 
 
 def _unit_is_single_statement(text: str) -> bool:
@@ -1277,7 +1384,10 @@ def parse_default_bindings():
         # Same bounded reader as every other path: a FIFO planted in this
         # directory used to block `list` forever, and an oversized file was
         # silently truncated mid-statement.
-        content = _read_bounded_regular_file(filepath)
+        try:
+            content = _read_bounded_regular_file(filepath)
+        except (OSError, UnicodeDecodeError):
+            continue
         if content is None:
             continue
         total_read += len(content.encode("utf-8"))
@@ -1371,11 +1481,23 @@ def parse_user_bindings():
             raw_key, desc, action_raw, opts_raw = parsed
             norm_key = normalize_key_chord(raw_key)
 
+            literal_cmd = ""
+            if not _is_raw_dispatcher(action_raw):
+                raw_action = (action_raw or "").strip()
+                if ((raw_action.startswith('"') and raw_action.endswith('"'))
+                        or (raw_action.startswith("'") and raw_action.endswith("'"))):
+                    literal_cmd = _decode_lua_string(raw_action[1:-1])
+
             entry = {
                 "source": "user",
                 "key": norm_key,
                 "raw_key": raw_key,
                 "description": desc or action_raw.strip('"\''),
+                # raw description as written (nil/empty stays empty) and the
+                # decoded literal command: the editor needs both so an untouched
+                # save is byte-stable and an in-place edit can identify the line.
+                "description_raw": desc or "",
+                "command": literal_cmd,
                 "action": action_raw,
                 "is_mouse": "mouse" in raw_key.lower() or "mouse" in (opts_raw or ""),
                 "is_release": opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw),
@@ -1611,7 +1733,7 @@ def _resolve_bindings_write_path(path: str):
 
 def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None,
                         preserve_entry=None, previous_entry=None, override_keys=None,
-                        require_absent=None):
+                        require_absent=None, require_removal=False):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
@@ -1630,6 +1752,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     ``require_absent``: keys that must have no bind line left in the output.
     The removal verbs pass their target, so "wrote nothing, said saved" cannot
     happen (they used to succeed while the statement stayed in place).
+
+    ``require_removal``: the write must remove at least one statement (a verb that
+    only deletes). Counting units catches every detection blind spot, including
+    forms the anchored patterns do not even recognise.
     """
     cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
     preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
@@ -1675,27 +1801,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 except OSError:
                     pass
                 raise
-            backup_path = resolved_path + ".bak"
-            # Write the backup through a unique temp file and atomically replace,
-            # instead of O_TRUNC on the predictable .bak path. This avoids
-            # truncating an existing inode, so a planted hard link / symlink at
-            # that path cannot destroy another file's contents. The .bak lands
-            # beside the resolved target so dotfile-managed links keep working.
-            bak_fd, bak_tmp = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".bak.tmp")
-            try:
-                with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
-                    bak_f.write(existing_content)
-                    bak_f.flush()
-                    os.fsync(bak_f.fileno())
-                os.replace(bak_tmp, backup_path)
-            except BaseException:
-                if os.path.exists(bak_tmp):
-                    try:
-                        os.unlink(bak_tmp)
-                    except OSError:
-                        pass
-                raise
+            # The .bak is written only after the statement proofs pass (see
+            # below): a refused edit must not destroy the previous known-good
+            # backup while telling the user that nothing was written.
 
+    original_content_for_backup = existing_content
     bom = "\ufeff" if existing_content.startswith("\ufeff") else ""
     if bom:
         # A BOM is only legal at byte 0. Strip it from the line list and put it
@@ -1725,11 +1835,22 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
         is_targeted = False
         if clean_keys:
-            m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', text)
+            m_unbind = _search_in_code(
+                r'\bhl\s*\.\s*unbind\s*\(\s*["\']([^"\']+)["\']', text)
             if m_unbind and normalize_key_chord(m_unbind.group(1)) in clean_keys:
+                if not _unit_is_single_statement(text):
+                    raise ValueError(
+                        "the line holding this chord also holds another "
+                        "statement; refusing to edit it (split it into its "
+                        "own line first)")
                 is_targeted = True
 
-            m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', text)
+            # Not anchored: a bind can follow `if ... then ` or be written as
+            # `o .bind(...)`, and an anchored match made both the removal and its
+            # proof blind to it (the write reported success and the chord stayed
+            # bound).
+            m_bind = _search_in_code(
+                r'\bo\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', text)
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
                 bind_key = normalize_key_chord(m_bind.group(1))
                 if bind_key in overrides:
@@ -1809,6 +1930,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
             if _is_raw_dispatcher(action):
+                if _NESTED_BIND_RE.match(action):
+                    raise ValueError("a raw dispatcher may not register another binding")
                 problem = _lua_single_expression_problem(action.strip())
                 if problem:
                     raise ValueError(f"refusing to write the raw dispatcher: {problem}")
@@ -1835,11 +1958,34 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         return parsed_binds
 
     written_binds = _parsed_binds(new_lines)
-    if require_absent:
-        remaining = {k for k, _p in written_binds if k in set(require_absent)}
-        if remaining:
+    if require_removal:
+        before_units = sum(1 for _u, t, c in _lua_units(current_lines) if t and not c)
+        after_units = sum(1 for _u, t, c in _lua_units(new_lines) if t and not c)
+        if after_units >= before_units:
             raise ValueError(
-                "could not remove the binding for " + ", ".join(sorted(remaining)) +
+                "nothing was removed: the statement to delete could not be "
+                "located; nothing was written")
+
+    if require_absent:
+        # Independent check: look for the chord anywhere in a unit's flattened
+        # text, with a tolerant pattern. Reusing the anchored helpers that did the
+        # removal let a blind spot certify itself.
+        still_there = []
+        for key in require_absent:
+            norm = normalize_key_chord(key)
+            if not norm:
+                continue
+            pattern = (r'o\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']' +
+                       re.escape(norm) + r'["\']')
+            for _unit, text, is_comment in _lua_units(new_lines):
+                if is_comment or not text:
+                    continue
+                if _search_in_code(pattern, text):
+                    still_there.append(norm)
+                    break
+        if still_there:
+            raise ValueError(
+                "could not remove the binding for " + ", ".join(sorted(set(still_there))) +
                 "; nothing was written")
     for entry in (lines_to_add or []):
         want = normalize_key_chord(entry.get("key", ""))
@@ -1851,9 +1997,12 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         for written_key, parsed in written_binds:
             if written_key not in clean_keys:
                 continue
-            written_desc = (parsed[1] or "").strip().lower()
+            written_desc = (parsed[1] or "").strip()
             written_action = (parsed[2] or "").strip().strip("\"'")
-            if (written_desc == previous_identity[0].strip().lower()
+            # Exact, not case-folded: a description that differs only in case is a
+            # legal edit, and refusing it claimed "nothing was written" after the
+            # file had been rewritten.
+            if (written_desc == previous_identity[0].strip()
                     and written_action == previous_identity[1].strip().strip("\"'")):
                 raise ValueError(
                     "could not replace the existing binding "
@@ -1869,6 +2018,27 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         else:
             final_output.append(line)
             prev_blank = False
+
+    if exists:
+        backup_path = resolved_path + ".bak"
+        # Unique temp file + atomic replace instead of O_TRUNC on the predictable
+        # .bak path: a planted hard link or symlink there cannot destroy another
+        # file's contents. The .bak lands beside the resolved target so
+        # dotfile-managed links keep working.
+        bak_fd, bak_tmp = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".bak.tmp")
+        try:
+            with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
+                bak_f.write(original_content_for_backup)
+                bak_f.flush()
+                os.fsync(bak_f.fileno())
+            os.replace(bak_tmp, backup_path)
+        except BaseException:
+            if os.path.exists(bak_tmp):
+                try:
+                    os.unlink(bak_tmp)
+                except OSError:
+                    pass
+            raise
 
     fd, temp_file = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".tmp")
     try:
@@ -1916,7 +2086,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     norm_key = normalize_key_chord(key)
     norm_old_key = normalize_key_chord(old_key) if old_key else ""
 
-    if not norm_key:
+    if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
 
     # A dispatcher-looking command is almost always a lost argument; writing it
@@ -1929,6 +2099,9 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                      "(set <key> <desc> <command> <action>)",
         }
     if _is_raw_dispatcher(action):
+        if _NESTED_BIND_RE.match(action):
+            return {"success": False,
+                    "error": "invalid raw Lua dispatcher: it may not register another binding"}
         problem = _lua_single_expression_problem(action.strip())
         if problem:
             return {"success": False, "error": f"invalid raw Lua dispatcher: {problem}"}
@@ -2017,7 +2190,7 @@ def reset_keybinding(key: str, default_key: str = ""):
     norm_key = normalize_key_chord(key)
     norm_def = normalize_key_chord(default_key) if default_key else ""
 
-    if not norm_key:
+    if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
 
     keys_to_remove = [norm_key]
@@ -2040,7 +2213,13 @@ def reset_keybinding(key: str, default_key: str = ""):
         # require_absent: the target must really be gone from the output, so a
         # statement this code cannot isolate can no longer be reported as
         # removed while it stays in the file.
-        write_user_bindings(keys_to_remove=keys_to_remove, require_absent=keys_to_remove)
+        # Only demand a removal when there is something to remove: resetting a
+        # chord that has no user override is already the default.
+        state = parse_user_bindings()
+        has_statement = (any(b["key"] in keys_to_remove for b in state["binds"])
+                         or bool(state["unbinds"] & set(keys_to_remove)))
+        write_user_bindings(keys_to_remove=keys_to_remove,
+                            require_absent=keys_to_remove, require_removal=has_statement)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -2053,7 +2232,7 @@ def reset_keybinding(key: str, default_key: str = ""):
 def disable_keybinding(key: str):
     """Disable/unbind a keybinding."""
     norm_key = normalize_key_chord(key)
-    if not norm_key:
+    if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
     try:
         write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key],
@@ -2068,10 +2247,16 @@ def disable_keybinding(key: str):
 def enable_keybinding(key: str):
     """Re-enable a previously disabled default keybinding by removing its unbind."""
     norm_key = normalize_key_chord(key)
-    if not norm_key:
+    if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
     try:
-        write_user_bindings(keys_to_remove=[norm_key])
+        # Enabling a chord with no unbind at all is an honest no-op success; any
+        # unbind form that cannot be removed must be refused.
+        content = _read_bounded_regular_file(USER_BINDINGS_PATH) or ""
+        has_unbind = (norm_key in parse_user_bindings()["unbinds"]
+                      or _file_mentions_unbind(content, norm_key))
+        write_user_bindings(keys_to_remove=[norm_key], require_absent=[norm_key],
+                            require_removal=has_unbind)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()

