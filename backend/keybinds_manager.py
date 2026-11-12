@@ -67,6 +67,11 @@ def _lua_single_expression_problem(expr: str) -> str:
     """
     if "\n" in expr or "\r" in expr:
         return "newlines are not allowed in a raw dispatcher"
+    # Control bytes cannot appear in Lua source: ESC/BEL/DEL produced text luac
+    # rejects, i.e. a bindings.lua Hyprland drops entire, reported as saved.
+    bad = [ch for ch in expr if (ord(ch) < 32 and ch not in "\t\v\f") or ord(ch) == 127]
+    if bad:
+        return "control characters are not allowed in a raw dispatcher"
     if len(expr) > MAX_CMD_LEN:
         return f"a raw dispatcher may not exceed {MAX_CMD_LEN} characters"
     closers = {")": "(", "]": "[", "}": "{"}
@@ -271,7 +276,10 @@ def _unit_is_single_statement(text: str) -> bool:
     cannot be removed line-wise without taking the other statement with it: the
     caller refuses instead of corrupting the file.
     """
-    head = re.match(r"\s*(?:o\.bind(?:_toggle)?|hl\.unbind)\s*\(", text)
+    # Same tolerant head as detection: `o .bind(...)` and `o["bind"](...)` are
+    # legal Lua, and a strict spelling here refused to edit rows the scanner had
+    # already matched (the write then certified success without removing them).
+    head = re.match(r"\s*(?:" + _BIND_HEAD_RE.pattern + r"|hl\s*\.\s*unbind\s*\()", text)
     if not head:
         return False
     i = text.index("(", head.start())
@@ -298,7 +306,13 @@ def _unit_is_single_statement(text: str) -> bool:
     return False
 
 
-_BIND_HEAD_RE = re.compile(r"o\.bind(?:_toggle)?\s*\(")
+_BIND_HEAD_RE = re.compile(
+    r'o\s*\.\s*bind(?:_toggle)?\s*\(|o\s*\[\s*["\']bind(?:_toggle)?["\']\s*\]\s*\(')
+
+
+def _bind_head(text: str):
+    """First bind-call head in CODE position, or None."""
+    return _search_in_code(_BIND_HEAD_RE.pattern, text or "")
 
 
 def _read_lua_string(text: str, pos: int):
@@ -338,6 +352,14 @@ def _read_lua_string(text: str, pos: int):
         out.append(ch)
         pos += 1
     return None, pos, False  # unterminated literal
+
+
+def _bind_fn(text: str) -> str:
+    """``o.bind_toggle`` or ``o.bind`` for a bind statement (default ``o.bind``)."""
+    m = _BIND_HEAD_RE.match((text or "").lstrip())
+    if m and "toggle" in m.group(0):
+        return "o.bind_toggle"
+    return "o.bind"
 
 
 def _parse_bind_line(line: str):
@@ -1422,9 +1444,10 @@ def parse_default_bindings():
                 continue
 
             raw_key, desc, action_raw, opts_raw = parsed
+            fn_name = _bind_fn(stripped)
 
             norm_key = normalize_key_chord(raw_key)
-            if stripped.startswith("o.bind_toggle"):
+            if fn_name == "o.bind_toggle":
                 clean_target = action_raw.strip('"\'')
                 action_raw = f'"omarchy-toggle-{clean_target}"'
             if not desc:
@@ -1447,13 +1470,18 @@ def parse_default_bindings():
 
             is_release = opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw)
 
+            decoded_cmd, _end, _ok = _read_lua_string((action_raw or "").strip(), 0)
             bindings.append({
                 "source": "default",
                 "file": fname,
+                "command": decoded_cmd if (_ok and decoded_cmd is not None
+                                           and not _is_raw_dispatcher(action_raw)) else "",
                 "key": norm_key,
                 "raw_key": raw_key,
                 "description": desc,
                 "action": action_raw,
+                "opts": opts_raw or "",
+                "fn": fn_name,
                 "category": cat,
                 "is_mouse": "mouse" in raw_key.lower() or "mouse" in (opts_raw or ""),
                 "is_release": is_release,
@@ -1518,6 +1546,8 @@ def parse_user_bindings():
                 "description_raw": desc or "",
                 "command": literal_cmd,
                 "action": action_raw,
+                "opts": opts_raw or "",
+                "fn": _bind_fn(text),
                 "is_mouse": "mouse" in raw_key.lower() or "mouse" in (opts_raw or ""),
                 "is_release": opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw),
             }
@@ -1551,7 +1581,10 @@ def build_complete_model():
              if d["action"] == ub["action"] and d["key"] in user_state["unbinds"]),
             None
         )
-        if matched:
+        if matched and matched["key"] not in rebound_defaults_map:
+            # One default row can stand for one moved binding: a second user row
+            # with the same action must stay visible as its own custom row instead
+            # of silently disappearing from the model.
             rebound_defaults_map[matched["key"]] = ub
             matched_user_bind_keys.add(ub["key"])
 
@@ -1630,7 +1663,10 @@ def build_complete_model():
             conflicts_dict[k] = {
                 "key": k,
                 "bindings": [
-                    {"description": x["description"], "action": x["action"], "status": x.get("status", "unknown")}
+                    {"key": x["key"], "description": x["description"], "action": x["action"],
+                     "command": x.get("command", ""),
+                     "description_raw": x.get("description_raw", ""),
+                     "status": x.get("status", "unknown")}
                     for x in group
                 ],
             }
@@ -1672,6 +1708,25 @@ def build_complete_model():
         "mouse_settings": get_mouse_scroll_settings(),
         "user_bindings_file": USER_BINDINGS_PATH,
     }
+
+
+def _pure_literal(text: str):
+    """Decoded value when ``text`` is ONE complete Lua string literal, else None.
+
+    The writer re-emits a stored literal verbatim so an untouched save cannot
+    change the bytes. That must never interpolate caller text into code: the
+    documented CLI takes old_action as an argument, and `"x") os.execute(...) --`
+    was written as Lua before this check existed.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    value, end, ok = _read_lua_string(raw, 0)
+    if not ok or value is None:
+        return None
+    if raw[end:].strip():
+        return None
+    return value
 
 
 def _identity_value(raw) -> str:
@@ -1760,6 +1815,54 @@ def _written_bind_identity(entry):
     if cmd:
         return desc, _plain_value(cmd)
     return desc, _identity_value(action)
+
+
+def _lua_compile_error(text: str) -> str:
+    """First line of the Lua compiler's complaint about ``text``, or "".
+
+    ``luac -p`` only parses (no execution), so the ``hl``/``o`` helpers being
+    runtime globals is fine. No compiler installed -> "" (the shape checks above
+    are all there is, which is why they stay).
+    """
+    luac = shutil.which("luac") or shutil.which("luac5.4") or shutil.which("luac5.3")
+    if not luac or not text.strip():
+        return ""
+    fd, tmp = tempfile.mkstemp(suffix=".lua")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            res = subprocess.run([luac, "-p", tmp], capture_output=True, text=True,
+                                 timeout=10)
+        except Exception:
+            return ""  # a broken compiler is not a reason to lose the edit
+        if res.returncode != 0:
+            first = (res.stderr or res.stdout or "").strip().splitlines()
+            return first[0] if first else "luac rejected it"
+        return ""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _assert_lua_compiles(text: str, original: str = "") -> None:
+    """Refuse a write that would leave a file Hyprland cannot parse.
+
+    Only OUR change matters: a file that was already broken stays editable (the
+    plugin has always preserved such bytes verbatim), but a file that compiled
+    before must still compile - otherwise one bad save makes Hyprland drop every
+    user override in it.
+    """
+    error = _lua_compile_error(text)
+    if not error:
+        return
+    if _lua_compile_error(original):
+        return  # already broken before us; do not make the user unable to fix it
+    raise ValueError(
+        "refusing to write: the resulting bindings.lua would not compile ("
+        + error + ")")
 
 
 def _resolve_bindings_write_path(path: str):
@@ -1913,7 +2016,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # proof blind to it (the write reported success and the chord stayed
             # bound).
             bind_key = ""
-            m_bind = _search_in_code(r'\bo\s*\.\s*bind(?:_toggle)?\s*\(', text)
+            m_bind = _bind_head(text)
             if m_bind:
                 # Read the arguments with the real parser: a key written as a
                 # long-bracket string (o.bind([[SUPER + W]], ...)) is legal and
@@ -1938,7 +2041,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                             "own line first)")
                     _parsed = _parse_bind_line(text)
                     if _parsed:
-                        parsed_desc = _identity_value(_parsed[1])
+                        parsed_desc = _plain_value(_parsed[1])
                         parsed_action = _identity_value(_parsed[2])
                         for ident in identities:
                             # Both halves, not either: a rename that lands on the
@@ -2008,7 +2111,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     if lines_to_add:
         for entry in lines_to_add:
             key = normalize_key_chord(entry.get("key", ""))
-            desc = sanitize_lua_str(entry.get("description", ""), max_len=MAX_TEXT_LEN)
+            raw_desc = _plain_value(entry.get("description", ""))
+            if len(raw_desc) > MAX_TEXT_LEN:
+                raise ValueError(
+                    f"that description is longer than {MAX_TEXT_LEN} characters")
+            desc = sanitize_lua_str(raw_desc, max_len=MAX_TEXT_LEN)
             cmd = entry.get("command", "")
             action = entry.get("action", "")
 
@@ -2016,26 +2123,58 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # `command`: the command can be an untrusted .desktop Exec, and
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
+            fn_name = "o.bind_toggle" if entry.get("fn_name") == "o.bind_toggle" else "o.bind"
+            opts_part = ""
+            opts_literal = (entry.get("opts_literal") or "").strip()
+            if opts_literal:
+                # o.bind's fourth argument (locked/repeating/non_consuming) decides
+                # how the key behaves; dropping it reported "saved" while the key
+                # stopped repeating.
+                problem = _lua_single_expression_problem(opts_literal)
+                if problem or not opts_literal.startswith("{"):
+                    raise ValueError(
+                        "refusing to rewrite this binding: its options table cannot "
+                        "be validated (" + (problem or "not a table") + ")")
+                opts_part = ", " + opts_literal
+
             if _is_raw_dispatcher(action):
                 if _registers_a_binding(action):
                     raise ValueError("a raw dispatcher may not register another binding")
                 problem = _lua_single_expression_problem(action.strip())
                 if problem:
                     raise ValueError(f"refusing to write the raw dispatcher: {problem}")
-                new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()})')
+                new_lines.append(f'{fn_name}("{key}", "{desc}", {action.strip()}{opts_part})')
             elif entry.get("action_literal"):
                 # Unchanged command: re-emit the literal the file already holds, so
-                # an untouched save cannot rewrite (or duplicate) it.
+                # an untouched save cannot rewrite (or duplicate) it. It is
+                # validated as ONE complete literal first: the documented CLI takes
+                # this value as an argument, and `"x") os.execute(...) --` used to be
+                # written as Lua.
                 literal = entry["action_literal"].strip()
-                if _identity_value(literal) == "":
-                    raise ValueError("refusing to write an empty action literal")
-                new_lines.append(f'o.bind("{key}", "{desc}", {literal})')
+                value = _pure_literal(literal)
+                if value is None:
+                    raise ValueError(
+                        "refusing to write this binding: its stored command is not "
+                        "one complete string literal")
+                if value == "":
+                    raise ValueError(
+                        "this binding has no command to keep: type the command you want")
+                new_lines.append(f'{fn_name}("{key}", "{desc}", {literal}{opts_part})')
             else:
-                raw_cmd = cmd or action
-                value = _plain_value(raw_cmd) if raw_cmd else ""
+                # `command` is plain text typed by the user (never decoded); a stored
+                # `action` literal from the file IS a literal, so it is decoded -
+                # otherwise a default row's "omacalc" became the dead command
+                # "\"omacalc\"".
+                if cmd:
+                    value = _plain_value(cmd)
+                elif action:
+                    value = _identity_value(action)
+                else:
+                    value = ""
                 escaped_cmd = sanitize_lua_str(value, max_len=MAX_CMD_LEN)
-                new_line = f'o.bind("{key}", "{desc}", "{escaped_cmd}")'
-                new_lines.append(new_line)
+                if len(_plain_value(value)) > MAX_CMD_LEN:
+                    raise ValueError(f"that command is longer than {MAX_CMD_LEN} characters")
+                new_lines.append(f'{fn_name}("{key}", "{desc}", "{escaped_cmd}"{opts_part})')
 
     # A one-for-one replacement goes back where it was (comment above it intact).
     if len(removed_positions) == 1 and lines_to_add and len(lines_to_add) == 1:
@@ -2060,23 +2199,32 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     written_binds = _parsed_binds(new_lines)
     if no_duplicate_keys:
-        def _bind_count(lines, key):
-            seen = 0
-            pattern = (r'o\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']' +
-                       re.escape(key) + r'["\']')
+        def _keys_bound(lines):
+            found = []
             for _unit, text, is_comment in _lua_units(lines):
                 if is_comment or not text:
                     continue
-                seen += len(re.findall(pattern, text))
-            return seen
+                start = 0
+                while start < len(text):
+                    head = _bind_head(text[start:])
+                    if not head:
+                        break
+                    parsed = _parse_bind_line(text[start + head.start():])
+                    if parsed:
+                        found.append(normalize_key_chord(parsed[0]))
+                    start += head.end()
+            return found
 
         for key in no_duplicate_keys:
             norm = normalize_key_chord(key)
             if not norm:
                 continue
-            before = _bind_count(current_lines, norm)
-            after = _bind_count(new_lines, norm)
-            if after > before:
+            before = _keys_bound(current_lines).count(norm)
+            after = _keys_bound(new_lines).count(norm)
+            # Only a replacement can duplicate: binding a chord that had no user row
+            # yet (every override of an Omarchy default, the plugin's main
+            # operation) legitimately goes 0 -> 1.
+            if before and after > before:
                 raise ValueError(
                     "refusing to write: the edit would leave " + str(after) +
                     " bindings on " + norm + " instead of " + str(before) +
@@ -2095,18 +2243,22 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         # text, with a tolerant pattern. Reusing the anchored helpers that did the
         # removal let a blind spot certify itself.
         still_there = []
-        for key in require_absent:
-            norm = normalize_key_chord(key)
-            if not norm:
+        absent_targets = {normalize_key_chord(k) for k in require_absent}
+        absent_targets.discard("")
+        for _unit, text, is_comment in _lua_units(new_lines):
+            if is_comment or not text:
                 continue
-            pattern = (r'o\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']' +
-                       re.escape(norm) + r'["\']')
-            for _unit, text, is_comment in _lua_units(new_lines):
-                if is_comment or not text:
-                    continue
-                if _search_in_code(pattern, text):
-                    still_there.append(norm)
+            start = 0
+            while start < len(text):
+                head = _bind_head(text[start:])
+                if not head:
                     break
+                parsed = _parse_bind_line(text[start + head.start():])
+                if parsed:
+                    key_here = normalize_key_chord(parsed[0])
+                    if key_here in absent_targets:
+                        still_there.append(key_here)
+                start += head.end()
         if still_there:
             raise ValueError(
                 "could not remove the binding for " + ", ".join(sorted(set(still_there))) +
@@ -2121,7 +2273,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         for written_key, parsed in written_binds:
             if written_key not in clean_keys:
                 continue
-            written_desc = _identity_value(parsed[1])
+            written_desc = _plain_value(parsed[1])
             written_action = _identity_value(parsed[2])
             # Compared by value, not case-folded: a description that differs only
             # in case is a legal edit, and refusing it claimed "nothing was
@@ -2142,6 +2294,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         else:
             final_output.append(line)
             prev_blank = False
+
+    # Last gate before the file is committed: compile it, when a Lua compiler is
+    # installed. A file that does not parse makes Hyprland drop every user override
+    # in it, and no shape check of ours can promise a parser's verdict.
+    _assert_lua_compiles(newline.join(final_output), existing_content)
 
     if exists:
         backup_path = resolved_path + ".bak"
@@ -2265,6 +2422,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if old_literal and not action.strip() and not _is_raw_dispatcher(old_literal):
         if _identity_value(old_literal) == _plain_value(command):
             bind_entry["action_literal"] = old_literal
+
     binds = [bind_entry]
 
     # Editing a binding in place replaces *that* binding only: a second user
@@ -2300,6 +2458,29 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                      "description/command: set <key> <desc> <cmd> <action> "
                      "<old_key> <old_desc> <old_cmd> <old_action>",
         }
+
+    # Keep the row's call form and options table: rewriting an o.bind_toggle as
+    # o.bind changed what the key does, and dropping { locked = true, repeating =
+    # true } made media keys stop repeating while the panel said "applied".
+    if in_place:
+        user_rows = parse_user_bindings()["binds"]
+        candidates = [b for b in user_rows if b["key"] == norm_key]
+        if not candidates:
+            candidates = [d for d in parse_default_bindings() if d["key"] == norm_key]
+        target_ident = _written_bind_identity(previous_entry) if previous_entry else None
+        for row in candidates:
+            same = (target_ident is not None
+                    and _plain_value(row.get("description")) == target_ident[0]
+                    and _identity_value(row.get("action")) == target_ident[1])
+            if same or len(candidates) == 1:
+                bind_entry.setdefault("opts_literal", row.get("opts") or "")
+                bind_entry.setdefault("fn_name", row.get("fn") or "o.bind")
+                if (not bind_entry.get("action_literal")
+                        and _pure_literal(row.get("action")) is not None
+                        and _identity_value(row.get("action")) == _plain_value(command)):
+                    bind_entry["action_literal"] = row.get("action")
+                break
+    binds = [bind_entry]
 
     override_keys = []
     if not in_place and override_conflicts:

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import json
+import shutil
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 import keybinds_manager
@@ -1454,10 +1455,13 @@ class TestSecurityRegressions(unittest.TestCase):
         self.assertTrue(res["success"], res)
         self.assertEqual(content, line + "\n")
 
-    def test_long_description_does_not_duplicate(self):
+    def test_over_long_description_is_refused_not_truncated(self):
         long_desc = "L" * 260
         res, content = self._save_untouched(f'o.bind("SUPER + B", "{long_desc}", "b")')
-        self.assertTrue(res["success"], res)
+        # Truncating on the way to disk rewrote the user's row to 200 characters
+        # while reporting success; the refusal names the field.
+        self.assertFalse(res["success"])
+        self.assertIn("description is longer", res["error"])
         self.assertEqual(content.count("o.bind("), 1)
 
     def test_long_bracket_key_is_removed_by_disable(self):
@@ -1529,6 +1533,103 @@ class TestSecurityRegressions(unittest.TestCase):
             self._unstub_set_keybinding()
             keybinds_manager.reload_hyprland = lambda: {
                 "success": True, "reload_output": "", "config_errors": ""}
+
+    # -- round-6 review: injection via old_action, spellings, defaults, opts -----
+
+    def test_old_action_is_never_written_as_lua(self):
+        self._stub_set_keybinding()
+        try:
+            marker = os.path.join(tempfile.mkdtemp(), "pwned")
+            self._write('o.bind("SUPER + W", "Close", "x")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + W", "Close", "x", "", "SUPER + W", old_description="Close",
+                old_command="x",
+                old_action='"x") os.execute("touch ' + marker + '") --')
+            self.assertFalse(res["success"], res)
+            self.assertFalse(os.path.exists(marker))
+            self.assertEqual(keybinds_manager._lua_compile_error(self._read()), "")
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_spaced_or_bracketed_bind_head_can_be_disabled(self):
+        self._stub_set_keybinding()
+        try:
+            for spelling in ('o .bind([[SUPER + W]], "mine", "evil")',
+                             'o["bind"]("SUPER + W", "mine", "evil")',
+                             "o['bind']('SUPER + W', 'mine', 'evil')"):
+                self._write(spelling + "\n")
+                res = keybinds_manager.disable_keybinding("SUPER + W")
+                self.assertTrue(res["success"], (spelling, res))
+                live = [l for l in self._read().splitlines()
+                        if "SUPER + W" in l and not l.strip().startswith("hl.unbind")]
+                self.assertFalse(live, (spelling, self._read()))
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_shipped_default_row_can_be_edited_in_place(self):
+        # The plugin's main operation: override a default at its own chord. The
+        # duplicate proof used to read 0 -> 1 as a duplication and refuse.
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + RETURN", "description": "Terminal",
+                 "command": "", "action": "o.launch_terminal()", "opts": "", "fn": "o.bind"}]
+            self._write("")
+            res = keybinds_manager.set_keybinding(
+                "SUPER + RETURN", "Terminal edited", "", "o.launch_terminal()",
+                "SUPER + RETURN", old_description="Terminal", old_command="",
+                old_action="o.launch_terminal()")
+            self.assertTrue(res["success"], res)
+            self.assertEqual(self._read().count("o.bind("), 1)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_call_form_and_options_table_are_preserved(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind_toggle("SUPER + T", "Touchpad", "touchpad")\n'
+                        'o.bind("SUPER + K", "Vol", "vol-up", '
+                        '{ locked = true, repeating = true })\n')
+            r1 = keybinds_manager.set_keybinding(
+                "SUPER + T", "Touchpad2", "touchpad", "", "SUPER + T",
+                old_description="Touchpad", old_command="touchpad")
+            r2 = keybinds_manager.set_keybinding(
+                "SUPER + K", "Vol up", "vol-up", "", "SUPER + K",
+                old_description="Vol", old_command="vol-up")
+            content = self._read()
+            self.assertTrue(r1["success"], r1)
+            self.assertTrue(r2["success"], r2)
+            self.assertIn("o.bind_toggle(", content)
+            self.assertIn("repeating = true", content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_invalid_lua_is_refused_before_it_is_committed(self):
+        if not (shutil.which("luac") or shutil.which("luac5.4")):
+            self.skipTest("no Lua compiler installed")
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + W", "Close", "x")\n')
+            before = self._read()
+            res = keybinds_manager.set_keybinding(
+                "SUPER + Y", "d", "", "hl.dsp.notify(1 2)")
+            self.assertFalse(res["success"], res)
+            self.assertIn("compile", res["error"])
+            self.assertEqual(self._read(), before)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_quote_leading_description_is_replaced_not_duplicated(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + W", "\\"vim\\" scratch", "gvim")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + W", '"vim" scratch 2', "gvim", "", "SUPER + W",
+                old_description='"vim" scratch', old_command="gvim")
+            self.assertTrue(res["success"], res)
+            self.assertEqual(self._read().count("o.bind("), 1)
+        finally:
+            self._unstub_set_keybinding()
 
     def test_menu_reader_refuses_a_fifo(self):
         fifo = os.path.join(self._tmpdir.name, "omarchy-menu.jsonc")
