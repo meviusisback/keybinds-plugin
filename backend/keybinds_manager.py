@@ -149,10 +149,21 @@ def _key_is_plausible(norm_key: str) -> bool:
     for part in parts[:-1]:
         if part.upper() not in _MODIFIER_NAMES:
             return False
+    if parts[-1].upper() in _MODIFIER_NAMES:
+        return False  # "SUPER" / "SUPER + CTRL" binds nothing
     return re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.:-]*", parts[-1]) is not None
 
 
 _NESTED_BIND_RE = re.compile(r"^\s*o\s*\.\s*bind(?:_toggle)?\s*\(")
+
+
+def _registers_a_binding(action: str) -> bool:
+    """True when the raw action registers another binding in CODE position.
+
+    The anchored check missed a registration inside a table or a function body
+    (`{ o.bind(...) }`), which Hyprland evaluates at load time.
+    """
+    return _search_in_code(r'\bo\s*\.\s*bind(?:_toggle)?\s*\(', action or "") is not None
 
 
 def _is_raw_dispatcher(action: str) -> bool:
@@ -302,6 +313,15 @@ def _read_lua_string(text: str, pos: int):
         pos += 1
     if text.startswith("nil", pos):
         return None, pos + 3, True
+    if pos < len(text) and text[pos] == "[":
+        m = re.match(r"\[(=*)\[", text[pos:])
+        if m:
+            close = "]" + "=" * len(m.group(1)) + "]"
+            start = pos + len(m.group(0))
+            end = text.find(close, start)
+            if end < 0:
+                return None, len(text), False
+            return text[start:end], end + len(close), True
     if pos >= len(text) or text[pos] not in "\"'":
         return None, pos, False
     quote = text[pos]
@@ -1483,10 +1503,9 @@ def parse_user_bindings():
 
             literal_cmd = ""
             if not _is_raw_dispatcher(action_raw):
-                raw_action = (action_raw or "").strip()
-                if ((raw_action.startswith('"') and raw_action.endswith('"'))
-                        or (raw_action.startswith("'") and raw_action.endswith("'"))):
-                    literal_cmd = _decode_lua_string(raw_action[1:-1])
+                value, _end, ok = _read_lua_string((action_raw or "").strip(), 0)
+                if ok and value is not None:
+                    literal_cmd = value
 
             entry = {
                 "source": "user",
@@ -1522,8 +1541,14 @@ def build_complete_model():
     matched_user_bind_keys = set()
 
     for ub in user_state["binds"]:
+        # A default counts as MOVED only when it is really gone from Hyprland: its
+        # own chord carries an hl.unbind AND the same action moved to this row. A
+        # second chord added for an action still bound at its default chord is an
+        # ADDITION, and hiding the live default row made it impossible to see,
+        # disable or reset that binding.
         matched = next(
-            (d for d in default_binds if d["description"].lower() == ub["description"].lower() or d["action"] == ub["action"]),
+            (d for d in default_binds
+             if d["action"] == ub["action"] and d["key"] in user_state["unbinds"]),
             None
         )
         if matched:
@@ -1649,6 +1674,35 @@ def build_complete_model():
     }
 
 
+def _identity_value(raw) -> str:
+    """A comparison value for a description or action, independent of form.
+
+    The stored text is a Lua literal; the model hands the editor the decoded
+    value. Comparing the two must not depend on which legal literal form the file
+    used - a wholly quoted command, a ``[[...]]`` action or a ``\\n`` escape all
+    decoded to different strings under the old quote-stripping comparison, so the
+    row was not recognised and a second bind was appended on top of it.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    value, _end, ok = _read_lua_string(text, 0)
+    if not (ok and value is not None):
+        value = text
+    return _plain_value(value)
+
+
+def _plain_value(raw) -> str:
+    """Normalise plain text the way the writer does, WITHOUT decoding a literal.
+
+    A command typed in the dialog is data, not Lua: a value that starts with a
+    quote means the user wants that quote, so it must not be re-parsed.
+    """
+    text = (raw or "").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return text.replace("\r", " ").replace("\n", " ")
+
+
 def _decode_lua_string(text: str) -> str:
     """Decode the escapes ``sanitize_lua_str`` adds (``\\\\`` and ``\\"``).
 
@@ -1694,15 +1748,18 @@ def _written_bind_identity(entry):
     # Decoded (flattened, length-capped) description: this is what a parsed
     # line yields, so identity comparisons stay on the same side of the
     # escaping the writer applies.
-    desc = (entry.get("description") or "").replace("\r", " ").replace("\n", " ")[:MAX_TEXT_LEN]
+    desc = _plain_value(entry.get("description") or "")
     cmd = entry.get("command", "")
     action = entry.get("action", "")
+    if entry.get("action_literal"):
+        # The file already holds this exact literal and the command was not
+        # edited: re-encoding it is what changed the bytes.
+        return desc, _identity_value(entry["action_literal"])
     if _is_raw_dispatcher(action):
         return desc, action.strip()[:MAX_CMD_LEN]
-    raw_cmd = (cmd or action).strip()
-    if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
-        raw_cmd = _decode_lua_string(raw_cmd[1:-1])
-    return desc, f'"{sanitize_lua_str(raw_cmd)}"'
+    if cmd:
+        return desc, _plain_value(cmd)
+    return desc, _identity_value(action)
 
 
 def _resolve_bindings_write_path(path: str):
@@ -1733,7 +1790,8 @@ def _resolve_bindings_write_path(path: str):
 
 def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None,
                         preserve_entry=None, previous_entry=None, override_keys=None,
-                        require_absent=None, require_removal=False):
+                        require_absent=None, require_removal=False,
+                        no_duplicate_keys=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
@@ -1824,6 +1882,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     clean_keys = set(normalize_key_chord(k) for k in (keys_to_remove or []))
 
     new_lines = []
+    removed_positions = []
 
     # Work on logical statements, not physical lines: a hand-formatted
     # multi-line o.bind must be replaced or removed as a whole, and text inside
@@ -1835,9 +1894,13 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
         is_targeted = False
         if clean_keys:
-            m_unbind = _search_in_code(
-                r'\bhl\s*\.\s*unbind\s*\(\s*["\']([^"\']+)["\']', text)
-            if m_unbind and normalize_key_chord(m_unbind.group(1)) in clean_keys:
+            m_unbind = _search_in_code(r'\bhl\s*\.\s*unbind\s*\(', text)
+            unbind_key = ""
+            if m_unbind:
+                value, _end, ok = _read_lua_string(text, m_unbind.end())
+                if ok and value is not None:
+                    unbind_key = normalize_key_chord(value)
+            if unbind_key and unbind_key in clean_keys:
                 if not _unit_is_single_statement(text):
                     raise ValueError(
                         "the line holding this chord also holds another "
@@ -1849,10 +1912,17 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # `o .bind(...)`, and an anchored match made both the removal and its
             # proof blind to it (the write reported success and the chord stayed
             # bound).
-            m_bind = _search_in_code(
-                r'\bo\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', text)
-            if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
-                bind_key = normalize_key_chord(m_bind.group(1))
+            bind_key = ""
+            m_bind = _search_in_code(r'\bo\s*\.\s*bind(?:_toggle)?\s*\(', text)
+            if m_bind:
+                # Read the arguments with the real parser: a key written as a
+                # long-bracket string (o.bind([[SUPER + W]], ...)) is legal and
+                # was invisible to the quote-shaped regex, so "Disable" wrote
+                # hl.unbind above a bind that stayed live.
+                _parsed_bind = _parse_bind_line(text[m_bind.start():])
+                if _parsed_bind:
+                    bind_key = normalize_key_chord(_parsed_bind[0])
+            if bind_key and bind_key in clean_keys:
                 if bind_key in overrides:
                     if not _unit_is_single_statement(text):
                         raise ValueError(
@@ -1868,14 +1938,17 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                             "own line first)")
                     _parsed = _parse_bind_line(text)
                     if _parsed:
-                        parsed_desc = (_parsed[1] or "").strip().lower()
-                        parsed_action = (_parsed[2] or "").strip().strip('"\'')
+                        parsed_desc = _identity_value(_parsed[1])
+                        parsed_action = _identity_value(_parsed[2])
                         for ident in identities:
                             # Both halves, not either: a rename that lands on the
                             # sibling's description (or command) used to match
-                            # that sibling by the OR and delete it.
-                            if (parsed_desc == ident[0].strip().lower()
-                                    and parsed_action == ident[1].strip().strip('"\'')):
+                            # that sibling by the OR and delete it. Compared by
+                            # VALUE: stripping quotes made every non-canonical
+                            # literal (a wholly quoted command, [[...]], an escape)
+                            # unrecognisable, and the row was duplicated instead of
+                            # replaced.
+                            if parsed_desc == ident[0] and parsed_action == ident[1]:
                                 is_targeted = True
                                 break
                     # Else: a different binding sharing this key (swap partner,
@@ -1888,9 +1961,14 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                             "own line first)")
                     is_targeted = True
 
-        if not is_targeted:
-            new_lines.extend(unit_lines)
+        if is_targeted:
+            # Remember where the row was: appending the replacement at the end of
+            # the block moved it away from its own comment on every save.
+            removed_positions.append(len(new_lines))
+            continue
+        new_lines.extend(unit_lines)
 
+    inserted_unbind_count = 0
     if unbinds_to_add:
         # Place unbinds at the top of the body, not at the end: Hyprland's
         # unbind() removes every bind on the chord registered before it, and the
@@ -1901,7 +1979,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         for k in unbinds_to_add:
             norm_k = normalize_key_chord(k)
             line_str = f'hl.unbind("{norm_k}")'
-            if line_str not in new_lines and line_str not in unbind_lines:
+            # Compare against CODE, not raw lines: a copy of this exact line inside
+            # a --[[ ]] block (the plugin writes it, a user comments it out to
+            # re-enable by hand) used to suppress the emission, so Disable wrote
+            # nothing and still reported success.
+            already_emitted = any(
+                not is_comment and text and _search_in_code(re.escape(line_str), text)
+                for _u, text, is_comment in _lua_units(new_lines)
+            )
+            if not already_emitted and line_str not in unbind_lines:
                 unbind_lines.append(line_str)
         # Ask the Lua scanner where the leading comments end. Walking physical
         # lines that start with "--" stops on the SECOND line of a --[[ ]] block
@@ -1917,11 +2003,12 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             break
         for offset, line_str in enumerate(unbind_lines):
             new_lines.insert(insert_at + offset, line_str)
+        inserted_unbind_count = len(unbind_lines)
 
     if lines_to_add:
         for entry in lines_to_add:
             key = normalize_key_chord(entry.get("key", ""))
-            desc = sanitize_lua_str(entry.get("description", ""))
+            desc = sanitize_lua_str(entry.get("description", ""), max_len=MAX_TEXT_LEN)
             cmd = entry.get("command", "")
             action = entry.get("action", "")
 
@@ -1930,18 +2017,32 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
             if _is_raw_dispatcher(action):
-                if _NESTED_BIND_RE.match(action):
+                if _registers_a_binding(action):
                     raise ValueError("a raw dispatcher may not register another binding")
                 problem = _lua_single_expression_problem(action.strip())
                 if problem:
                     raise ValueError(f"refusing to write the raw dispatcher: {problem}")
                 new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()})')
+            elif entry.get("action_literal"):
+                # Unchanged command: re-emit the literal the file already holds, so
+                # an untouched save cannot rewrite (or duplicate) it.
+                literal = entry["action_literal"].strip()
+                if _identity_value(literal) == "":
+                    raise ValueError("refusing to write an empty action literal")
+                new_lines.append(f'o.bind("{key}", "{desc}", {literal})')
             else:
-                raw_cmd = (cmd or action).strip()
-                if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
-                    raw_cmd = _decode_lua_string(raw_cmd[1:-1])
-                escaped_cmd = sanitize_lua_str(raw_cmd, max_len=MAX_CMD_LEN)
-                new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
+                raw_cmd = cmd or action
+                value = _plain_value(raw_cmd) if raw_cmd else ""
+                escaped_cmd = sanitize_lua_str(value, max_len=MAX_CMD_LEN)
+                new_line = f'o.bind("{key}", "{desc}", "{escaped_cmd}")'
+                new_lines.append(new_line)
+
+    # A one-for-one replacement goes back where it was (comment above it intact).
+    if len(removed_positions) == 1 and lines_to_add and len(lines_to_add) == 1:
+        pos = removed_positions[0]
+        pos += inserted_unbind_count
+        if 0 <= pos < len(new_lines):
+            new_lines.insert(pos, new_lines.pop())
 
     # Fail closed: prove the intended change is really in the output. A file
     # whose statements cannot be isolated (an unbalanced bracket above the
@@ -1958,6 +2059,29 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         return parsed_binds
 
     written_binds = _parsed_binds(new_lines)
+    if no_duplicate_keys:
+        def _bind_count(lines, key):
+            seen = 0
+            pattern = (r'o\s*\.\s*bind(?:_toggle)?\s*\(\s*["\']' +
+                       re.escape(key) + r'["\']')
+            for _unit, text, is_comment in _lua_units(lines):
+                if is_comment or not text:
+                    continue
+                seen += len(re.findall(pattern, text))
+            return seen
+
+        for key in no_duplicate_keys:
+            norm = normalize_key_chord(key)
+            if not norm:
+                continue
+            before = _bind_count(current_lines, norm)
+            after = _bind_count(new_lines, norm)
+            if after > before:
+                raise ValueError(
+                    "refusing to write: the edit would leave " + str(after) +
+                    " bindings on " + norm + " instead of " + str(before) +
+                    "; nothing was written")
+
     if require_removal:
         before_units = sum(1 for _u, t, c in _lua_units(current_lines) if t and not c)
         after_units = sum(1 for _u, t, c in _lua_units(new_lines) if t and not c)
@@ -1997,13 +2121,13 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         for written_key, parsed in written_binds:
             if written_key not in clean_keys:
                 continue
-            written_desc = (parsed[1] or "").strip()
-            written_action = (parsed[2] or "").strip().strip("\"'")
-            # Exact, not case-folded: a description that differs only in case is a
-            # legal edit, and refusing it claimed "nothing was written" after the
-            # file had been rewritten.
-            if (written_desc == previous_identity[0].strip()
-                    and written_action == previous_identity[1].strip().strip("\"'")):
+            written_desc = _identity_value(parsed[1])
+            written_action = _identity_value(parsed[2])
+            # Compared by value, not case-folded: a description that differs only
+            # in case is a legal edit, and refusing it claimed "nothing was
+            # written" after the file had been rewritten.
+            if (written_desc == previous_identity[0]
+                    and written_action == previous_identity[1]):
                 raise ValueError(
                     "could not replace the existing binding "
                     "(its statement cannot be isolated); nothing was written")
@@ -2064,10 +2188,14 @@ def reload_hyprland():
     try:
         res = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=10)
         err_res = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=10)
+        errors = err_res.stdout.strip() if err_res.returncode == 0 else ""
+        # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
+        # it drops every user override in it. A save that leaves errors behind is
+        # not "applied".
         return {
-            "success": res.returncode == 0,
+            "success": res.returncode == 0 and not errors,
             "reload_output": res.stdout.strip(),
-            "config_errors": err_res.stdout.strip() if err_res.returncode == 0 else "",
+            "config_errors": errors,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -2099,7 +2227,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                      "(set <key> <desc> <command> <action>)",
         }
     if _is_raw_dispatcher(action):
-        if _NESTED_BIND_RE.match(action):
+        if _registers_a_binding(action):
             return {"success": False,
                     "error": "invalid raw Lua dispatcher: it may not register another binding"}
         problem = _lua_single_expression_problem(action.strip())
@@ -2123,12 +2251,21 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if any(d["key"] == norm_key for d in default_binds):
         unbinds_to_add.append(norm_key)
 
-    binds = [{
+    bind_entry = {
         "key": norm_key,
         "description": description or command,
         "command": command,
         "action": action,
-    }]
+    }
+    # The dialog re-sends the command it was given. When that value is still the
+    # one stored, write the stored LITERAL back verbatim: re-encoding it changed
+    # the bytes (and, when the identity then failed to match, appended a second
+    # bind on the same chord).
+    old_literal = (old_action or "").strip()
+    if old_literal and not action.strip() and not _is_raw_dispatcher(old_literal):
+        if _identity_value(old_literal) == _plain_value(command):
+            bind_entry["action_literal"] = old_literal
+    binds = [bind_entry]
 
     # Editing a binding in place replaces *that* binding only: a second user
     # binding on the same chord must survive. Any other key is an override.
@@ -2170,7 +2307,15 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     try:
         write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
                             preserve_entry=binds[0], previous_entry=previous_entry,
-                            override_keys=override_keys)
+                            override_keys=override_keys,
+                            # An in-place edit replaces one row; if the output ends
+                            # up with more binds on that chord than the input had,
+                            # something was duplicated. This proof does not depend
+                            # on the identity helper recognising every literal form.
+                            # Only when a row is really being replaced: a first
+                            # bind on a free chord legitimately goes 0 -> 1.
+                            no_duplicate_keys=([norm_key]
+                                               if (in_place and previous_entry) else []))
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -2182,6 +2327,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
         "description": description,
         "reload": reload_status,
         "reload_success": bool(reload_status.get("success", False)),
+        "reload_errors": reload_status.get("config_errors", ""),
     }
 
 

@@ -961,7 +961,10 @@ class TestSecurityRegressions(unittest.TestCase):
         _desc, action = keybinds_manager._written_bind_identity(
             {"key": "SUPER + X", "description": "d",
              "command": "hl.dsp.window.close()"})
-        self.assertEqual(action, '"hl.dsp.window.close()"')
+        # Identity compares VALUES now: the literal form on disk is free (a quoted
+        # command, a [[...]] action, an escape) and re-encoding it is what broke
+        # untouched saves.
+        self.assertEqual(action, "hl.dsp.window.close()")
         _desc, raw = keybinds_manager._written_bind_identity(
             {"key": "SUPER + X", "description": "d", "command": "",
              "action": "hl.dsp.window.close()"})
@@ -1055,7 +1058,7 @@ class TestSecurityRegressions(unittest.TestCase):
             res = keybinds_manager.set_keybinding(
                 "SUPER + 2", "Two v2", "two2", "", "SUPER + 2")
             self.assertFalse(res["success"])
-            self.assertIn("could not", res["error"])
+            self.assertIn("nothing was written", res["error"])
             self.assertEqual(self._read(), original)
         finally:
             self._unstub_set_keybinding()
@@ -1417,6 +1420,115 @@ class TestSecurityRegressions(unittest.TestCase):
             finally:
                 keybinds_manager.DEFAULT_BINDINGS_DIR = saved
         self.assertTrue(any(b["key"] == "SUPER + J" for b in binds))
+
+    # -- round-5 review: literal forms, duplication proof, model honesty --------
+
+    def _save_untouched(self, line):
+        self._stub_set_keybinding()
+        try:
+            self._write(line + "\n")
+            row = keybinds_manager.parse_user_bindings()["binds"][0]
+            res = keybinds_manager.set_keybinding(
+                row["key"], row["description"], row["command"], "", row["key"],
+                old_description=row.get("description_raw", ""),
+                old_command=row["command"], old_action=row["action"])
+            return res, self._read()
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_wholly_quoted_command_survives_an_untouched_save(self):
+        line = r'o.bind("SUPER + R", "Run", "\"$HOME/My App/run\"")'
+        res, content = self._save_untouched(line)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(content, line + "\n")
+
+    def test_long_bracket_action_survives_an_untouched_save(self):
+        line = 'o.bind("SUPER + K", "K", [[echo "hi" ]])'
+        res, content = self._save_untouched(line)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(content, line + "\n")
+
+    def test_escape_sequences_survive_an_untouched_save(self):
+        line = r'o.bind("SUPER + T", "T", "printf \"a\nb\"")'
+        res, content = self._save_untouched(line)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(content, line + "\n")
+
+    def test_long_description_does_not_duplicate(self):
+        long_desc = "L" * 260
+        res, content = self._save_untouched(f'o.bind("SUPER + B", "{long_desc}", "b")')
+        self.assertTrue(res["success"], res)
+        self.assertEqual(content.count("o.bind("), 1)
+
+    def test_long_bracket_key_is_removed_by_disable(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('-- mine\no.bind([[SUPER + W]], "Close", "killactive")\n')
+            res = keybinds_manager.disable_keybinding("SUPER + W")
+            self.assertTrue(res["success"], res)
+            self.assertNotIn("o.bind(", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_commented_unbind_does_not_veto_the_real_one(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('--[[\nhl.unbind("SUPER + W")\n]]\n')
+            res = keybinds_manager.disable_keybinding("SUPER + W")
+            self.assertTrue(res["success"], res)
+            units = [t for _u, t, c in keybinds_manager._lua_units(
+                keybinds_manager._split_lines(self._read())[0]) if t and not c]
+            self.assertTrue(any(u.strip().startswith("hl.unbind") for u in units), units)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_second_chord_keeps_the_default_row(self):
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + W", "description": "Close Window", "action": "killactive"}]
+            self._write('o.bind("SUPER + SHIFT + Q", "Close Window", "killactive")\n')
+            model = keybinds_manager.build_complete_model()
+            keys = {b["key"] for b in model["active"]}
+            self.assertIn("SUPER + W", keys)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_chord_without_a_keysym_is_refused(self):
+        self._stub_set_keybinding()
+        try:
+            self._write("")
+            for chord in ("SUPER", "SUPER + CTRL"):
+                res = keybinds_manager.set_keybinding(chord, "d", "true")
+                self.assertFalse(res["success"], (chord, res))
+            self.assertEqual(self._read(), "")
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_nested_binding_in_a_table_is_refused(self):
+        self._stub_set_keybinding()
+        try:
+            self._write("")
+            res = keybinds_manager.set_keybinding(
+                "SUPER + Y", "d", "", '{ o.bind("SUPER + Z", "z", "c") }')
+            self.assertFalse(res["success"])
+            self.assertIn("may not register another binding", res["error"])
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_a_rejected_file_is_not_reported_as_applied(self):
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.reload_hyprland = lambda: {
+                "success": False, "reload_output": "", "config_errors": "bindings.lua:3 unexpected symbol"}
+            self._write("")
+            res = keybinds_manager.set_keybinding("SUPER + J", "j", "j")
+            self.assertFalse(res["reload_success"])
+            self.assertIn("unexpected symbol", res["reload_errors"])
+        finally:
+            self._unstub_set_keybinding()
+            keybinds_manager.reload_hyprland = lambda: {
+                "success": True, "reload_output": "", "config_errors": ""}
 
     def test_menu_reader_refuses_a_fifo(self):
         fifo = os.path.join(self._tmpdir.name, "omarchy-menu.jsonc")

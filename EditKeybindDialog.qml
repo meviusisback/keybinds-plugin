@@ -38,6 +38,7 @@ Item {
 
   // Builder state & selection tracking
   property string selectedActionId: ""
+  property string inlineError: ""
   property bool runInTerminal: false
   property string appSearchQuery: ""
   property string windowNavMode: "focus" // "focus" | "swap"
@@ -1424,6 +1425,7 @@ Item {
                   Text {
                     id: insertChipText
                     anchors.centerIn: parent
+                    textFormat: Text.PlainText
                     text: insertChip.modelData.label
                     color: root.foreground
                     font.family: Style.font.family
@@ -1575,6 +1577,19 @@ Item {
           }
         }
 
+        // A refusal must be visible where the user is working: the toast lives in
+        // the panel behind this card.
+        Text {
+          textFormat: Text.PlainText
+          visible: root.inlineError.length > 0
+          text: root.inlineError
+          color: root.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
+        }
+
         PanelSeparator { Layout.fillWidth: true }
 
         // 5. Modal Footer Buttons
@@ -1605,6 +1620,18 @@ Item {
               // command: deriving "this is code" from a prefix here let an
               // ordinary shell group like `{ a; b; }` become broken Lua in the
               // file Hyprland parses, dropping every user binding in it.
+              //
+              // A value that IS Lua (hl.*, o.*(...), {...}) cannot be saved as a
+              // command, though: it would be stored as the literal string and the
+              // shortcut would do nothing. Refuse and point at the dispatcher slot
+              // - the backend's own guard cannot fire when an app preset left the
+              // "exec" sentinel in the action slot.
+              if (root.isRawAction(root.actionCommand)
+                  && !root.isRawAction(root.actionDispatcher)) {
+                root.inlineError = "That text is Lua, not a shell command. Clear the command field and pick the action from the dispatcher list, or prefix it with a program (e.g. hyprctl dispatch ...)."
+                return
+              }
+              root.inlineError = ""
               root.saved(
                 root.actionKey,
                 root.actionTitle,

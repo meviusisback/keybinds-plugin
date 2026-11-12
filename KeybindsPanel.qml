@@ -138,7 +138,9 @@ Item {
       return
     }
     if (parsed.reload_success === false) {
-      root.showToast(okMessage + " (hyprctl reload reported an error)", true)
+      var why = (parsed.reload_errors || "").split("\n")[0]
+      root.showToast(okMessage + (why ? " — but Hyprland rejected the file: " + why
+                                       : " (hyprctl reload reported an error)"), true)
     } else {
       root.showToast(okMessage)
     }
@@ -414,6 +416,10 @@ Item {
           // success:false with exists:false means the file could not be read, not
           // that the entry is missing: do not offer to write into it.
           if (parsed.success === false) {
+            // Not offering to write into a file it cannot read is right; staying
+            // silent about why the plugin never appears in the launcher is not.
+            root.showToast("Could not read the Omarchy menu file, so the launcher entry was skipped: "
+                           + (parsed.error || parsed.message || "unknown error"), true)
             menuEntryChecked = true
             return
           }
@@ -1541,11 +1547,11 @@ Item {
                               horizontalPadding: Style.space(12)
                               verticalPadding: Style.space(4)
                               onClicked: {
-                                editDialog.openEdit({
-                                  key: conflictCard.modelData.key,
-                                  description: confSubRow.modelData.description,
-                                  action: confSubRow.modelData.action
-                                })
+                                // Hand over the WHOLE model row: without `command`
+                                // and `description_raw` the dialog opened with an
+                                // empty command field, and a nil-description row was
+                                // appended a second time instead of replaced.
+                                editDialog.openEdit(confSubRow.modelData)
                               }
                             }
                           }
@@ -1642,7 +1648,9 @@ Item {
         anchors.top: parent.top
         anchors.topMargin: Style.space(14)
         width: Math.min(parent.width - Style.space(44), toastRow.implicitWidth + Style.space(32))
-        height: Style.space(38)
+        // Refusals carry their remedy ("split it into its own line first"): a fixed
+        // 38px single line elided exactly that part away.
+        height: Math.max(Style.space(38), toastRow.implicitHeight + Style.space(16))
         z: 100
         radius: Style.cornerRadius
         color: Util.alpha(root.toastIsError ? root.urgent : root.accent, 0.2)
@@ -1669,7 +1677,7 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.body
             font.bold: true
-            elide: Text.ElideRight
+            wrapMode: Text.Wrap
             Layout.fillWidth: true
           }
         }
