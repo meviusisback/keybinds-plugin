@@ -44,7 +44,10 @@ MENU_ENTRY_VALUE = {
 
 def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     """Escape a string for safe embedding inside a Lua double-quoted literal."""
-    s = (s or "").replace("\r", " ").replace("\n", " ")
+    # Drop C0 control bytes: Lua tolerates NUL but any C-string reader of
+    # bindings.lua truncates at it, and nothing legitimate needs one.
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s or "")
+    s = s.replace("\r", " ").replace("\n", " ")
     if len(s) > max_len:
         s = s[:max_len]
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -131,7 +134,7 @@ def _lua_single_expression_problem(expr: str) -> str:
 
 
 def _is_raw_dispatcher(action: str) -> bool:
-    """True for the two shapes Omarchy stores as code, not as a command string.
+    """True for the shapes Omarchy stores as code, not as a command string.
 
     ``hl.*`` / ``{...}`` are the plain dispatchers; ``o.<name>(...)`` covers the
     shortcut helpers Omarchy's own defaults use (``o.launch_terminal()``), which
@@ -141,6 +144,40 @@ def _is_raw_dispatcher(action: str) -> bool:
     stripped = (action or "").strip()
     return (stripped.startswith("{") or stripped.startswith("hl.")
             or re.match(r"^o\.[A-Za-z_][A-Za-z0-9_.]*\s*\(", stripped) is not None)
+
+
+def _unit_is_single_statement(text: str) -> bool:
+    """True when ``text`` is exactly one bind/unbind call and nothing else.
+
+    A unit that also carries a second statement (``o.bind(...); if x then``)
+    cannot be removed line-wise without taking the other statement with it: the
+    caller refuses instead of corrupting the file.
+    """
+    head = re.match(r"\s*(?:o\.bind(?:_toggle)?|hl\.unbind)\s*\(", text)
+    if not head:
+        return False
+    i = text.index("(", head.start())
+    depth = 0
+    quote = None
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                rest = text[i + 1:].strip()
+                return rest == "" or rest == ";"
+        i += 1
+    return False
 
 
 _BIND_HEAD_RE = re.compile(r"o\.bind(?:_toggle)?\s*\(")
@@ -1224,19 +1261,26 @@ def parse_default_bindings():
 
     file_count = 0
     total_read = 0
-    for fname in sorted(os.listdir(DEFAULT_BINDINGS_DIR)):
+    try:
+        names = sorted(os.listdir(DEFAULT_BINDINGS_DIR))
+    except OSError:
+        # An unreadable directory must not turn the whole model build into a
+        # traceback (the panel would show an empty list and no error at all).
+        return bindings
+    for fname in names:
         if file_count >= MAX_DIR_FILES or total_read > MAX_TOTAL_READ:
             break
         file_count += 1
         if not fname.endswith(".lua"):
             continue
         filepath = os.path.join(DEFAULT_BINDINGS_DIR, fname)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read(MAX_FILE_BYTES)
-            total_read += len(content.encode("utf-8"))
-        except Exception:
+        # Same bounded reader as every other path: a FIFO planted in this
+        # directory used to block `list` forever, and an oversized file was
+        # silently truncated mid-statement.
+        content = _read_bounded_regular_file(filepath)
+        if content is None:
             continue
+        total_read += len(content.encode("utf-8"))
 
         for line in content.splitlines():
             stripped = line.strip()
@@ -1531,7 +1575,7 @@ def _written_bind_identity(entry):
     desc = (entry.get("description") or "").replace("\r", " ").replace("\n", " ")[:MAX_TEXT_LEN]
     cmd = entry.get("command", "")
     action = entry.get("action", "")
-    if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
+    if _is_raw_dispatcher(action):
         return desc, action.strip()[:MAX_CMD_LEN]
     raw_cmd = (cmd or action).strip()
     if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
@@ -1566,7 +1610,8 @@ def _resolve_bindings_write_path(path: str):
 
 
 def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None,
-                        preserve_entry=None, previous_entry=None, override_keys=None):
+                        preserve_entry=None, previous_entry=None, override_keys=None,
+                        require_absent=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
@@ -1581,6 +1626,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     ``override_keys``: keys whose existing bind lines are removed regardless of
     identity. ``set_keybinding`` uses it for a key that is not being edited in
     place, where binding a new action over an occupied chord is an override.
+
+    ``require_absent``: keys that must have no bind line left in the output.
+    The removal verbs pass their target, so "wrote nothing, said saved" cannot
+    happen (they used to succeed while the statement stayed in place).
     """
     cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
     preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
@@ -1647,6 +1696,12 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                         pass
                 raise
 
+    bom = "\ufeff" if existing_content.startswith("\ufeff") else ""
+    if bom:
+        # A BOM is only legal at byte 0. Strip it from the line list and put it
+        # back on write, so an inserted unbind cannot push it into the middle of
+        # the file (which made the whole file unparseable).
+        existing_content = existing_content[1:]
     current_lines, newline = _split_lines(existing_content)
 
     if not current_lines:
@@ -1678,8 +1733,18 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
                 bind_key = normalize_key_chord(m_bind.group(1))
                 if bind_key in overrides:
+                    if not _unit_is_single_statement(text):
+                        raise ValueError(
+                            "the line holding this chord also holds another "
+                            "statement; refusing to edit it (split it into its "
+                            "own line first)")
                     is_targeted = True
                 elif identities:
+                    if not _unit_is_single_statement(text):
+                        raise ValueError(
+                            "the line holding this chord also holds another "
+                            "statement; refusing to edit it (split it into its "
+                            "own line first)")
                     _parsed = _parse_bind_line(text)
                     if _parsed:
                         parsed_desc = (_parsed[1] or "").strip().lower()
@@ -1695,6 +1760,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                     # Else: a different binding sharing this key (swap partner,
                     # or a second binding on the same chord) -> keep it.
                 else:
+                    if not _unit_is_single_statement(text):
+                        raise ValueError(
+                            "the line holding this chord also holds another "
+                            "statement; refusing to edit it (split it into its "
+                            "own line first)")
                     is_targeted = True
 
         if not is_targeted:
@@ -1765,6 +1835,12 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         return parsed_binds
 
     written_binds = _parsed_binds(new_lines)
+    if require_absent:
+        remaining = {k for k, _p in written_binds if k in set(require_absent)}
+        if remaining:
+            raise ValueError(
+                "could not remove the binding for " + ", ".join(sorted(remaining)) +
+                "; nothing was written")
     for entry in (lines_to_add or []):
         want = normalize_key_chord(entry.get("key", ""))
         if want and not any(k == want for k, _ in written_binds):
@@ -1797,7 +1873,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     fd, temp_file = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(newline.join(final_output) + newline)
+            f.write(bom + newline.join(final_output) + newline)
             f.flush()
             os.fsync(f.fileno())
         if os.path.islink(temp_file):
@@ -1885,15 +1961,18 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     # binding on the same chord must survive. Any other key is an override.
     in_place = bool(norm_old_key) and norm_old_key == norm_key
     previous_entry = None
-    if in_place:
+    if old_description or old_command or old_action:
+        # The caller told us which row it is editing: use it for a chord change
+        # too, so moving a binding frees the old chord instead of leaving a
+        # duplicate statement behind.
+        previous_entry = {
+            "description": old_description,
+            "command": old_command,
+            "action": old_action,
+        }
+    elif in_place:
         same_key = [b for b in parse_user_bindings()["binds"] if b["key"] == norm_key]
-        if old_description or old_command or old_action:
-            previous_entry = {
-                "description": old_description,
-                "command": old_command,
-                "action": old_action,
-            }
-        elif len(same_key) == 1:
+        if len(same_key) == 1:
             previous_entry = same_key[0]
         elif len(same_key) > 1:
             return {
@@ -1901,11 +1980,24 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                 "error": "several bindings share this chord: pass the previous "
                          "description to say which one is being replaced",
             }
+    elif norm_old_key:
+        # A chord change must say WHICH row it is moving: guessing from the old
+        # chord picks whatever else lives there (a swap partner, or a default's
+        # neighbour) and would delete the wrong line.
+        return {
+            "success": False,
+            "error": "moving a binding to another chord needs the previous "
+                     "description/command: set <key> <desc> <cmd> <action> "
+                     "<old_key> <old_desc> <old_cmd> <old_action>",
+        }
 
+    override_keys = []
+    if not in_place and override_conflicts:
+        override_keys = [norm_key]
     try:
         write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
                             preserve_entry=binds[0], previous_entry=previous_entry,
-                            override_keys=[] if (in_place or not override_conflicts) else [norm_key])
+                            override_keys=override_keys)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -1945,7 +2037,10 @@ def reset_keybinding(key: str, default_key: str = ""):
                 keys_to_remove.append(matched_default["key"])
 
     try:
-        write_user_bindings(keys_to_remove=keys_to_remove)
+        # require_absent: the target must really be gone from the output, so a
+        # statement this code cannot isolate can no longer be reported as
+        # removed while it stays in the file.
+        write_user_bindings(keys_to_remove=keys_to_remove, require_absent=keys_to_remove)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -1961,7 +2056,8 @@ def disable_keybinding(key: str):
     if not norm_key:
         return {"success": False, "error": "Invalid key combination"}
     try:
-        write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key])
+        write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key],
+                            require_absent=[norm_key])
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()

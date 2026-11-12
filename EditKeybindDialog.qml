@@ -180,6 +180,12 @@ Item {
     root.opened = true
   }
 
+  // Same classifier as the backend: these shapes are Lua, not a command.
+  function isRawAction(a) {
+    if (!a) return false
+    return /^\s*(hl\.|\{|o\.[A-Za-z_][A-Za-z0-9_.]*\s*\()/.test(a)
+  }
+
   function openEdit(bindingItem) {
     root.isEditing = true
     root.itemData = bindingItem || null
@@ -188,7 +194,15 @@ Item {
     // Mirroring the action here rewrote shipped helper calls
     // (o.bind(..., o.launch_terminal())) as the literal command
     // "o.launch_terminal()" and silently broke the shortcut.
+    var storedAction = (bindingItem && bindingItem.action) || ""
     root.actionCommand = (bindingItem && bindingItem.command) || ""
+    if (!root.actionCommand && storedAction && storedAction !== "exec"
+        && !isRawAction(storedAction)) {
+      // A command stored as the action (a quoted literal) belongs in the command
+      // field, unquoted; otherwise it was neither visible nor editable and Save
+      // would have dropped it.
+      root.actionCommand = storedAction.replace(/^["']|["']$/g, "")
+    }
     root.actionDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionCategory = (bindingItem && bindingItem.category) || "Custom"
     root.actionKey = (bindingItem && bindingItem.key) || ""

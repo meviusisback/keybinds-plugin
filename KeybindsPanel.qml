@@ -442,7 +442,7 @@ Item {
             root.showToast(parsed.message || "Added Keybindings Manager to launcher!")
             refreshMenuProc.running = true
           } else {
-            root.showToast(parsed.message || "Failed to add menu entry.")
+            root.showToast(parsed.message || "Failed to add menu entry.", true)
           }
         } catch (e) {
           console.warn("KeybindsPanel: Failed to parse menu-install json:", e)
@@ -584,7 +584,9 @@ Item {
           root.recordingSearch = false
           root.clearFindHolds()
         } else if (editDialog.opened) {
-          editDialog.close()
+          // Not while a save is running: a late refusal would then have nowhere
+          // to put the user's fields.
+          if (!setProc.running) editDialog.close()
         } else {
           root.requestClose()
         }
@@ -1598,40 +1600,6 @@ Item {
             }
           }
         }
-
-        // 5. Toast Feedback Banner
-        BorderSurface {
-          id: toastCard
-          visible: root.toastVisible
-          Layout.fillWidth: true
-          Layout.preferredHeight: Style.space(38)
-          radius: Style.cornerRadius
-          color: Util.alpha(root.toastIsError ? root.urgent : root.accent, 0.2)
-          borderSpec: Border.flat(root.toastIsError ? root.urgent : root.accent, 1)
-
-          RowLayout {
-            anchors.centerIn: parent
-            spacing: Style.space(10)
-
-            Text {
-              textFormat: Text.PlainText
-              text: root.toastIsError ? "✕" : "✓"
-              color: root.toastIsError ? root.urgent : root.accent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: root.toastMessage
-              color: root.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-          }
-        }
       }
 
       // First-run: Add to Omarchy launcher
@@ -1661,6 +1629,49 @@ Item {
         apps: (root.modelData && root.modelData.apps) || []
         onSaved: function(key, desc, cmd, act, oldK, overrideConf, oldT, oldC, oldDsp) {
           root.saveKeybinding(key, desc, cmd, act, oldK, overrideConf, oldT, oldC, oldDsp)
+        }
+      }
+
+      // Toast Feedback Banner — an overlay, drawn above the dialogs: inside the
+      // layout it sat under the edit dialog's scrim and a refusal never reached
+      // the user.
+      BorderSurface {
+        id: toastCard
+        visible: root.toastVisible
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Style.space(14)
+        width: Math.min(parent.width - Style.space(44), toastRow.implicitWidth + Style.space(32))
+        height: Style.space(38)
+        z: 100
+        radius: Style.cornerRadius
+        color: Util.alpha(root.toastIsError ? root.urgent : root.accent, 0.2)
+        borderSpec: Border.flat(root.toastIsError ? root.urgent : root.accent, 1)
+
+        RowLayout {
+          id: toastRow
+          anchors.centerIn: parent
+          spacing: Style.space(10)
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.toastIsError ? "✕" : "✓"
+            color: root.toastIsError ? root.urgent : root.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.toastMessage
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+            Layout.fillWidth: true
+          }
         }
       }
     }

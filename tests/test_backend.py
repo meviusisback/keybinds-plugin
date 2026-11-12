@@ -216,11 +216,15 @@ class TestKeybindsBackend(unittest.TestCase):
             # Step 2: move "Full screen" SUPER + F -> SUPER + ALT + F
             keybinds_manager.set_keybinding(
                 key="SUPER + ALT + F", description="Full screen", command="",
-                action='hl.dsp.window.fullscreen({ mode = "fullscreen" })', old_key="SUPER + F")
+                action='hl.dsp.window.fullscreen({ mode = "fullscreen" })', old_key="SUPER + F",
+                old_description="Full screen",
+                old_action='hl.dsp.window.fullscreen({ mode = "fullscreen" })')
             # Step 3: move "Full width" SUPER + ALT + F -> SUPER + F (the swap)
             keybinds_manager.set_keybinding(
                 key="SUPER + F", description="Full width", command="",
-                action='hl.dsp.window.fullscreen({ mode = "maximized" })', old_key="SUPER + ALT + F")
+                action='hl.dsp.window.fullscreen({ mode = "maximized" })', old_key="SUPER + ALT + F",
+                old_description="Full width",
+                old_action='hl.dsp.window.fullscreen({ mode = "maximized" })')
 
             with open(tmp_path) as f:
                 content = f.read()
@@ -1201,6 +1205,106 @@ class TestSecurityRegressions(unittest.TestCase):
             self.assertTrue(res["success"], res)
             self.assertFalse(res["reload_success"])
             self.assertNotIn("o.bind(", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    # -- round-3 review: statements, identities, BOM, control bytes -----------
+
+    def test_rename_of_a_helper_call_with_a_quoted_argument_replaces_it(self):
+        # The identity helper classed o.<name>(...) as a command string while the
+        # writer emitted it as code, so the old line never matched and every save
+        # appended another copy.
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + M", "Move left", o.workspaces.move_to_monitor("l"))\n'
+                        'o.bind("SUPER + M", "Other", "other")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + M", "Move left v2", "", 'o.workspaces.move_to_monitor("l")',
+                "SUPER + M", old_description="Move left",
+                old_action='o.workspaces.move_to_monitor("l")')
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertEqual(content.count('o.workspaces.move_to_monitor("l")'), 1)
+            self.assertIn('o.bind("SUPER + M", "Move left v2"', content)
+            self.assertIn('o.bind("SUPER + M", "Other", "other")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_chord_change_requires_the_previous_identity(self):
+        self._stub_set_keybinding()
+        try:
+            original = 'o.bind("SUPER + K", "Close", "a")\n'
+            self._write(original)
+            res = keybinds_manager.set_keybinding(
+                "SUPER + J", "Close", "a", "", "SUPER + K")
+            self.assertFalse(res["success"])
+            self.assertIn("previous description", res["error"])
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_chord_change_with_identity_moves_the_binding(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + L", "Close", "a", "", "SUPER + K",
+                old_description="Close", old_command="a")
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertNotIn('o.bind("SUPER + K", "Close", "a")', content)
+            self.assertIn('o.bind("SUPER + K", "Exec", "b")', content)
+            self.assertIn('o.bind("SUPER + L", "Close", "a")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_line_with_a_second_statement_is_refused_not_deleted(self):
+        # The unit scanner groups by physical lines: dropping such a unit took the
+        # neighbouring statement with it and left bindings.lua uncompilable.
+        self._stub_set_keybinding()
+        try:
+            original = ('o.bind("SUPER + RETURN", "Terminal", "y"); if true then\n'
+                        '  local q = 1\n'
+                        'end\n')
+            self._write(original)
+            res = keybinds_manager.disable_keybinding("SUPER + RETURN")
+            self.assertFalse(res["success"])
+            self.assertIn("another statement", res["error"])
+            self.assertEqual(self._read(), original)
+            res = keybinds_manager.set_keybinding(
+                "SUPER + RETURN", "Terminal v2", "y2", "", "SUPER + RETURN",
+                old_description="Terminal", old_command="y")
+            self.assertFalse(res["success"])
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_leading_bom_stays_at_offset_zero(self):
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + W", "description": "Close", "action": "o.close()"}]
+            self._write('\ufeff-- head\no.bind("SUPER + W", "Close", "a")\n')
+            res = keybinds_manager.set_keybinding("SUPER + W", "Close v2", "b")
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertTrue(content.startswith("\ufeff"), repr(content[:20]))
+            self.assertEqual(content.count("\ufeff"), 1)
+            self.assertIn('hl.unbind("SUPER + W")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_control_bytes_never_reach_the_lua_literal(self):
+        self._stub_set_keybinding()
+        try:
+            self._write("")
+            res = keybinds_manager.set_keybinding(
+                "SUPER + N", "Note\x00", "notify-send a\x01b")
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertNotIn("\x00", content)
+            self.assertNotIn("\x01", content)
         finally:
             self._unstub_set_keybinding()
 
