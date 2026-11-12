@@ -5,6 +5,7 @@ Provides parsing, catalog discovery, conflict detection, mouse scroll integratio
 """
 
 import os
+import errno
 import sys
 import re
 import json
@@ -1187,6 +1188,32 @@ def _written_bind_identity(entry):
     return desc, f'"{sanitize_lua_str(raw_cmd)}"'
 
 
+def _resolve_bindings_write_path(path: str):
+    """Resolve a (possibly symlinked) bindings path to the real target.
+
+    Returns (resolved_path, exists). Follows symlinks so dotfile-managed
+    configs keep their link intact, but every read/write happens on the
+    resolved regular file. Dangling links and loops become ValueError.
+    """
+    resolved = os.path.realpath(path)
+    try:
+        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise ValueError(f"dangling symlink, refusing to edit: {path}")
+        return resolved, False
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(f"cannot resolve symlink path, refusing to edit: {path}")
+        raise ValueError(f"refusing to operate on non-regular path: {path}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"refusing non-regular file: {path}")
+    finally:
+        os.close(fd)
+    return resolved, True
+
+
 def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None, preserve_entry=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
@@ -1203,52 +1230,63 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
     os.makedirs(cfg_dir, exist_ok=True)
 
+    resolved_path, exists = _resolve_bindings_write_path(USER_BINDINGS_PATH)
+    target_dir = os.path.dirname(resolved_path) or cfg_dir
+    os.makedirs(target_dir, exist_ok=True)
+
     existing_content = ""
-    # Open the source directly (no isfile() pre-check -> no TOCTOU window in
-    # which a FIFO could be swapped in to block the open indefinitely).
-    try:
-        src_fd = os.open(USER_BINDINGS_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        src_fd = None
-    except OSError:
-        raise ValueError(f"refusing to operate on non-regular/symlink path: {USER_BINDINGS_PATH}")
-    if src_fd is not None:
+    # Open the resolved target directly (no isfile() pre-check -> no TOCTOU
+    # window in which a FIFO could be swapped in to block the open).
+    if exists:
         try:
-            if not stat.S_ISREG(os.fstat(src_fd).st_mode):
-                os.close(src_fd)
-                raise ValueError(f"refusing non-regular file: {USER_BINDINGS_PATH}")
-            with os.fdopen(src_fd, "rb") as f:
-                raw = f.read(MAX_FILE_BYTES + 1)
-            if len(raw) > MAX_FILE_BYTES:
-                # Byte-exact cap like the menu path (round-2 filesystem
-                # review): a text-mode read(n) counts CHARACTERS, so a
-                # >64 KiB file used to be silently truncated here — the tail
-                # lost in BOTH the rewrite and the .bak. Refuse instead of
-                # destroying data.
-                raise ValueError(
-                    f"file exceeds the {MAX_FILE_BYTES}-byte cap, refusing to edit: {USER_BINDINGS_PATH}")
-            existing_content = raw.decode("utf-8")
-        except BaseException:
-            raise
-        backup_path = USER_BINDINGS_PATH + ".bak"
-        # Write the backup through a unique temp file and atomically replace,
-        # instead of O_TRUNC on the predictable .bak path. This avoids
-        # truncating an existing inode, so a planted hard link / symlink at
-        # that path cannot destroy another file's contents.
-        bak_fd, bak_tmp = tempfile.mkstemp(dir=cfg_dir, prefix=".bindings_", suffix=".bak.tmp")
-        try:
-            with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
-                bak_f.write(existing_content)
-                bak_f.flush()
-                os.fsync(bak_f.fileno())
-            os.replace(bak_tmp, backup_path)
-        except BaseException:
-            if os.path.exists(bak_tmp):
+            src_fd = os.open(resolved_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            src_fd = None
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise ValueError(f"cannot resolve symlink path, refusing to edit: {USER_BINDINGS_PATH}")
+            raise ValueError(f"refusing to operate on non-regular path: {USER_BINDINGS_PATH}")
+        if src_fd is not None:
+            try:
+                if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+                    raise ValueError(f"refusing non-regular file: {USER_BINDINGS_PATH}")
+                with os.fdopen(src_fd, "rb") as f:
+                    raw = f.read(MAX_FILE_BYTES + 1)
+                if len(raw) > MAX_FILE_BYTES:
+                    # Byte-exact cap like the menu path (round-2 filesystem
+                    # review): a text-mode read(n) counts CHARACTERS, so a
+                    # >64 KiB file used to be silently truncated here — the tail
+                    # lost in BOTH the rewrite and the .bak. Refuse instead of
+                    # destroying data.
+                    raise ValueError(
+                        f"file exceeds the {MAX_FILE_BYTES}-byte cap, refusing to edit: {USER_BINDINGS_PATH}")
+                existing_content = raw.decode("utf-8")
+            except BaseException:
                 try:
-                    os.unlink(bak_tmp)
+                    os.close(src_fd)
                 except OSError:
                     pass
-            raise
+                raise
+            backup_path = resolved_path + ".bak"
+            # Write the backup through a unique temp file and atomically replace,
+            # instead of O_TRUNC on the predictable .bak path. This avoids
+            # truncating an existing inode, so a planted hard link / symlink at
+            # that path cannot destroy another file's contents. The .bak lands
+            # beside the resolved target so dotfile-managed links keep working.
+            bak_fd, bak_tmp = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".bak.tmp")
+            try:
+                with os.fdopen(bak_fd, "w", encoding="utf-8") as bak_f:
+                    bak_f.write(existing_content)
+                    bak_f.flush()
+                    os.fsync(bak_f.fileno())
+                os.replace(bak_tmp, backup_path)
+            except BaseException:
+                if os.path.exists(bak_tmp):
+                    try:
+                        os.unlink(bak_tmp)
+                    except OSError:
+                        pass
+                raise
 
     current_lines = existing_content.splitlines() if existing_content else []
 
@@ -1331,7 +1369,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             final_output.append(line)
             prev_blank = False
 
-    fd, temp_file = tempfile.mkstemp(dir=cfg_dir, prefix=".bindings_", suffix=".tmp")
+    fd, temp_file = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(final_output) + "\n")
@@ -1340,7 +1378,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         if os.path.islink(temp_file):
             os.unlink(temp_file)
             raise ValueError("temp write path is a symlink")
-        os.replace(temp_file, USER_BINDINGS_PATH)
+        os.replace(temp_file, resolved_path)
     except BaseException:
         if os.path.exists(temp_file):
             try:
@@ -1526,7 +1564,12 @@ def _menu_refusal(exc: BaseException) -> dict:
 
 
 def _safe_read_regular_file(path: str):
-    """Open path with O_NOFOLLOW | O_NONBLOCK, verify S_ISREG, return contents or None."""
+    """Open path with O_NOFOLLOW | O_NONBLOCK, verify S_ISREG, return contents or None.
+
+    Fails closed on symlinks and non-regular files. Callers that need to follow
+    dotfile symlinks (bindings.lua) must resolve and write to the target path
+    explicitly so the link is preserved.
+    """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -1657,7 +1700,10 @@ def main():
         command = sys.argv[4]
         action = sys.argv[5] if len(sys.argv) > 5 else ""
         old_key = sys.argv[6] if len(sys.argv) > 6 else ""
-        res = set_keybinding(key, desc, command, action, old_key)
+        try:
+            res = set_keybinding(key, desc, command, action, old_key)
+        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
+            res = {"success": False, "error": str(e)}
         print(json.dumps(res))
 
     elif cmd == "reset":
@@ -1666,7 +1712,10 @@ def main():
             sys.exit(1)
         key = sys.argv[2]
         def_key = sys.argv[3] if len(sys.argv) > 3 else ""
-        res = reset_keybinding(key, def_key)
+        try:
+            res = reset_keybinding(key, def_key)
+        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
+            res = {"success": False, "error": str(e)}
         print(json.dumps(res))
 
     elif cmd == "disable":
@@ -1674,7 +1723,10 @@ def main():
             print(json.dumps({"success": False, "error": "Usage: disable <key>"}))
             sys.exit(1)
         key = sys.argv[2]
-        res = disable_keybinding(key)
+        try:
+            res = disable_keybinding(key)
+        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
+            res = {"success": False, "error": str(e)}
         print(json.dumps(res))
 
     elif cmd == "enable":
@@ -1682,7 +1734,10 @@ def main():
             print(json.dumps({"success": False, "error": "Usage: enable <key>"}))
             sys.exit(1)
         key = sys.argv[2]
-        res = enable_keybinding(key)
+        try:
+            res = enable_keybinding(key)
+        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
+            res = {"success": False, "error": str(e)}
         print(json.dumps(res))
 
     elif cmd == "reload":

@@ -287,6 +287,40 @@ class TestKeybindsBackend(unittest.TestCase):
             if os.path.exists(tmp_path + ".bak"):
                 os.remove(tmp_path + ".bak")
 
+    def test_write_user_bindings_preserves_symlink(self):
+        """Dotfile-managed bindings.lua may be a symlink; writes must update the
+        target and keep the symlink intact (PR #21 review)."""
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "dotfiles", "bindings.lua")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("-- original\n")
+
+            link_dir = os.path.join(td, "config", "hypr")
+            os.makedirs(link_dir, exist_ok=True)
+            link = os.path.join(link_dir, "bindings.lua")
+            os.symlink(target, link)
+
+            old_path = keybinds_manager.USER_BINDINGS_PATH
+            try:
+                keybinds_manager.USER_BINDINGS_PATH = link
+                keybinds_manager.write_user_bindings(
+                    lines_to_add=[{"key": "SUPER + Z", "description": "Test",
+                                   "command": "my-tool"}],
+                    unbinds_to_add=["SUPER + Z"])
+
+                self.assertTrue(os.path.islink(link))
+                self.assertEqual(os.path.realpath(link), os.path.realpath(target))
+                with open(target, "r", encoding="utf-8") as f:
+                    target_content = f.read()
+                self.assertIn('o.bind("SUPER + Z", "Test", "my-tool")', target_content)
+                with open(link, "r", encoding="utf-8") as f:
+                    link_content = f.read()
+                self.assertEqual(link_content, target_content)
+                self.assertTrue(os.path.isfile(target + ".bak"))
+            finally:
+                keybinds_manager.USER_BINDINGS_PATH = old_path
+
     def test_get_installed_apps(self):
         apps = keybinds_manager.get_installed_apps()
         self.assertIsInstance(apps, list)
