@@ -32,6 +32,8 @@ MAX_CMD_LEN = 2000
 MAX_FILE_BYTES = 65_536  # 64 KiB cap on any single config file read
 MAX_DIR_FILES = 256  # ceiling on enumerated default-binding files
 MAX_TOTAL_READ = 2_097_152  # 2 MiB cumulative cap across the default-bindings dir
+MAX_APP_FILES = 1_024  # ceiling on enumerated .desktop entries
+MAX_APP_TOTAL_READ = 4_194_304  # 4 MiB cumulative cap across the application dirs
 
 MENU_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/extensions/omarchy-menu.jsonc")
 MENU_ENTRY_KEY = "setup.keybindings.gui"
@@ -103,6 +105,17 @@ def _parse_bind_line(line: str):
             pos += 1
             continue
 
+        # Long strings ([[...]], [==[...]==]) may contain parens, braces, commas
+        # and quotes; skip their body so they cannot unbalance the scan.
+        m_long = re.match(r"\[(=*)\[", line[pos:]) if ch == "[" else None
+        if m_long:
+            close = "]" + m_long.group(1) + "]"
+            pos += m_long.end()
+            while pos < len(line) and not line.startswith(close, pos):
+                pos += 1
+            pos += len(close) if pos < len(line) else 0
+            continue
+
         if ch == '(':
             depth_paren += 1
         elif ch == ')':
@@ -132,6 +145,98 @@ def _parse_bind_line(line: str):
 
     return raw_key, desc, action, opts
 
+
+def _lua_units(lines):
+    """Group physical lines into logical Lua units.
+
+    Returns ``[(physical_lines, text, is_comment)]``. ``text`` is the unit with
+    comments removed and newlines flattened to spaces (string contents are
+    preserved), so callers match statements without being fooled by ``--[[ ]]``
+    blocks or trailing ``--`` comments. Lines are grouped while a
+    paren/brace/bracket or a string is still open, so a hand-formatted
+    multi-line ``o.bind`` is one unit and is replaced or removed as a whole
+    instead of leaving a dangling continuation line behind.
+    """
+    units = []
+    long_close = None   # terminator of an open long bracket (comment or string)
+    is_long_str = False  # True: long string (code), False: long comment
+    in_string = None    # quote character of an open short string
+    escape = False
+    depth = 0
+    raw = []
+    code = []
+    has_code = False
+
+    def flush():
+        nonlocal raw, code, has_code
+        text = re.sub(r"\s+", " ", "".join(code)).strip()
+        units.append((raw, text, not has_code))
+        raw, code, has_code = [], [], False
+
+    for line in lines:
+        raw.append(line)
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if long_close is not None:
+                if line.startswith(long_close, i):
+                    if is_long_str:
+                        # Keep the closing delimiter: dropping it turned a
+                        # long-string action into unquoted text on reparse.
+                        code.append(long_close)
+                    i += len(long_close)
+                    long_close = None
+                    is_long_str = False
+                else:
+                    if is_long_str:
+                        code.append(ch)
+                    i += 1
+                continue
+            if in_string is not None:
+                code.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == in_string:
+                    in_string = None
+                i += 1
+                continue
+            if ch == "-" and line.startswith("--", i):
+                m = re.match(r"--\[(=*)\[", line[i:])
+                if m:
+                    long_close = "]" + m.group(1) + "]"
+                    is_long_str = False
+                    i += m.end()
+                else:
+                    break  # line comment: the rest of the physical line is comment
+                continue
+            m = re.match(r"\[(=*)\[", line[i:]) if ch == "[" else None
+            if m:
+                code.append(line[i:i + m.end()])  # keep [[ / [==[ as source
+                long_close = "]" + m.group(1) + "]"
+                is_long_str = True
+                has_code = True
+                i += m.end()
+                continue
+            code.append(ch)
+            if not ch.isspace():
+                has_code = True
+            if ch in "\"'":
+                in_string = ch
+                escape = False
+            elif ch in "({[":
+                depth += 1
+            elif ch in ")}]":
+                depth = max(0, depth - 1)
+            i += 1
+        code.append(
+            "\n" if depth or in_string is not None or long_close is not None else " ")
+        if not depth and in_string is None and long_close is None:
+            flush()
+    if raw:
+        flush()
+    return units
 
 
 PRESET_CATALOG = [
@@ -728,29 +833,81 @@ PRESET_CATALOG = [
 
 _INSTALLED_APPS_CACHE = None
 
-def get_installed_apps():
+
+def _read_bounded_regular_file(path: str, max_bytes: int = MAX_FILE_BYTES):
+    """Read at most ``max_bytes`` from ``path``, never blocking on a FIFO.
+
+    Unlike the write path this follows symlinks on purpose (dotfile-managed
+    configs and packaged ``.desktop`` links must stay readable), but O_NONBLOCK
+    plus the S_ISREG fstat close the FIFO-blocking and device-target holes. The
+    cap is byte-exact: an oversized file reads ``max_bytes + 1`` bytes and is
+    refused, so a caller can never act on a silently truncated read.
+    Returns None for missing, non-regular or oversized paths.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    f = None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        f = os.fdopen(fd, "rb")
+        raw = f.read(max_bytes + 1)
+    finally:
+        if f is not None:
+            f.close()
+        else:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if len(raw) > max_bytes:
+        return None
+    return raw.decode("utf-8")
+
+
+def get_installed_apps(dirs=None):
     """Scan standard XDG application directories for launchable applications.
     Returns a sorted list of unique applications: [{'name': ..., 'exec': ..., 'icon': ..., 'comment': ..., 'terminal': bool}]
+
+    Every entry is read through the bounded reader (size cap, no FIFO block) and
+    the scan itself is capped, so a planted or corrupt ``.desktop`` cannot turn
+    the panel's model build into an unbounded read.
     """
     global _INSTALLED_APPS_CACHE
-    if _INSTALLED_APPS_CACHE is not None:
+    if dirs is None and _INSTALLED_APPS_CACHE is not None:
         return _INSTALLED_APPS_CACHE
 
     apps = []
     seen = set()
-    dirs = [
-        os.path.expanduser("~/.local/share/applications"),
-        "/usr/share/applications",
-        "/usr/local/share/applications",
-    ]
+    dirs_is_default = dirs is None
+    if dirs is None:
+        dirs = [
+            os.path.expanduser("~/.local/share/applications"),
+            "/usr/share/applications",
+            "/usr/local/share/applications",
+        ]
 
+    file_count = 0
+    total_read = 0
     for app_dir in dirs:
         if not os.path.isdir(app_dir):
             continue
         for desktop_file in sorted(glob.glob(os.path.join(app_dir, "*.desktop"))):
+            if file_count >= MAX_APP_FILES or total_read > MAX_APP_TOTAL_READ:
+                break
+            file_count += 1
+            try:
+                contents = _read_bounded_regular_file(desktop_file)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if contents is None:
+                continue
+            total_read += len(contents.encode("utf-8"))
             cp = configparser.RawConfigParser()
             try:
-                cp.read(desktop_file, encoding="utf-8")
+                cp.read_string(contents)
                 if not cp.has_section("Desktop Entry"):
                     continue
                 entry = cp["Desktop Entry"]
@@ -790,7 +947,8 @@ def get_installed_apps():
                 continue
 
     apps.sort(key=lambda x: x["name"].lower())
-    _INSTALLED_APPS_CACHE = apps
+    if dirs_is_default:
+        _INSTALLED_APPS_CACHE = apps
     return apps
 
 
@@ -979,7 +1137,11 @@ def parse_default_bindings():
 def parse_user_bindings():
     """
     Parse user overrides from ~/.config/hypr/bindings.lua.
-    CRITICAL: Skips all commented-out lines (starting with --) to avoid false unbind detection.
+
+    Reads through the bounded, non-blocking reader (byte-exact 64 KiB cap, no
+    FIFO block, symlinks followed for dotfile-managed configs). Parsing works on
+    logical Lua units, so commented-out text inside ``--[[ ]]`` blocks is never
+    mistaken for a live unbind/bind.
     """
     result = {
         "raw_content": "",
@@ -988,28 +1150,25 @@ def parse_user_bindings():
         "mouse_binds": [],
     }
 
-    if not os.path.isfile(USER_BINDINGS_PATH):
-        return result
-
     try:
-        with open(USER_BINDINGS_PATH, "r", encoding="utf-8") as f:
-            content = f.read(MAX_FILE_BYTES)
-            result["raw_content"] = content
-    except Exception:
+        content = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except (OSError, UnicodeDecodeError):
         return result
+    if content is None:
+        return result
+    result["raw_content"] = content
 
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("--"):
+    for _lines, text, is_comment in _lua_units(content.splitlines()):
+        if is_comment or not text:
             continue
 
-        m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', stripped)
+        m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', text)
         if m_unbind:
             raw_key = m_unbind.group(1).strip()
             result["unbinds"].add(normalize_key_chord(raw_key))
             continue
 
-        parsed = _parse_bind_line(stripped)
+        parsed = _parse_bind_line(text)
         if parsed:
             raw_key, desc, action_raw, opts_raw = parsed
             norm_key = normalize_key_chord(raw_key)
@@ -1180,8 +1339,6 @@ def _written_bind_identity(entry):
     action = entry.get("action", "")
     if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
         return desc, action.strip()[:MAX_CMD_LEN]
-    if cmd and (cmd.strip().startswith("{") or cmd.strip().startswith("hl.")):
-        return desc, cmd.strip()[:MAX_CMD_LEN]
     raw_cmd = (cmd or action).strip()
     if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
         raw_cmd = raw_cmd[1:-1]
@@ -1301,23 +1458,24 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     new_lines = []
 
-    for line in current_lines:
-        stripped = line.strip()
-
-        if stripped.startswith("--"):
-            new_lines.append(line)
+    # Work on logical statements, not physical lines: a hand-formatted
+    # multi-line o.bind must be replaced or removed as a whole, and text inside
+    # a --[[ ]] block is a comment even though its lines do not start with --.
+    for unit_lines, text, is_comment in _lua_units(current_lines):
+        if is_comment or not text:
+            new_lines.extend(unit_lines)
             continue
 
         is_targeted = False
         if clean_keys:
-            m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', stripped)
+            m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', text)
             if m_unbind and normalize_key_chord(m_unbind.group(1)) in clean_keys:
                 is_targeted = True
 
-            m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', stripped)
+            m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', text)
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
                 if preserve_identity is not None:
-                    _parsed = _parse_bind_line(stripped)
+                    _parsed = _parse_bind_line(text)
                     if _parsed:
                         norm_parsed_action = (_parsed[2] or "").strip().strip('"\'')
                         norm_pres_action = preserve_identity[1].strip().strip('"\'')
@@ -1330,7 +1488,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                     is_targeted = True
 
         if not is_targeted:
-            new_lines.append(line)
+            new_lines.extend(unit_lines)
 
     if unbinds_to_add:
         for k in unbinds_to_add:
@@ -1346,17 +1504,18 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             cmd = entry.get("command", "")
             action = entry.get("action", "")
 
+            # Raw Lua comes ONLY from the explicit dispatcher field, never from
+            # `command`: the command can be an untrusted .desktop Exec, and
+            # deciding "this is code" from a prefix in that data let `Exec=hl.…`
+            # inject statements into the file Hyprland executes.
             if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
                 new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()[:MAX_CMD_LEN]})')
-            elif cmd and (cmd.strip().startswith("{") or cmd.strip().startswith("hl.")):
-                new_lines.append(f'o.bind("{key}", "{desc}", {cmd.strip()[:MAX_CMD_LEN]})')
             else:
                 raw_cmd = (cmd or action).strip()
                 if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
                     raw_cmd = raw_cmd[1:-1]
                 escaped_cmd = sanitize_lua_str(raw_cmd, max_len=MAX_CMD_LEN)
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
-
 
     final_output = []
     prev_blank = False

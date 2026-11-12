@@ -1600,6 +1600,9 @@ Item {
         }
         onCanceled: {
           menuEntryChecked = true
+          // ConfirmDialog only emits canceled(); it never clears `opened`, so
+          // leaving it set kept a full-panel scrim up for the whole session.
+          menuSetupDialog.opened = false
         }
       }
 

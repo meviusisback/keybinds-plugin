@@ -49,6 +49,15 @@ Item {
   signal saved(string key, string description, string command, string action, string oldKey, bool overrideConflict)
   signal canceled()
 
+  // Qt ToolTip renders its text as styled markup, so .desktop-derived strings
+  // (Exec/Name) must lose markup and control characters before they reach it.
+  function plainText(s) {
+    return String(s === undefined || s === null ? "" : s)
+      .replace(/[\x00-\x1F\x7F]/g, " ")
+      .replace(/[<>&"']/g, "")
+      .slice(0, 120)
+  }
+
   // Filtered Installed Applications
   readonly property var filteredApps: {
     var list = root.apps || []
@@ -619,7 +628,9 @@ Item {
 
                     ToolTip.visible: appMouse.containsMouse
                     ToolTip.delay: 500
-                    ToolTip.text: appChip.modelData.exec ? ("Command: " + appChip.modelData.exec) : appChip.modelData.name
+                    ToolTip.text: appChip.modelData.exec
+                      ? ("Command: " + root.plainText(appChip.modelData.exec))
+                      : root.plainText(appChip.modelData.name)
                   }
 
                   RowLayout {
