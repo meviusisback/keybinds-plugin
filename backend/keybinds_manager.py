@@ -54,46 +54,93 @@ def _lua_single_expression_problem(expr: str) -> str:
     """Return why ``expr`` cannot be one Lua expression, or "" when it can.
 
     A raw dispatcher is written between ``o.bind("<key>", "<desc>", `` and the
-    closing ``)``. Anything that ends the statement early, opens a second one,
-    or leaves the brackets unbalanced makes the whole bindings.lua fail to
-    compile — and Hyprland then drops every user override in the file — so the
-    write is refused instead of producing a broken file.
+    closing ``)``, so anything that ends the statement early, opens a second
+    one, or leaves a bracket or string open makes the whole bindings.lua fail to
+    compile - and Hyprland then drops every user override in the file. The check
+    therefore rejects comments (a trailing ``--`` comments out the closing paren),
+    a trailing escape, a top-level ``;`` or ``,`` (a second expression smuggled in
+    as o.bind's fourth argument is evaluated at load time), and requires the
+    outermost call or table to close exactly at the end of the text.
     """
     if "\n" in expr or "\r" in expr:
         return "newlines are not allowed in a raw dispatcher"
+    if len(expr) > MAX_CMD_LEN:
+        return f"a raw dispatcher may not exceed {MAX_CMD_LEN} characters"
     closers = {")": "(", "]": "[", "}": "{"}
     depth = []
     quote = None
-    i = 0
-    while i < len(expr):
+    long_close = None
+    opened_any = False
+    i, n = 0, len(expr)
+    while i < n:
         ch = expr[i]
-        if quote:
+        if long_close is not None:
+            if expr.startswith(long_close, i):
+                i += len(long_close)
+                long_close = None
+                continue
+            i += 1
+            continue
+        if quote is not None:
             if ch == "\\":
                 i += 2
                 continue
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"'):
+            i += 1
+            continue
+        if ch == "-" and expr.startswith("--", i):
+            return "comments are not allowed in a raw dispatcher"
+        if ch == "[":
+            # Lua long-bracket string: [[ ... ]] or [==[ ... ]==]
+            j = i + 1
+            level = 0
+            while j < n and expr[j] == "=":
+                level += 1
+                j += 1
+            if j < n and expr[j] == "[":
+                long_close = "]" + "=" * level + "]"
+                i = j + 1
+                continue
+        if ch in ("'", '"'):
             quote = ch
         elif ch in "([{":
+            if not depth:
+                opened_any = True
             depth.append(ch)
         elif ch in ")]}":
             if not depth or depth[-1] != closers[ch]:
                 return f"unbalanced brackets: unexpected {ch!r}"
             depth.pop()
-        elif ch == ";":
-            return "a second statement (;) is not allowed"
+            if not depth and i != n - 1:
+                return "a second expression follows the closed call"
+        elif ch in ",;" and not depth:
+            return f"a second expression ({ch!r}) is not allowed"
+        elif ch == "\\":
+            return "a trailing escape is not allowed"
         i += 1
     if quote:
         return "unterminated string literal"
+    if long_close:
+        return "unterminated long string"
     if depth:
         return f"unbalanced brackets: unclosed {depth[-1]!r}"
+    if not opened_any:
+        return "a raw dispatcher must be a call or a table"
     return ""
 
 
 def _is_raw_dispatcher(action: str) -> bool:
+    """True for the two shapes Omarchy stores as code, not as a command string.
+
+    ``hl.*`` / ``{...}`` are the plain dispatchers; ``o.<name>(...)`` covers the
+    shortcut helpers Omarchy's own defaults use (``o.launch_terminal()``), which
+    must stay code or editing such a binding would replace the call with a
+    literal command string and silently break the shortcut.
+    """
     stripped = (action or "").strip()
-    return stripped.startswith("{") or stripped.startswith("hl.")
+    return (stripped.startswith("{") or stripped.startswith("hl.")
+            or re.match(r"^o\.[A-Za-z_][A-Za-z0-9_.]*\s*\(", stripped) is not None)
 
 
 _BIND_HEAD_RE = re.compile(r"o\.bind(?:_toggle)?\s*\(")
@@ -1022,8 +1069,11 @@ def get_installed_apps(dirs=None):
                 if entry.get("Hidden", "false").lower() == "true":
                     continue
 
-                name = entry.get("Name", "").strip()
-                exec_cmd = entry.get("Exec", "").strip()
+                # Cap every field that reaches the panel: StdioCollector has no
+                # byte ceiling, so a hostile .desktop could otherwise push a
+                # multi-megabyte payload that the GUI thread must parse.
+                name = entry.get("Name", "").strip()[:MAX_TEXT_LEN]
+                exec_cmd = entry.get("Exec", "").strip()[:MAX_CMD_LEN]
                 if not name or not exec_cmd:
                     continue
 
@@ -1043,8 +1093,8 @@ def get_installed_apps(dirs=None):
                 apps.append({
                     "name": name,
                     "exec": clean_exec,
-                    "icon": entry.get("Icon", "").strip(),
-                    "comment": entry.get("Comment", "").strip(),
+                    "icon": entry.get("Icon", "").strip()[:MAX_TEXT_LEN],
+                    "comment": entry.get("Comment", "").strip()[:MAX_TEXT_LEN],
                     "terminal": entry.get("Terminal", "false").lower() == "true",
                 })
             except Exception:
@@ -1635,8 +1685,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                         parsed_desc = (_parsed[1] or "").strip().lower()
                         parsed_action = (_parsed[2] or "").strip().strip('"\'')
                         for ident in identities:
+                            # Both halves, not either: a rename that lands on the
+                            # sibling's description (or command) used to match
+                            # that sibling by the OR and delete it.
                             if (parsed_desc == ident[0].strip().lower()
-                                    or parsed_action == ident[1].strip().strip('"\'')):
+                                    and parsed_action == ident[1].strip().strip('"\'')):
                                 is_targeted = True
                                 break
                     # Else: a different binding sharing this key (swap partner,
@@ -1659,12 +1712,18 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             line_str = f'hl.unbind("{norm_k}")'
             if line_str not in new_lines and line_str not in unbind_lines:
                 unbind_lines.append(line_str)
+        # Ask the Lua scanner where the leading comments end. Walking physical
+        # lines that start with "--" stops on the SECOND line of a --[[ ]] block
+        # and put the unbind inside the comment, where it never ran: the default
+        # stayed bound and the write still reported success.
         insert_at = 0
-        for idx, line in enumerate(new_lines):
-            if not line.strip() or line.strip().startswith("--"):
-                insert_at = idx + 1
-            else:
-                break
+        consumed = 0
+        for unit_lines, unit_text, unit_is_comment in _lua_units(new_lines):
+            if unit_is_comment or not unit_text:
+                consumed += len(unit_lines)
+                insert_at = consumed
+                continue
+            break
         for offset, line_str in enumerate(unbind_lines):
             new_lines.insert(insert_at + offset, line_str)
 
@@ -1683,7 +1742,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 problem = _lua_single_expression_problem(action.strip())
                 if problem:
                     raise ValueError(f"refusing to write the raw dispatcher: {problem}")
-                new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()[:MAX_CMD_LEN]})')
+                new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()})')
             else:
                 raw_cmd = (cmd or action).strip()
                 if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
@@ -1787,7 +1846,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     # A dispatcher-looking command is almost always a lost argument; writing it
     # as a quoted shell command would silently break the binding. Raw Lua is
     # accepted only from the explicit dispatcher slot.
-    if not action.strip() and command.strip().startswith(("hl.", "{")):
+    if not action.strip() and _is_raw_dispatcher(command.strip()):
         return {
             "success": False,
             "error": "dispatcher-looking command: pass it as the action argument "
@@ -1885,9 +1944,15 @@ def reset_keybinding(key: str, default_key: str = ""):
             if matched_default and matched_default["key"] not in keys_to_remove:
                 keys_to_remove.append(matched_default["key"])
 
-    write_user_bindings(keys_to_remove=keys_to_remove)
+    try:
+        write_user_bindings(keys_to_remove=keys_to_remove)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
-    return {"success": reload_status.get("success", False), "key": norm_key, "reload": reload_status}
+    # The write is what success means; a failed reload is reported separately so
+    # the panel cannot say "not saved" about a change that landed.
+    return {"success": True, "key": norm_key, "reload": reload_status,
+            "reload_success": bool(reload_status.get("success", False))}
 
 
 def disable_keybinding(key: str):

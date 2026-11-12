@@ -37,6 +37,7 @@ Item {
   property string currentCategory: "All"
   property string toastMessage: ""
   property bool toastVisible: false
+  property bool toastIsError: false
 
   // Menu entry setup (first-run)
   property bool menuEntryChecked: false
@@ -77,8 +78,9 @@ Item {
     }
   }
 
-  function showToast(msg) {
+  function showToast(msg, isError) {
     root.toastMessage = msg
+    root.toastIsError = isError === true
     root.toastVisible = true
     toastTimer.restart()
   }
@@ -123,15 +125,24 @@ Item {
     } catch (e) {
       console.warn("KeybindsPanel: backend answer was not json:", e)
     }
-    if (parsed && parsed.success === false) {
-      root.showToast("Not saved: " + (parsed.error || "the backend refused the change"))
+    // No answer is a failure, not an implicit success: an empty payload used to
+    // fall through to the success toast.
+    if (!parsed) {
+      root.showToast("Not saved: the backend produced no answer", true)
       return
     }
-    if (parsed && parsed.reload_success === false) {
-      root.showToast(okMessage + " (hyprctl reload reported an error)")
+    if (parsed.success === false) {
+      // The dialog stays open (the fields keep what the user typed) until a save
+      // actually lands.
+      root.showToast("Not saved: " + (parsed.error || "the backend refused the change"), true)
       return
     }
-    root.showToast(okMessage)
+    if (parsed.reload_success === false) {
+      root.showToast(okMessage + " (hyprctl reload reported an error)", true)
+    } else {
+      root.showToast(okMessage)
+    }
+    if (editDialog.opened) editDialog.opened = false
   }
 
   function resetKeybinding(key, defaultKey) {
@@ -400,6 +411,12 @@ Item {
       onStreamFinished: {
         try {
           var parsed = JSON.parse(text)
+          // success:false with exists:false means the file could not be read, not
+          // that the entry is missing: do not offer to write into it.
+          if (parsed.success === false) {
+            menuEntryChecked = true
+            return
+          }
           root.launcherEntryInstalled = parsed.exists
           if (!parsed.exists) {
             menuSetupDialog.opened = true
@@ -559,7 +576,11 @@ Item {
       }
 
       Keys.onEscapePressed: function(event) {
-        if (root.recordingSearch) {
+        if (menuSetupDialog.opened) {
+          // ConfirmDialog has no key handling of its own; without this, Escape
+          // hid the whole panel and left the prompt (and its scrim) armed.
+          menuSetupDialog.handleKey(event)
+        } else if (root.recordingSearch) {
           root.recordingSearch = false
           root.clearFindHolds()
         } else if (editDialog.opened) {
@@ -678,7 +699,8 @@ Item {
               iconText: ""
               tooltipText: "Edit bindings.lua in Editor"
               horizontalPadding: Style.space(10)
-              onClicked: Util.execDetached("omarchy-launch-config-editor $HOME/.config/hypr/bindings.lua")
+              onClicked: Quickshell.execDetached(["omarchy-launch-config-editor",
+            (Quickshell.env("HOME") || "") + "/.config/hypr/bindings.lua"])
             }
 
             Button {
@@ -1584,8 +1606,8 @@ Item {
           Layout.fillWidth: true
           Layout.preferredHeight: Style.space(38)
           radius: Style.cornerRadius
-          color: Util.alpha(root.accent, 0.2)
-          borderSpec: Border.flat(root.accent, 1)
+          color: Util.alpha(root.toastIsError ? root.urgent : root.accent, 0.2)
+          borderSpec: Border.flat(root.toastIsError ? root.urgent : root.accent, 1)
 
           RowLayout {
             anchors.centerIn: parent
@@ -1593,8 +1615,8 @@ Item {
 
             Text {
               textFormat: Text.PlainText
-              text: "✓"
-              color: root.accent
+              text: root.toastIsError ? "✕" : "✓"
+              color: root.toastIsError ? root.urgent : root.accent
               font.family: Style.font.family
               font.pixelSize: Style.font.body
               font.bold: true

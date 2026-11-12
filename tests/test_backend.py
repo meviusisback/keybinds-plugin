@@ -1114,6 +1114,96 @@ class TestSecurityRegressions(unittest.TestCase):
             self.assertEqual(f.read(), "do not touch\n")
         self.assertEqual(self._read_backup(), 'o.bind("SUPER + 1", "One", "one")\n')
 
+    # -- round-2 review: the dispatcher check, unbind placement, identity -----
+
+    def test_dispatcher_rejects_a_line_comment_tail(self):
+        # `hl.foo() --` comments out the closing paren of the generated o.bind,
+        # so bindings.lua stops compiling and Hyprland drops every user binding.
+        self.assertTrue(keybinds_manager._lua_single_expression_problem("hl.dsp.window.close() --"))
+        self.assertTrue(keybinds_manager._lua_single_expression_problem("hl.dsp.exec(\"a\") -- c"))
+        self.assertTrue(keybinds_manager._lua_single_expression_problem("--[["))
+
+    def test_dispatcher_rejects_trailing_escape_and_top_level_comma(self):
+        self.assertTrue(keybinds_manager._lua_single_expression_problem("hl.foo() \\"))
+        # A depth-0 comma becomes o.bind's fourth argument and is evaluated at
+        # load time: a second expression smuggled into the file Hyprland runs.
+        self.assertTrue(keybinds_manager._lua_single_expression_problem(
+            'hl.dsp.window.close(), os.execute("/usr/bin/true")'))
+        self.assertTrue(keybinds_manager._lua_single_expression_problem(
+            'hl.dsp.window.close() or o.bind("SUPER + X", "pwned", "evil")'))
+
+    def test_dispatcher_rejects_an_over_long_expression(self):
+        self.assertTrue(keybinds_manager._lua_single_expression_problem(
+            'hl.foo("' + "A" * (keybinds_manager.MAX_CMD_LEN + 10) + '")'))
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            'hl.foo("' + "A" * 100 + '")'), "")
+
+    def test_dispatcher_accepts_omarchy_helper_calls_and_long_strings(self):
+        # Omarchy's own defaults bind helpers like o.launch_terminal(): they are
+        # code, and editing such a binding must not turn them into a string.
+        self.assertTrue(keybinds_manager._is_raw_dispatcher("o.launch_terminal()"))
+        self.assertEqual(keybinds_manager._lua_single_expression_problem("o.launch_terminal()"), "")
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            'hl.dsp.exec([==[echo "a;b" --x]==])'), "")
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            'hl.dsp.window.move({ workspace = "e+1", follow = false })'), "")
+
+    def test_dispatcher_looking_command_is_refused_not_written_as_code(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + 1", "One", "one")\n')
+            for text in ("o.launch_terminal()", "hl.dsp.window.close()", "{ a; b; }"):
+                res = keybinds_manager.set_keybinding("SUPER + 2", "Two", text)
+                self.assertFalse(res["success"], text)
+            self.assertNotIn("launch_terminal", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_unbind_is_not_placed_inside_a_leading_block_comment(self):
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + W", "description": "Close", "action": "o.close()"}]
+            self._write('--[[\nlegacy notes\n-- kept\n]]\no.bind("SUPER + W", "Close", "a")\n')
+            keybinds_manager.set_keybinding("SUPER + W", "Close v2", "b")
+            content = self._read()
+            block = content.split("]]")[0]
+            self.assertNotIn("hl.unbind", block)
+            self.assertIn('hl.unbind("SUPER + W")', content)
+            parsed = keybinds_manager.parse_user_bindings()
+            self.assertIn("SUPER + W", parsed["unbinds"])
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_rename_onto_the_sibling_description_keeps_the_sibling(self):
+        # Identity matching on description OR action deleted a sibling that only
+        # shared one half with the row being edited.
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            keybinds_manager.set_keybinding(
+                "SUPER + K", "Exec", "kitty", "", "SUPER + K",
+                old_description="Close", old_command="a")
+            content = self._read()
+            self.assertIn('o.bind("SUPER + K", "Exec", "b")', content)
+            self.assertIn('o.bind("SUPER + K", "Exec", "kitty")', content)
+            self.assertNotIn('o.bind("SUPER + K", "Close", "a")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_reset_reports_the_write_separately_from_the_reload(self):
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.reload_hyprland = lambda: {"success": False, "error": "no session"}
+            self._write('o.bind("SUPER + 1", "One", "one")\n')
+            res = keybinds_manager.reset_keybinding("SUPER + 1")
+            self.assertTrue(res["success"], res)
+            self.assertFalse(res["reload_success"])
+            self.assertNotIn("o.bind(", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
     def test_menu_reader_refuses_a_fifo(self):
         fifo = os.path.join(self._tmpdir.name, "omarchy-menu.jsonc")
         os.mkfifo(fifo)

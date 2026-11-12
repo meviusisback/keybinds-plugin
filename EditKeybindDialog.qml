@@ -140,6 +140,9 @@ Item {
     root.isEditing = false
     root.itemData = presetItem || null
     root.oldKey = ""
+    root.oldTitle = ""
+    root.oldCommand = ""
+    root.oldDispatcher = ""
     root.runInTerminal = false
     root.appSearchQuery = ""
     root.workspaceSubAction = "switch"
@@ -181,7 +184,11 @@ Item {
     root.isEditing = true
     root.itemData = bindingItem || null
     root.actionTitle = (bindingItem && bindingItem.description) || ""
-    root.actionCommand = (bindingItem && (bindingItem.command || bindingItem.action)) || ""
+    // The command slot is a literal command only; the action slot carries code.
+    // Mirroring the action here rewrote shipped helper calls
+    // (o.bind(..., o.launch_terminal())) as the literal command
+    // "o.launch_terminal()" and silently broke the shortcut.
+    root.actionCommand = (bindingItem && bindingItem.command) || ""
     root.actionDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionCategory = (bindingItem && bindingItem.category) || "Custom"
     root.actionKey = (bindingItem && bindingItem.key) || ""
@@ -1596,8 +1603,9 @@ Item {
                 root.oldCommand,
                 root.oldDispatcher
               )
+              // The panel closes this dialog once the backend confirms the
+              // write; a refusal keeps the fields so nothing typed is lost.
               keyRecorder.stopRecording()
-              root.opened = false
             }
           }
         }
