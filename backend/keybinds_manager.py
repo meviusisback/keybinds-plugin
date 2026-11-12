@@ -50,6 +50,52 @@ def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _lua_single_expression_problem(expr: str) -> str:
+    """Return why ``expr`` cannot be one Lua expression, or "" when it can.
+
+    A raw dispatcher is written between ``o.bind("<key>", "<desc>", `` and the
+    closing ``)``. Anything that ends the statement early, opens a second one,
+    or leaves the brackets unbalanced makes the whole bindings.lua fail to
+    compile — and Hyprland then drops every user override in the file — so the
+    write is refused instead of producing a broken file.
+    """
+    if "\n" in expr or "\r" in expr:
+        return "newlines are not allowed in a raw dispatcher"
+    closers = {")": "(", "]": "[", "}": "{"}
+    depth = []
+    quote = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth.append(ch)
+        elif ch in ")]}":
+            if not depth or depth[-1] != closers[ch]:
+                return f"unbalanced brackets: unexpected {ch!r}"
+            depth.pop()
+        elif ch == ";":
+            return "a second statement (;) is not allowed"
+        i += 1
+    if quote:
+        return "unterminated string literal"
+    if depth:
+        return f"unbalanced brackets: unclosed {depth[-1]!r}"
+    return ""
+
+
+def _is_raw_dispatcher(action: str) -> bool:
+    stripped = (action or "").strip()
+    return stripped.startswith("{") or stripped.startswith("hl.")
+
+
 _BIND_HEAD_RE = re.compile(r"o\.bind(?:_toggle)?\s*\(")
 
 
@@ -1602,11 +1648,25 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             new_lines.extend(unit_lines)
 
     if unbinds_to_add:
+        # Place unbinds at the top of the body, not at the end: Hyprland's
+        # unbind() removes every bind on the chord registered before it, and the
+        # user file is loaded after Omarchy's defaults. At the top it shadows the
+        # default while every user binding (a sibling on the same chord included)
+        # is registered afterwards and survives.
+        unbind_lines = []
         for k in unbinds_to_add:
             norm_k = normalize_key_chord(k)
             line_str = f'hl.unbind("{norm_k}")'
-            if line_str not in new_lines:
-                new_lines.append(line_str)
+            if line_str not in new_lines and line_str not in unbind_lines:
+                unbind_lines.append(line_str)
+        insert_at = 0
+        for idx, line in enumerate(new_lines):
+            if not line.strip() or line.strip().startswith("--"):
+                insert_at = idx + 1
+            else:
+                break
+        for offset, line_str in enumerate(unbind_lines):
+            new_lines.insert(insert_at + offset, line_str)
 
     if lines_to_add:
         for entry in lines_to_add:
@@ -1619,7 +1679,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # `command`: the command can be an untrusted .desktop Exec, and
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
-            if action and (action.strip().startswith("{") or action.strip().startswith("hl.")):
+            if _is_raw_dispatcher(action):
+                problem = _lua_single_expression_problem(action.strip())
+                if problem:
+                    raise ValueError(f"refusing to write the raw dispatcher: {problem}")
                 new_lines.append(f'o.bind("{key}", "{desc}", {action.strip()[:MAX_CMD_LEN]})')
             else:
                 raw_cmd = (cmd or action).strip()
@@ -1627,6 +1690,39 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                     raw_cmd = _decode_lua_string(raw_cmd[1:-1])
                 escaped_cmd = sanitize_lua_str(raw_cmd, max_len=MAX_CMD_LEN)
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
+
+    # Fail closed: prove the intended change is really in the output. A file
+    # whose statements cannot be isolated (an unbalanced bracket above the
+    # binds, a hand-formatted multi-statement line) used to be written back
+    # unchanged while the caller reported success.
+    def _parsed_binds(lines):
+        parsed_binds = []
+        for _unit, text, is_comment in _lua_units(lines):
+            if is_comment or not text:
+                continue
+            parsed = _parse_bind_line(text)
+            if parsed:
+                parsed_binds.append((normalize_key_chord(parsed[0]), parsed))
+        return parsed_binds
+
+    written_binds = _parsed_binds(new_lines)
+    for entry in (lines_to_add or []):
+        want = normalize_key_chord(entry.get("key", ""))
+        if want and not any(k == want for k, _ in written_binds):
+            raise ValueError(
+                "could not isolate the statement to edit in the bindings file "
+                "(unbalanced brackets or a hand-formatted bind); nothing was written")
+    if previous_identity is not None and previous_identity != preserve_identity:
+        for written_key, parsed in written_binds:
+            if written_key not in clean_keys:
+                continue
+            written_desc = (parsed[1] or "").strip().lower()
+            written_action = (parsed[2] or "").strip().strip("\"'")
+            if (written_desc == previous_identity[0].strip().lower()
+                    and written_action == previous_identity[1].strip().strip("\"'")):
+                raise ValueError(
+                    "could not replace the existing binding "
+                    "(its statement cannot be isolated); nothing was written")
 
     final_output = []
     prev_blank = False
@@ -1672,8 +1768,16 @@ def reload_hyprland():
         return {"success": False, "error": str(e)}
 
 
-def set_keybinding(key: str, description: str, command: str, action: str = "", old_key: str = "", override_conflicts: bool = True):
-    """Set, modify, or replace a keybinding."""
+def set_keybinding(key: str, description: str, command: str, action: str = "", old_key: str = "",
+                   override_conflicts: bool = True,
+                   old_description: str = "", old_command: str = "", old_action: str = ""):
+    """Set, modify, or replace a keybinding.
+
+    ``old_description`` / ``old_command`` / ``old_action`` describe the binding
+    being edited in place. They are what identifies the exact line to replace
+    when several bindings share the chord (a rename changes both the
+    description and the command, so key alone cannot find it).
+    """
     norm_key = normalize_key_chord(key)
     norm_old_key = normalize_key_chord(old_key) if old_key else ""
 
@@ -1689,6 +1793,10 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
             "error": "dispatcher-looking command: pass it as the action argument "
                      "(set <key> <desc> <command> <action>)",
         }
+    if _is_raw_dispatcher(action):
+        problem = _lua_single_expression_problem(action.strip())
+        if problem:
+            return {"success": False, "error": f"invalid raw Lua dispatcher: {problem}"}
 
     default_binds = parse_default_bindings()
     keys_to_clean = [norm_key]
@@ -1699,7 +1807,12 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
         if any(d["key"] == norm_old_key for d in default_binds):
             unbinds_to_add.append(norm_old_key)
 
-    if any(d["key"] == norm_key for d in default_binds) or override_conflicts:
+    # hl.unbind(<chord>) removes every binding on that chord at the Hyprland
+    # level, so it is emitted only to shadow an Omarchy default. Emitting it on
+    # every save silently killed the sibling binding this code takes care to
+    # preserve in the file, which made the panel show bindings that no longer
+    # existed.
+    if any(d["key"] == norm_key for d in default_binds):
         unbinds_to_add.append(norm_key)
 
     binds = [{
@@ -1715,20 +1828,36 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     previous_entry = None
     if in_place:
         same_key = [b for b in parse_user_bindings()["binds"] if b["key"] == norm_key]
-        if len(same_key) == 1:
+        if old_description or old_command or old_action:
+            previous_entry = {
+                "description": old_description,
+                "command": old_command,
+                "action": old_action,
+            }
+        elif len(same_key) == 1:
             previous_entry = same_key[0]
+        elif len(same_key) > 1:
+            return {
+                "success": False,
+                "error": "several bindings share this chord: pass the previous "
+                         "description to say which one is being replaced",
+            }
 
-    write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
-                        preserve_entry=binds[0], previous_entry=previous_entry,
-                        override_keys=[] if in_place else [norm_key])
+    try:
+        write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
+                            preserve_entry=binds[0], previous_entry=previous_entry,
+                            override_keys=[] if (in_place or not override_conflicts) else [norm_key])
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
 
     return {
-        "success": reload_status.get("success", False),
+        "success": True,
         "key": norm_key,
         "old_key": norm_old_key,
         "description": description,
         "reload": reload_status,
+        "reload_success": bool(reload_status.get("success", False)),
     }
 
 
@@ -1736,6 +1865,9 @@ def reset_keybinding(key: str, default_key: str = ""):
     """Reset a keybinding back to default Omarchy configuration."""
     norm_key = normalize_key_chord(key)
     norm_def = normalize_key_chord(default_key) if default_key else ""
+
+    if not norm_key:
+        return {"success": False, "error": "Invalid key combination"}
 
     keys_to_remove = [norm_key]
     if norm_def and norm_def != norm_key:
@@ -1761,17 +1893,29 @@ def reset_keybinding(key: str, default_key: str = ""):
 def disable_keybinding(key: str):
     """Disable/unbind a keybinding."""
     norm_key = normalize_key_chord(key)
-    write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key])
+    if not norm_key:
+        return {"success": False, "error": "Invalid key combination"}
+    try:
+        write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key])
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
-    return {"success": reload_status.get("success", False), "key": norm_key, "reload": reload_status}
+    return {"success": True, "key": norm_key, "reload": reload_status,
+            "reload_success": bool(reload_status.get("success", False))}
 
 
 def enable_keybinding(key: str):
     """Re-enable a previously disabled default keybinding by removing its unbind."""
     norm_key = normalize_key_chord(key)
-    write_user_bindings(keys_to_remove=[norm_key])
+    if not norm_key:
+        return {"success": False, "error": "Invalid key combination"}
+    try:
+        write_user_bindings(keys_to_remove=[norm_key])
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
-    return {"success": reload_status.get("success", False), "key": norm_key, "reload": reload_status}
+    return {"success": True, "key": norm_key, "reload": reload_status,
+            "reload_success": bool(reload_status.get("success", False))}
 
 
 def _strip_jsonc_comments(text: str) -> str:
@@ -1983,15 +2127,20 @@ def main():
 
     elif cmd == "set":
         if len(sys.argv) < 5:
-            print(json.dumps({"success": False, "error": "Usage: set <key> <desc> <command> [action] [old_key]"}))
+            print(json.dumps({"success": False, "error": "Usage: set <key> <desc> <command> [action] [old_key] [old_desc] [old_command] [old_action]"}))
             sys.exit(1)
         key = sys.argv[2]
         desc = sys.argv[3]
         command = sys.argv[4]
         action = sys.argv[5] if len(sys.argv) > 5 else ""
         old_key = sys.argv[6] if len(sys.argv) > 6 else ""
+        old_desc = sys.argv[7] if len(sys.argv) > 7 else ""
+        old_command = sys.argv[8] if len(sys.argv) > 8 else ""
+        old_action = sys.argv[9] if len(sys.argv) > 9 else ""
         try:
-            res = set_keybinding(key, desc, command, action, old_key)
+            res = set_keybinding(key, desc, command, action, old_key,
+                                 old_description=old_desc, old_command=old_command,
+                                 old_action=old_action)
         except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
             res = {"success": False, "error": str(e)}
         print(json.dumps(res))

@@ -824,13 +824,16 @@ class TestSecurityRegressions(unittest.TestCase):
 
     def test_in_place_edit_keeps_second_binding_on_same_chord(self):
         # Editing one of two user bindings that share a chord must not delete
-        # the other one (the old key-in-lines_to_add clause did).
+        # the other one (the old key-in-lines_to_add clause did). The row being
+        # edited is identified by its previous description/command, because the
+        # chord alone matches both.
         self._stub_set_keybinding()
         try:
             self._write('o.bind("SUPER + K", "Close", "a")\n'
                         'o.bind("SUPER + K", "Exec", "b")\n')
             keybinds_manager.set_keybinding(
-                "SUPER + K", "Close", "a2", "", "SUPER + K")
+                "SUPER + K", "Close", "a2", "", "SUPER + K",
+                old_description="Close", old_command="a")
             content = self._read()
             self.assertIn('o.bind("SUPER + K", "Exec", "b")', content)
             self.assertIn('o.bind("SUPER + K", "Close", "a2")', content)
@@ -959,6 +962,170 @@ class TestSecurityRegressions(unittest.TestCase):
             {"key": "SUPER + X", "description": "d", "command": "",
              "action": "hl.dsp.window.close()"})
         self.assertEqual(raw, "hl.dsp.window.close()")
+
+    # -- in-place edits when several bindings share a chord ------------------
+
+    def test_in_place_rename_replaces_only_the_edited_binding(self):
+        # A rename changes both the description and the command, so the key can
+        # no longer identify the line: the previous identity must. Before this
+        # the old line survived and every save added one more.
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + K", "Exec v2", "kitty", "", "SUPER + K",
+                old_description="Exec", old_command="b")
+            self.assertTrue(res["success"], res)
+            content = self._read()
+            self.assertIn('o.bind("SUPER + K", "Close", "a")', content)
+            self.assertIn('o.bind("SUPER + K", "Exec v2", "kitty")', content)
+            self.assertNotIn('"Exec", "b"', content)
+            self.assertEqual(content.count("o.bind("), 2)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_in_place_rename_refuses_when_chord_is_ambiguous(self):
+        self._stub_set_keybinding()
+        try:
+            original = ('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            self._write(original)
+            res = keybinds_manager.set_keybinding(
+                "SUPER + K", "Exec v2", "kitty", "", "SUPER + K")
+            self.assertFalse(res["success"])
+            self.assertIn("share this chord", res["error"])
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_no_unbind_is_added_when_a_sibling_binding_is_preserved(self):
+        # hl.unbind(<chord>) removes every binding on that chord at the
+        # Hyprland level, so emitting it unconditionally made the panel show a
+        # sibling that no longer existed.
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            keybinds_manager.set_keybinding(
+                "SUPER + K", "Exec v2", "kitty", "", "SUPER + K",
+                old_description="Exec", old_command="b")
+            self.assertNotIn("hl.unbind", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_unbind_for_a_default_chord_precedes_every_user_bind(self):
+        # When the chord is an Omarchy default the unbind is still needed, but it
+        # must come first: Hyprland removes every bind registered before it, and
+        # the user file loads after the defaults, so a trailing unbind would kill
+        # the sibling binding kept above it.
+        self._stub_set_keybinding()
+        try:
+            keybinds_manager.parse_default_bindings = lambda: [
+                {"key": "SUPER + K", "description": "Default", "action": "default"}]
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            keybinds_manager.set_keybinding(
+                "SUPER + K", "Exec v2", "kitty", "", "SUPER + K",
+                old_description="Exec", old_command="b")
+            lines = self._read().splitlines()
+            unbind_at = lines.index('hl.unbind("SUPER + K")')
+            binds_at = [i for i, l in enumerate(lines) if l.startswith("o.bind(")]
+            self.assertEqual(len(binds_at), 2)
+            self.assertLess(unbind_at, min(binds_at))
+        finally:
+            self._unstub_set_keybinding()
+
+    # -- the writer proves the change landed ---------------------------------
+
+    def test_edit_refuses_when_the_statement_cannot_be_isolated(self):
+        # An unbalanced bracket above the binds collapses every following line
+        # into one unit; the old writer wrote the file back unchanged and the
+        # CLI still reported success.
+        self._stub_set_keybinding()
+        try:
+            original = ('local x = foo(\n'
+                        'o.bind("SUPER + 1", "One", "one")\n'
+                        'o.bind("SUPER + 2", "Two", "two")\n')
+            self._write(original)
+            res = keybinds_manager.set_keybinding(
+                "SUPER + 2", "Two v2", "two2", "", "SUPER + 2")
+            self.assertFalse(res["success"])
+            self.assertIn("could not", res["error"])
+            self.assertEqual(self._read(), original)
+        finally:
+            self._unstub_set_keybinding()
+
+    # -- raw dispatcher validation ------------------------------------------
+
+    def test_raw_dispatcher_rejects_newline_and_second_statement(self):
+        for bad in ('hl.dsp.window.close())\nos.execute("touch /tmp/x") --',
+                    'hl.dsp.window.close(); os.execute("touch /tmp/x")',
+                    'hl.dsp.focus({ direction = "left"',):
+            self.assertFalse(keybinds_manager._lua_single_expression_problem(bad) == "",
+                             f"accepted a bad dispatcher: {bad!r}")
+        for good in ('hl.dsp.window.close()',
+                     'hl.dsp.window.move({ workspace = "e+1", follow = false })',
+                     '{ "a", "b" }'):
+            self.assertEqual(keybinds_manager._lua_single_expression_problem(good), "",
+                             f"refused a valid dispatcher: {good!r}")
+
+    def test_raw_dispatcher_with_second_statement_is_refused_by_the_writer(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + 1", "One", "one")\n')
+            res = keybinds_manager.set_keybinding(
+                "SUPER + 2", "Two", "", 'hl.dsp.window.close()\nos.execute("id") --')
+            self.assertFalse(res["success"])
+            self.assertNotIn("os.execute", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_invalid_key_is_refused_by_every_verb(self):
+        for verb in (keybinds_manager.disable_keybinding,
+                     keybinds_manager.enable_keybinding,
+                     keybinds_manager.reset_keybinding):
+            res = verb('SUPER + A")')
+            self.assertFalse(res["success"], f"{verb.__name__} accepted an unsafe key")
+        self.assertFalse(os.path.exists(self.path) and "hl.unbind(\"\")" in self._read())
+
+    # -- guards that must fail when deleted ---------------------------------
+
+    def test_dangling_symlink_at_bindings_path_is_refused(self):
+        # Deleting this guard made the plugin create the link target's
+        # directory and write outside ~/.config; the suite stayed green.
+        outside = os.path.join(self._tmpdir.name, "created-by-plugin", "bindings.lua")
+        os.unlink(self.path) if os.path.exists(self.path) else None
+        os.symlink(outside, self.path)
+        with self.assertRaises(ValueError):
+            keybinds_manager.write_user_bindings(
+                lines_to_add=[{"key": "SUPER + B", "description": "B", "command": "true"}])
+        self.assertFalse(os.path.exists(outside))
+
+    def test_backup_does_not_truncate_a_planted_hardlink(self):
+        self._write('o.bind("SUPER + 1", "One", "one")\n')
+        victim = os.path.join(self._tmpdir.name, "victim.txt")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("do not touch\n")
+        os.link(victim, self.path + ".bak")
+        keybinds_manager.write_user_bindings(
+            lines_to_add=[{"key": "SUPER + 2", "description": "Two", "command": "two"}])
+        with open(victim, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "do not touch\n")
+        self.assertEqual(self._read_backup(), 'o.bind("SUPER + 1", "One", "one")\n')
+
+    def test_menu_reader_refuses_a_fifo(self):
+        fifo = os.path.join(self._tmpdir.name, "omarchy-menu.jsonc")
+        os.mkfifo(fifo)
+        saved = keybinds_manager.MENU_CONFIG_PATH
+        keybinds_manager.MENU_CONFIG_PATH = fifo
+        try:
+            res = keybinds_manager.check_menu_entry()
+            self.assertFalse(res["success"])
+            res = keybinds_manager.install_menu_entry()
+            self.assertFalse(res["success"])
+        finally:
+            keybinds_manager.MENU_CONFIG_PATH = saved
 
 
 if __name__ == "__main__":

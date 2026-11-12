@@ -95,7 +95,7 @@ Item {
     listProc.running = true
   }
 
-  function saveKeybinding(key, desc, cmd, action, oldKey, overrideConflict) {
+  function saveKeybinding(key, desc, cmd, action, oldKey, overrideConflict, oldDesc, oldCmd, oldAction) {
     root.loading = true
     setProc.running = false
     setProc.command = [
@@ -105,9 +105,33 @@ Item {
       desc,
       cmd,
       action || "",
-      oldKey || ""
+      oldKey || "",
+      oldDesc || "",
+      oldCmd || "",
+      oldAction || ""
     ]
     setProc.running = true
+  }
+
+  // The backend answers {"success": bool, "error"?: string} for every write and
+  // refuses instead of lying (unsafe key, oversized file, dangling symlink,
+  // a statement it cannot isolate). Report what it says, never a fixed success.
+  function handleWriteResult(payload, okMessage) {
+    var parsed = null
+    try {
+      if (payload && payload.trim().length > 0) parsed = JSON.parse(payload)
+    } catch (e) {
+      console.warn("KeybindsPanel: backend answer was not json:", e)
+    }
+    if (parsed && parsed.success === false) {
+      root.showToast("Not saved: " + (parsed.error || "the backend refused the change"))
+      return
+    }
+    if (parsed && parsed.reload_success === false) {
+      root.showToast(okMessage + " (hyprctl reload reported an error)")
+      return
+    }
+    root.showToast(okMessage)
   }
 
   function resetKeybinding(key, defaultKey) {
@@ -326,7 +350,7 @@ Item {
       onStreamFinished: {
         root.loading = false
         root.loadData()
-        root.showToast("Keybinding saved & applied to Hyprland!")
+        root.handleWriteResult(text, "Keybinding saved & applied to Hyprland!")
       }
     }
   }
@@ -338,7 +362,7 @@ Item {
       onStreamFinished: {
         root.loading = false
         root.loadData()
-        root.showToast("Keybinding reset to default!")
+        root.handleWriteResult(text, "Keybinding reset to default!")
       }
     }
   }
@@ -350,7 +374,7 @@ Item {
       onStreamFinished: {
         root.loading = false
         root.loadData()
-        root.showToast("Keybinding re-enabled!")
+        root.handleWriteResult(text, "Keybinding re-enabled!")
       }
     }
   }
@@ -362,7 +386,7 @@ Item {
       onStreamFinished: {
         root.loading = false
         root.loadData()
-        root.showToast("Keybinding disabled!")
+        root.handleWriteResult(text, "Keybinding disabled!")
       }
     }
   }
@@ -1613,8 +1637,8 @@ Item {
         allBindings: root.modelData.active
         catalog: root.modelData.catalog
         apps: (root.modelData && root.modelData.apps) || []
-        onSaved: function(key, desc, cmd, act, oldK, overrideConf) {
-          root.saveKeybinding(key, desc, cmd, act, oldK, overrideConf)
+        onSaved: function(key, desc, cmd, act, oldK, overrideConf, oldT, oldC, oldDsp) {
+          root.saveKeybinding(key, desc, cmd, act, oldK, overrideConf, oldT, oldC, oldDsp)
         }
       }
     }

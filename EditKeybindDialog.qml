@@ -31,6 +31,9 @@ Item {
   property string actionCategory: "Applications"
   property string actionKey: ""
   property string oldKey: ""
+  property string oldTitle: ""
+  property string oldCommand: ""
+  property string oldDispatcher: ""
   property string actionType: "app" // "app" | "window" | "workspace" | "system" | "custom"
 
   // Builder state & selection tracking
@@ -46,7 +49,7 @@ Item {
   property color accent: Color.accent
   property color urgent: Color.urgent
 
-  signal saved(string key, string description, string command, string action, string oldKey, bool overrideConflict)
+  signal saved(string key, string description, string command, string action, string oldKey, bool overrideConflict, string oldTitle, string oldCommand, string oldDispatcher)
   signal canceled()
 
   // Qt ToolTip renders its text as styled markup, so .desktop-derived strings
@@ -183,6 +186,11 @@ Item {
     root.actionCategory = (bindingItem && bindingItem.category) || "Custom"
     root.actionKey = (bindingItem && bindingItem.key) || ""
     root.oldKey = (bindingItem && bindingItem.key) || ""
+    // Identity of the row being edited. Several bindings can share a chord, so
+    // the backend needs this to replace exactly this line and not a sibling.
+    root.oldTitle = root.actionTitle
+    root.oldCommand = (bindingItem && bindingItem.command) || ""
+    root.oldDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionType = "custom"
     root.selectedActionId = "custom"
     root.runInTerminal = false
@@ -1571,20 +1579,22 @@ Item {
             verticalPadding: Style.space(6)
             enabled: root.actionTitle.trim().length > 0 && root.actionKey.trim().length > 0 && (root.actionCommand.trim().length > 0 || (root.actionDispatcher && root.actionDispatcher.trim().length > 0))
             onClicked: {
-              var cmd = root.actionCommand
-              var dsp = root.actionDispatcher || ""
-              // The backend emits raw Lua only from the dispatcher slot. A
-              // dispatcher the user typed into the command field is code they
-              // chose, so route it there; app commands keep dsp = "exec" and
-              // stay literal, so a .desktop Exec can never become code.
-              if (!dsp && /^\s*(hl\.|\{)/.test(cmd)) dsp = cmd
+              // Raw Lua is written only from the dispatcher slot, which this
+              // dialog fills from a catalog preset or from the binding being
+              // edited. Text typed into the command field is always a literal
+              // command: deriving "this is code" from a prefix here let an
+              // ordinary shell group like `{ a; b; }` become broken Lua in the
+              // file Hyprland parses, dropping every user binding in it.
               root.saved(
                 root.actionKey,
                 root.actionTitle,
-                cmd,
-                dsp,
+                root.actionCommand,
+                root.actionDispatcher || "",
                 root.oldKey,
-                true
+                true,
+                root.oldTitle,
+                root.oldCommand,
+                root.oldDispatcher
               )
               keyRecorder.stopRecording()
               root.opened = false
