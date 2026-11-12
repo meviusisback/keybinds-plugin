@@ -810,6 +810,87 @@ class TestSecurityRegressions(unittest.TestCase):
         keybinds_manager.write_user_bindings(keys_to_remove=["SUPER + W", "SUPER + Q"])
         self.assertIn(commented.strip(), self._read())
 
+    def _stub_set_keybinding(self):
+        """Keep set_keybinding off /usr/share and hyprctl."""
+        self._orig_defaults = keybinds_manager.parse_default_bindings
+        self._orig_reload = keybinds_manager.reload_hyprland
+        keybinds_manager.parse_default_bindings = lambda: []
+        keybinds_manager.reload_hyprland = lambda: {
+            "success": True, "reload_output": "", "config_errors": ""}
+
+    def _unstub_set_keybinding(self):
+        keybinds_manager.parse_default_bindings = self._orig_defaults
+        keybinds_manager.reload_hyprland = self._orig_reload
+
+    def test_in_place_edit_keeps_second_binding_on_same_chord(self):
+        # Editing one of two user bindings that share a chord must not delete
+        # the other one (the old key-in-lines_to_add clause did).
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n'
+                        'o.bind("SUPER + K", "Exec", "b")\n')
+            keybinds_manager.set_keybinding(
+                "SUPER + K", "Close", "a2", "", "SUPER + K")
+            content = self._read()
+            self.assertIn('o.bind("SUPER + K", "Exec", "b")', content)
+            self.assertIn('o.bind("SUPER + K", "Close", "a2")', content)
+            self.assertEqual(content.count("o.bind("), 2)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_new_binding_overrides_occupied_chord(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Close", "a")\n')
+            keybinds_manager.set_keybinding("SUPER + K", "Mine", "mine", "", "")
+            content = self._read()
+            self.assertNotIn('"Close"', content)
+            self.assertIn('o.bind("SUPER + K", "Mine", "mine")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_in_place_rename_replaces_single_line(self):
+        self._stub_set_keybinding()
+        try:
+            self._write('o.bind("SUPER + K", "Old name", "old")\n')
+            keybinds_manager.set_keybinding(
+                "SUPER + K", "New name", "new", "", "SUPER + K")
+            content = self._read()
+            self.assertNotIn('"Old name"', content)
+            self.assertIn('o.bind("SUPER + K", "New name", "new")', content)
+        finally:
+            self._unstub_set_keybinding()
+
+    def test_dispatcher_looking_command_is_rejected(self):
+        self._write("-- original\n")
+        res = keybinds_manager.set_keybinding("SUPER + R", "Reload", "hl.dsp.reload()", "")
+        self.assertFalse(res["success"])
+        self.assertIn("dispatcher", res["error"])
+        self.assertEqual(self._read(), "-- original\n")
+
+    def test_quoted_action_is_stable_across_saves(self):
+        self._write('o.bind("SUPER + Q", "Q", "echo \\"hi\\"")\n')
+        for _ in range(2):
+            bind = keybinds_manager.parse_user_bindings()["binds"][0]
+            keybinds_manager.write_user_bindings(
+                lines_to_add=[{"key": bind["key"],
+                               "description": bind["description"],
+                               "command": bind.get("command") or bind["action"],
+                               "action": bind["action"]}],
+                keys_to_remove=[bind["key"]])
+        self.assertIn('o.bind("SUPER + Q", "Q", "echo \\"hi\\"")', self._read())
+
+    def test_crlf_line_endings_preserved(self):
+        with open(self.path, "wb") as f:
+            f.write(b'o.bind("SUPER + Z", "Z", "z")\r\n-- comment\r\n')
+        keybinds_manager.write_user_bindings(
+            lines_to_add=[{"key": "SUPER + N", "description": "N", "command": "n"}])
+        with open(self.path, "rb") as f:
+            data = f.read()
+        self.assertIn(b'-- comment\r\n', data)
+        self.assertIn(b'o.bind("SUPER + N", "N", "n")\r\n', data)
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+
     # -- bounded reads -------------------------------------------------------
 
     def test_get_installed_apps_skips_oversized_and_special_files(self):

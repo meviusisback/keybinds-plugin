@@ -106,7 +106,7 @@ The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
 The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and every plain command is escaped into a Lua string. Raw Lua dispatchers (starting with `hl.` or `{`) are inserted only from the explicit dispatcher field the built-in catalog uses — never from a command string, so an application's `.desktop` `Exec` can never become code. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin also rewrites when you add an app action to it) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
-Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 54 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents and bounded reads.
+Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 61 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents and bounded reads.
 
 ## Removal
 

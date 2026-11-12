@@ -1216,7 +1216,7 @@ def parse_user_bindings():
         return result
     result["raw_content"] = content
 
-    for _lines, text, is_comment in _lua_units(content.splitlines()):
+    for _lines, text, is_comment in _lua_units(_split_lines(content)[0]):
         if is_comment or not text:
             continue
 
@@ -1387,6 +1387,43 @@ def build_complete_model():
     }
 
 
+def _decode_lua_string(text: str) -> str:
+    """Decode the escapes ``sanitize_lua_str`` adds (``\\\\`` and ``\\"``).
+
+    Only those two are decoded: they are the ones the writer produces, and a
+    round-trip must be byte-stable. Other Lua escapes (``\\n``) are left as
+    written so nothing invents a newline the file did not have.
+    """
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in '\\"':
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_lines(content: str):
+    """Split bindings.lua on LF only, preserving other separators verbatim.
+
+    ``str.splitlines()`` also splits on CR, form feed, U+0085/U+2028/U+2029;
+    rejoining with LF silently rewrote those bytes and could break a literal
+    that contained one. Returns ``(lines, newline)`` with CRLF detected so a
+    rewrite keeps the file's convention.
+    """
+    if not content:
+        return [], "\n"
+    newline = "\r\n" if "\r\n" in content else "\n"
+    lines = [line[:-1] if line.endswith("\r") else line for line in content.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines, newline
+
+
 def _written_bind_identity(entry):
     """Return the (description, action) pair a single o.bind line for ``entry``
     will store on disk. Scoping key removal to this exact pair lets a rebind
@@ -1402,7 +1439,7 @@ def _written_bind_identity(entry):
         return desc, action.strip()[:MAX_CMD_LEN]
     raw_cmd = (cmd or action).strip()
     if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
-        raw_cmd = raw_cmd[1:-1]
+        raw_cmd = _decode_lua_string(raw_cmd[1:-1])
     return desc, f'"{sanitize_lua_str(raw_cmd)}"'
 
 
@@ -1432,20 +1469,28 @@ def _resolve_bindings_write_path(path: str):
     return resolved, True
 
 
-def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None, preserve_entry=None):
+def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None,
+                        preserve_entry=None, previous_entry=None, override_keys=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
 
-    ``preserve_entry``: when set, an existing o.bind/o.bind_toggle whose key is
-    in ``keys_to_remove`` is only removed if it is *the same binding* (matching
-    description OR action, mirroring build_complete_model's identity convention)
-    as this entry. Any other binding sharing the key is left intact (needed for
-    swaps, where one binding's old key is another binding's freshly written key,
-    and for in-place action edits, where the description is unchanged).
+    ``preserve_entry`` / ``previous_entry``: an existing o.bind/o.bind_toggle
+    whose key is in ``keys_to_remove`` is removed only if it is *the same
+    binding* — its description OR action matches the entry being written
+    (``preserve_entry``) or the binding it replaces (``previous_entry``). Any
+    other binding sharing the key is left intact: that is what keeps a swap
+    partner and a second binding on the same chord alive.
+
+    ``override_keys``: keys whose existing bind lines are removed regardless of
+    identity. ``set_keybinding`` uses it for a key that is not being edited in
+    place, where binding a new action over an occupied chord is an override.
     """
     cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
     preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
+    previous_identity = _written_bind_identity(previous_entry) if previous_entry else None
+    identities = [i for i in (previous_identity, preserve_identity) if i is not None]
+    overrides = set(normalize_key_chord(k) for k in (override_keys or []))
     os.makedirs(cfg_dir, exist_ok=True)
 
     resolved_path, exists = _resolve_bindings_write_path(USER_BINDINGS_PATH)
@@ -1506,7 +1551,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                         pass
                 raise
 
-    current_lines = existing_content.splitlines() if existing_content else []
+    current_lines, newline = _split_lines(existing_content)
 
     if not current_lines:
         current_lines = [
@@ -1535,16 +1580,21 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
             m_bind = re.match(r'o\.bind(?:_toggle)?\s*\(\s*["\']([^"\']+)["\']', text)
             if m_bind and normalize_key_chord(m_bind.group(1)) in clean_keys:
-                if preserve_identity is not None:
+                bind_key = normalize_key_chord(m_bind.group(1))
+                if bind_key in overrides:
+                    is_targeted = True
+                elif identities:
                     _parsed = _parse_bind_line(text)
                     if _parsed:
-                        norm_parsed_action = (_parsed[2] or "").strip().strip('"\'')
-                        norm_pres_action = preserve_identity[1].strip().strip('"\'')
-                        if ((_parsed[1] or "").strip().lower() == preserve_identity[0].strip().lower()
-                                or norm_parsed_action == norm_pres_action
-                                or normalize_key_chord(m_bind.group(1)) in [normalize_key_chord(e.get("key", "")) for e in (lines_to_add or [])]):
-                            is_targeted = True
-                    # Else: a different binding sharing this key (swap partner) -> keep.
+                        parsed_desc = (_parsed[1] or "").strip().lower()
+                        parsed_action = (_parsed[2] or "").strip().strip('"\'')
+                        for ident in identities:
+                            if (parsed_desc == ident[0].strip().lower()
+                                    or parsed_action == ident[1].strip().strip('"\'')):
+                                is_targeted = True
+                                break
+                    # Else: a different binding sharing this key (swap partner,
+                    # or a second binding on the same chord) -> keep it.
                 else:
                     is_targeted = True
 
@@ -1574,7 +1624,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             else:
                 raw_cmd = (cmd or action).strip()
                 if (raw_cmd.startswith('"') and raw_cmd.endswith('"')) or (raw_cmd.startswith("'") and raw_cmd.endswith("'")):
-                    raw_cmd = raw_cmd[1:-1]
+                    raw_cmd = _decode_lua_string(raw_cmd[1:-1])
                 escaped_cmd = sanitize_lua_str(raw_cmd, max_len=MAX_CMD_LEN)
                 new_lines.append(f'o.bind("{key}", "{desc}", "{escaped_cmd}")')
 
@@ -1592,7 +1642,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     fd, temp_file = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("\n".join(final_output) + "\n")
+            f.write(newline.join(final_output) + newline)
             f.flush()
             os.fsync(f.fileno())
         if os.path.islink(temp_file):
@@ -1630,6 +1680,16 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if not norm_key:
         return {"success": False, "error": "Invalid key combination"}
 
+    # A dispatcher-looking command is almost always a lost argument; writing it
+    # as a quoted shell command would silently break the binding. Raw Lua is
+    # accepted only from the explicit dispatcher slot.
+    if not action.strip() and command.strip().startswith(("hl.", "{")):
+        return {
+            "success": False,
+            "error": "dispatcher-looking command: pass it as the action argument "
+                     "(set <key> <desc> <command> <action>)",
+        }
+
     default_binds = parse_default_bindings()
     keys_to_clean = [norm_key]
     unbinds_to_add = []
@@ -1649,8 +1709,18 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
         "action": action,
     }]
 
+    # Editing a binding in place replaces *that* binding only: a second user
+    # binding on the same chord must survive. Any other key is an override.
+    in_place = bool(norm_old_key) and norm_old_key == norm_key
+    previous_entry = None
+    if in_place:
+        same_key = [b for b in parse_user_bindings()["binds"] if b["key"] == norm_key]
+        if len(same_key) == 1:
+            previous_entry = same_key[0]
+
     write_user_bindings(lines_to_add=binds, unbinds_to_add=unbinds_to_add, keys_to_remove=keys_to_clean,
-                        preserve_entry=binds[0])
+                        preserve_entry=binds[0], previous_entry=previous_entry,
+                        override_keys=[] if in_place else [norm_key])
     reload_status = reload_hyprland()
 
     return {
