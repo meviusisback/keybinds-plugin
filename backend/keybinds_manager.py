@@ -35,23 +35,26 @@ def _trusted_binary(name: str) -> str:
     if not candidates:
         return ""
     for found in candidates:
-      if not _binary_is_trusted(found):
+      real = _binary_is_trusted(found)
+      if not real:
         continue
-      return os.path.realpath(found)
+      # Return the path that was CHECKED: resolving a second time reopens the
+      # window between the check and the exec.
+      return real
     return ""
 
 
-def _binary_is_trusted(found: str) -> bool:
+def _binary_is_trusted(found: str) -> str:
     try:
         real = os.path.realpath(found)
         st = os.stat(real)
         # The file we will execute: regular, and not writable by anyone else.
         if not stat.S_ISREG(st.st_mode):
-            return False
+            return ""
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return False
+            return ""
         if st.st_uid not in (0, os.geteuid()):
-            return False
+            return ""
         # ... and every directory above it: a clean binary inside a world-writable
         # ancestor can be swapped by someone else just the same.
         probe = real
@@ -59,18 +62,18 @@ def _binary_is_trusted(found: str) -> bool:
             probe = os.path.dirname(probe)
             pst = os.stat(probe)
             if not stat.S_ISDIR(pst.st_mode):
-                return False
+                return ""
             if pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                return False
+                return ""
             # A directory owned by a third party can be re-pointed by that owner
             # even when its mode looks clean.
             if pst.st_uid not in (0, os.geteuid()):
-                return False
+                return ""
             if probe in ("/", ""):
                 break
     except OSError:
-        return False
-    return True
+        return ""
+    return real
 
 
 def _hyprctl() -> str:
@@ -614,7 +617,8 @@ def _unit_is_single_statement(text: str) -> bool:
 
 
 _BIND_HEAD_RE = re.compile(
-    r'o\s*\.\s*bind(?:_toggle|_hold)?\s*\(|o\s*\[\s*["\']bind(?:_toggle|_hold)?["\']\s*\]\s*\(')
+    r'o\s*\.\s*bind(?:_toggle|_hold)?\s*\(|o\s*\[\s*["\']bind(?:_toggle|_hold)?["\']\s*\]\s*\('
+    r'|hl\s*\.\s*bind\s*\(|hl\s*\[\s*["\']bind["\']\s*\]\s*\(')
 
 
 def _is_last_default_on_chord(default: dict, defaults: list) -> bool:
@@ -630,6 +634,36 @@ def _is_last_default_on_chord(default: dict, defaults: list) -> bool:
     return True
 
 
+def _bind_heads_in(text: str) -> list:
+    """Every bind head in the unit, so a second statement cannot hide a chord."""
+    heads = []
+    start = 0
+    while True:
+        m = _search_in_code(_BIND_HEAD_RE.pattern, text[start:])
+        if not m:
+            break
+        heads.append(start + m.start())
+        start = start + m.end()
+        if len(heads) > 32:
+            break
+    return heads
+
+
+def _chord_of_head(text: str, pos: int) -> str:
+    """The chord of the bind whose head starts at ``pos``; "" when unreadable."""
+    parsed = _parse_bind_line(text[pos:].split("\n")[0])
+    if not parsed:
+        return ""
+    key = parsed[0] if isinstance(parsed, (tuple, list)) else (
+        parsed.get("key") if isinstance(parsed, dict) else "")
+    return normalize_key_chord(key) if key else ""
+
+
+def _has_bare_cr(text: str) -> bool:
+    """True for old-Mac line endings (a CR that is not part of CRLF)."""
+    return bool(re.search(r"\r(?!\n)", text or ""))
+
+
 def _file_has_unreadable_binds() -> bool:
     """True when bindings.lua holds a bind whose chord the parser cannot read.
 
@@ -642,12 +676,37 @@ def _file_has_unreadable_binds() -> bool:
         return False
     if not raw:
         return False
+    if _has_bare_cr(raw):
+        # A CR is a statement boundary to Lua but not to our line splitter: refuse to
+        # certify anything about the file rather than guess.
+        return True
     lines, _newline = _split_lines(raw)
     for _unit_lines, text, is_comment in _lua_units(lines):
-        if is_comment or not text or not _bind_head(text):
+        if is_comment or not text:
             continue
-        if not _bind_chord_of(text):
+        heads = _bind_heads_in(text)
+        if not heads:
+            continue
+        # Two binds in one unit, or a bind we cannot read: the chord map would be
+        # incomplete, and an incomplete map is what makes "no bind follows" a lie.
+        if len(heads) > 1:
             return True
+        if not _chord_of_head(text, heads[0]):
+            return True
+    return False
+
+
+def _chord_has_other_live_bind(chord: str, description: str, action: str) -> bool:
+    """True when a DIFFERENT live user binding sits on this chord."""
+    desc = (description or "").strip().lower()
+    act = _identity_value(action)
+    for ub in parse_user_bindings()["binds"]:
+        if ub["key"] != chord:
+            continue
+        if ((desc and (ub.get("description", "") or "").strip().lower() == desc)
+                or (act and _identity_value(ub.get("action")) == act)):
+            continue
+        return True
     return False
 
 
@@ -895,7 +954,8 @@ def _lua_units(lines):
 
     def flush():
         nonlocal raw, code, has_code
-        text = re.sub(r"[ \t]*\n[ \t]*", " ", "".join(code)).strip()
+        text = re.sub(r"[ \t]*\r?\n[ \t]*", " ", "".join(code)).strip()
+        text = re.sub(r"[ \t]*\r[ \t]*", " ", text).strip()
         units.append((raw, text, not has_code))
         raw, code, has_code = [], [], False
 
@@ -2157,12 +2217,20 @@ def build_complete_model():
     live_chords = {b["key"] for b in all_active
                    if b.get("status") in ("default", "modified", "custom")}
     _unreadable = _file_has_unreadable_binds()
+    _blocked_reason = ("Botty cannot read every binding in your file (a computed key, "
+                       "two statements on one line, a CR line ending or another hl.* "
+                       "call), so some controls are hidden") if _unreadable else ""
     for item in all_active:
         status = item.get("status")
         on_default_chord = bool(item.get("default_key"))
         # Reset restores the shipped action, so it is the right control for ANY row
         # tied to a default chord - including one disabled by a hand-written unbind.
-        item["can_reset"] = on_default_chord and status in ("modified", "disabled")
+        _shadowed = (status == "disabled" and item["key"] in live_chords)
+        item["can_reset"] = (on_default_chord and status in ("modified", "disabled")
+                             and not _shadowed and not _unreadable)
+        if _shadowed:
+            item["blocked_reason"] = ("another binding of yours uses this shortcut; "
+                                      "remove it first to restore the default")
         item["can_delete"] = (status == "custom"
                               or (bool(item.get("disabled_row")) and not on_default_chord))
         # Enable can only remove an unbind that no live bind follows on that chord.
@@ -2244,6 +2312,9 @@ def build_complete_model():
                           if b.get("status") in ("modified", "custom")
                           or b.get("disabled_row")])
 
+    for _item in all_active:
+        if _blocked_reason and not _item.get("blocked_reason"):
+            _item["blocked_reason"] = _blocked_reason
     return {
         "active": all_active,
         "catalog": catalog,
@@ -2532,7 +2603,20 @@ def _resolve_bindings_write_path(path: str):
     # bound stays $HOME - but a link into a credential or autostart location is not
     # a dotfiles link, and neither is a target that is not a .lua file.
     home = os.path.realpath(os.path.expanduser("~"))
+    if home in ("", "/") or not os.path.isabs(home):
+        # Skipping the bound when the home is unusable disabled it entirely.
+        raise ValueError("cannot determine your home folder; refusing to edit the "
+                         "bindings file")
+    # The link must point at a file with the SAME NAME as the bindings file: a stale
+    # dotfiles link to hyprland.lua (or any other .lua) turned a save into rewriting
+    # the compositor's own config.
+    if os.path.basename(resolved).lower() != os.path.basename(path).lower():
+        raise ValueError(
+            f"the bindings file resolves to {resolved}, which is a different file; "
+            "refusing to write there")
     _denied = (os.path.join(".ssh"), os.path.join(".gnupg"), os.path.join(".password-store"),
+               os.path.join(".aws"), os.path.join(".kube"), os.path.join(".docker"),
+               os.path.join(".config", "gh"), os.path.join(".config", "opencode"),
                os.path.join(".config", "autostart"), os.path.join(".local", "bin"),
                os.path.join(".config", "systemd"))
     _rel = os.path.relpath(resolved, home) if home not in ("", "/") else resolved
@@ -2560,8 +2644,15 @@ def _resolve_bindings_write_path(path: str):
             raise ValueError(f"cannot resolve symlink path, refusing to edit: {path}")
         raise ValueError(f"refusing to operate on non-regular path: {path}")
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise ValueError(f"refusing non-regular file: {path}")
+        if st.st_uid != os.geteuid():
+            raise ValueError(f"refusing a file owned by another user: {path}")
+        if st.st_nlink != 1:
+            # A hard link lets a save copy a private file's bytes into bindings.lua
+            # (and its .bak), which Hyprland then loads.
+            raise ValueError(f"refusing a file with {st.st_nlink} hard links: {path}")
     finally:
         os.close(fd)
     return resolved, True
@@ -2680,21 +2771,32 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     # any other binding was saved later, and made a hand-written disable dead.
     _units = list(_lua_units(current_lines))
     _bind_index_by_chord = {}
-    _unreadable_binds = False
+    _unreadable_binds = _has_bare_cr(existing_content or "")
     for _i, (_ul, _ut, _uc) in enumerate(_units):
-        if _uc or not _ut or not _bind_head(_ut):
+        if _uc or not _ut:
             continue
-        _k = _bind_chord_of(_ut)
-        if _k:
-            _bind_index_by_chord[_k] = _i
-        else:
-            # A bind we cannot read could be on the chord being enabled: guessing
-            # "no bind follows" deleted the shadow unbind and left two actions live.
+        _heads = _bind_heads_in(_ut)
+        if not _heads:
+            if (_search_in_code(r"\bhl\s*\.\s*[A-Za-z_][\w]*\s*\(", _ut)
+                    and not _search_in_code(r"\bhl\s*\.\s*unbind\b", _ut)):
+                # Some other hl.* registration we do not model: it might own a chord.
+                _unreadable_binds = True
+            continue
+        if len(_heads) > 1:
             _unreadable_binds = True
-    if unbind_only_keys and _unreadable_binds:
+        for _pos in _heads:
+            _k = _chord_of_head(_ut, _pos)
+            if _k:
+                _bind_index_by_chord[_k] = _i
+            else:
+                # A bind we cannot read could be on the chord being edited: guessing
+                # "no bind follows" deleted the shadow unbind and left two actions live.
+                _unreadable_binds = True
+    if (unbind_only_keys or clean_keys or remove_unbinds_only) and _unreadable_binds:
         raise ValueError(
-            "this file holds a binding whose shortcut cannot be read (a computed "
-            "key or description); refusing to remove an unbind that might belong "
+            "this file holds a binding Botty cannot read (a computed key, two "
+            "statements on one line, a CR line ending or another hl.* call); "
+            "nothing was written: refusing to remove an unbind that might belong "
             "to it")
 
     trailing_unbind_units = set()
@@ -3216,6 +3318,17 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     norm_key = normalize_key_chord(key)
     norm_old_key = normalize_key_chord(old_key) if old_key else ""
 
+    # A keep-disabled save appends an unbind for the WHOLE chord: if another of your
+    # bindings lives there it would be switched off. Refuse BEFORE anything is
+    # written (checking after the first write reported "not saved" about a file that
+    # had already changed).
+    if keep_disabled and _chord_has_other_live_bind(
+            normalize_key_chord(old_key) if old_key else norm_key,
+            old_description, old_action):
+        return {"success": False,
+                "error": ("another binding of yours uses this shortcut, so the edit "
+                          "would switch it off; remove it first or edit that row")}
+
     if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
 
@@ -3422,6 +3535,12 @@ def reset_keybinding(key: str, default_key: str = "", description: str = "",
     # would re-arm the shipped default beside it (two actions on one keypress).
     _target_desc = (description or "").strip().lower()
     _target_act = _identity_value(action)
+    if _file_has_unreadable_binds():
+        return {"success": False,
+                "error": ("this file holds a binding Botty cannot read (a computed "
+                          "key, two statements on one line, a CR line ending or "
+                          "another hl.* call); nothing was written: refusing to "
+                          "remove an unbind that might belong to it")}
     _others_live = []
     for ub in user_state["binds"]:
         if ub["key"] != norm_key:

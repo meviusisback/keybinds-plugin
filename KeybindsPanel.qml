@@ -1074,7 +1074,8 @@ Item {
                         text: "Enable"
                         iconText: "✓"
                         accent: "#4CAF50"
-                        tooltipText: "Re-enable Keybinding"
+                        tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
+                                     ? activeRow.modelData.blocked_reason : "Re-enable Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.enableKeybinding(activeRow.modelData.key)
@@ -1316,7 +1317,8 @@ Item {
                         text: "Enable"
                         iconText: "✓"
                         accent: "#4CAF50"
-                        tooltipText: "Re-enable Keybinding"
+                        tooltipText: Boolean(modRow.modelData && modRow.modelData.blocked_reason)
+                                     ? modRow.modelData.blocked_reason : "Re-enable Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.enableKeybinding(modRow.modelData.key)

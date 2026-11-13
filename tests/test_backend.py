@@ -2352,5 +2352,63 @@ class TestRoundSixteenAgreement(TestRoundTwelveRegressions):
         self.assertEqual(open(outside).read(), "export X=1\n")
 
 
+class TestRoundSeventeenUnreadableFiles(TestRoundTwelveRegressions):
+    """Seventeenth round: an unreadable file certifies nothing, so nothing is removed."""
+
+    def _row_for(self, key):
+        model = keybinds_manager.build_complete_model()
+        return next((b for b in model["active"] if b["key"] == key), None)
+
+    def test_a_second_bind_in_one_unit_blocks_enable_and_reset(self):
+        self._write('hl.unbind("SUPER + W")\n'
+                    'o.bind("SUPER + P", "other", "x") ; o.bind("SUPER + W", "mine", "swapwindow")\n')
+        row = self._row_for("SUPER + W")
+        self.assertFalse(row["can_enable"])
+        self.assertFalse(row["can_reset"])
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + W")["success"])
+        self.assertFalse(keybinds_manager.reset_keybinding(
+            "SUPER + W", "SUPER + W", "Close window", "hl.dsp.window.close()")["success"])
+        self.assertIn('hl.unbind("SUPER + W")', self._read())
+
+    def test_a_cr_commented_bind_blocks_the_verbs(self):
+        self._write('hl.unbind("SUPER + W")\n-- off\r o.bind("SUPER + W", "mine", "swapwindow")\n')
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + W")["success"])
+        self.assertIn('hl.unbind("SUPER + W")', self._read())
+
+    def test_the_hl_bind_form_is_seen(self):
+        self._write('hl.unbind("SUPER + W")\nhl.bind("SUPER + W", hl.dsp.exec_cmd("my-close"))\n')
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + W")["success"])
+
+    def test_a_keep_disabled_edit_refuses_before_writing(self):
+        self._write("")
+        keybinds_manager.set_keybinding("SUPER + ALT + F", "My fullscreen", "", "my-fullscreen-cmd")
+        before = self._read()
+        res = keybinds_manager.set_keybinding(
+            "SUPER + ALT + F", "Full width", "", "hl.dsp.window.fullscreen()",
+            old_key="SUPER + ALT + F", old_description="Full width",
+            old_action="hl.dsp.window.fullscreen()", keep_disabled=True)
+        self.assertFalse(res["success"], res)
+        self.assertEqual(self._read(), before)   # nothing was written
+
+    def test_a_non_bindings_target_is_refused(self):
+        other = os.path.join(self.home, ".config", "hypr", "hyprland.lua")
+        open(other, "w").write("-- compositor\n")
+        if os.path.lexists(self.path):
+            os.remove(self.path)
+        os.symlink(other, self.path)
+        res = keybinds_manager.set_keybinding("SUPER + B", "B", "true")
+        self.assertFalse(res["success"], res)
+        self.assertEqual(open(other).read(), "-- compositor\n")
+
+    def test_a_hardlinked_target_is_refused(self):
+        other = os.path.join(self.home, "private.lua")
+        open(other, "w").write("-- secret\n")
+        if os.path.lexists(self.path):
+            os.remove(self.path)
+        os.link(other, self.path)
+        res = keybinds_manager.set_keybinding("SUPER + B", "B", "true")
+        self.assertFalse(res["success"], res)
+
+
 if __name__ == "__main__":
     unittest.main()
