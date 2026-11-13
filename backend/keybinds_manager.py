@@ -10,6 +10,7 @@ import sys
 import re
 import json
 import shutil
+import signal
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -664,6 +665,95 @@ def _has_bare_cr(text: str) -> bool:
     return bool(re.search(r"\r(?!\n)", text or ""))
 
 
+def _call_span(code: str, open_idx: int) -> int:
+    """Index just past the balanced ``)`` of the call whose ``(`` is at open_idx."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _unit_certification_problem(text: str) -> str:
+    """Why this unit cannot be certified, or "" when it can.
+
+    ONE predicate for the model and the writer: they used to disagree, so a row
+    published a button the other side then refused. A unit certifies only when
+    everything in code position is a bind we can read or an ``hl.unbind`` we can
+    read; anything else (a second statement, an alias such as ``local b = o.bind``,
+    a call through a helper, a chord written with escapes) is unreadable.
+    """
+    code = _code_only(text)
+    if not code.strip():
+        return ""
+    heads = _bind_heads_in(text)
+    if len(heads) > 1:
+        return "two statements on one line"
+    span_free = list(code)
+    for pos in heads:
+        if not _chord_of_head(text, pos):
+            return "a key Botty cannot read"
+        # \x53 / \83 / \u{53} are the same chord to Lua and something else to us, so
+        # they were certified and then mis-read. Read the raw literal, not the mask.
+        open_idx = code.find("(", pos)
+        if open_idx != -1:
+            quote_at = -1
+            for _q in (text.find('"', open_idx), text.find("'", open_idx)):
+                if _q != -1 and (quote_at == -1 or _q < quote_at):
+                    quote_at = _q
+            if quote_at != -1:
+                j = quote_at + 1
+                while j < len(text) and text[j] != text[quote_at]:
+                    if text[j] == "\\":
+                        return "a key written with escapes"
+                    j += 1
+        end = _call_span(code, open_idx) if open_idx != -1 else len(code)
+        # Blank the head too (``o.bind``), not only the parentheses.
+        head_start = open_idx
+        while head_start > 0 and (code[head_start - 1].isalnum()
+                                  or code[head_start - 1] in "_.:"):
+            head_start -= 1
+        for i in range(head_start, min(end, len(code))):
+            span_free[i] = " "
+    # A bind hidden inside another call (hl.on("x", function() hl.bind(..) end))
+    # would slip through the blanking below, so check the strict mask first.
+    _strict = list(code)
+    for pos in heads:
+        _open = code.find("(", pos)
+        _end = _call_span(code, _open) if _open != -1 else len(code)
+        for i in range(pos, min(_end, len(code))):
+            _strict[i] = " "
+    if re.search(r"\b(?:bind|bind_toggle|bind_hold)\b", "".join(_strict)):
+        return "a binding registered through an alias"
+
+    # hl.unbind(...) units are ours to remove, so they are readable.
+    for m in re.finditer(r"\bhl\s*(?:\.\s*unbind|\[\s*[\"']unbind[\"']\s*\])\s*\(",
+                         "".join(span_free)):
+        end = _call_span("".join(span_free), m.end() - 1)
+        for i in range(m.start(), min(end, len(span_free))):
+            span_free[i] = " "
+    rest = "".join(span_free)
+    # Chord-free helpers are fine: they cannot put a binding on a key. Anything
+    # else might (o.<custom>(...), a wrapper, require(...)), so it is not readable.
+    rest = re.sub(r"\bhl\s*\.\s*(?:config|env|on|exec|exec_cmd|notify|dsp"
+                  r"(?:\s*\.\s*[A-Za-z_][\w]*)?)\s*\(", " ", rest)
+    rest = re.sub(r"\bfunction\s*\(", " ", rest)
+    if re.search(r"[A-Za-z_][\w.:]*\s*\(", rest):
+        return "a call Botty does not model"
+    if re.search(r"\b(?:load|loadstring|require|dofile)\b", rest):
+        # `local b = require(...)` can register a binding no head shows.
+        return "a binding registered through an alias"
+    return ""
+
+
 def _file_has_unreadable_binds() -> bool:
     """True when bindings.lua holds a bind whose chord the parser cannot read.
 
@@ -684,14 +774,7 @@ def _file_has_unreadable_binds() -> bool:
     for _unit_lines, text, is_comment in _lua_units(lines):
         if is_comment or not text:
             continue
-        heads = _bind_heads_in(text)
-        if not heads:
-            continue
-        # Two binds in one unit, or a bind we cannot read: the chord map would be
-        # incomplete, and an incomplete map is what makes "no bind follows" a lie.
-        if len(heads) > 1:
-            return True
-        if not _chord_of_head(text, heads[0]):
+        if _unit_certification_problem(text):
             return True
     return False
 
@@ -2217,9 +2300,10 @@ def build_complete_model():
     live_chords = {b["key"] for b in all_active
                    if b.get("status") in ("default", "modified", "custom")}
     _unreadable = _file_has_unreadable_binds()
-    _blocked_reason = ("Botty cannot read every binding in your file (a computed key, "
-                       "two statements on one line, a CR line ending or another hl.* "
-                       "call), so some controls are hidden") if _unreadable else ""
+    _blocked_reason = ("Botty cannot read every binding in your file (a computed or "
+                       "escaped key, two statements on one line, a CR line ending, a "
+                       "bind registered through an alias or another hl.* call), so "
+                       "the controls that rewrite the file are hidden") if _unreadable else ""
     for item in all_active:
         status = item.get("status")
         on_default_chord = bool(item.get("default_key"))
@@ -2231,16 +2315,30 @@ def build_complete_model():
         if _shadowed:
             item["blocked_reason"] = ("another binding of yours uses this shortcut; "
                                       "remove it first to restore the default")
-        item["can_delete"] = (status == "custom"
-                              or (bool(item.get("disabled_row")) and not on_default_chord))
+        item["can_delete"] = ((status == "custom"
+                               or (bool(item.get("disabled_row")) and not on_default_chord))
+                              and not _unreadable)
         # Enable can only remove an unbind that no live bind follows on that chord.
         # A default shadowed by a sibling's bind (ALT+TAB) would always be refused,
         # so offer Reset there instead of a button that can only fail.
+        # Two shipped defaults on one chord: when the other one was moved away, the
+        # chord's unbind belongs to THAT move. Re-enabling this one would re-arm both.
+        _sibling_moved = any(
+            other is not item
+            and other.get("default_key") and other["key"] == item["key"]
+            and (other.get("description") or "").strip().lower()
+            != (item.get("description") or "").strip().lower()
+            and other.get("status") in ("modified", "custom")
+            for other in all_active)
         item["can_enable"] = (status == "disabled" and item["key"] not in live_chords
-                              and not _unreadable)
+                              and not _unreadable and not _sibling_moved)
+        if (_sibling_moved and status == "disabled"
+                and not item.get("blocked_reason")):
+            item["blocked_reason"] = ("another default on this shortcut was moved "
+                                      "away; restoring this one would re-arm both")
         if _unreadable and status == "disabled":
             item["can_reset"] = False
-        item["can_disable"] = status in ("default", "modified", "custom")
+        item["can_disable"] = status in ("default", "modified", "custom") and not _unreadable
 
     # 3. Sort Alphabetically by Description (case-insensitive)
     all_active.sort(key=lambda x: (x.get("description", "").lower(), x.get("key", "")))
@@ -2437,6 +2535,9 @@ def _written_bind_identity(entry):
     return desc, _identity_value(action)
 
 
+LUAC_NAMES = ("luac", "luac5.4", "luac5.3", "luac4")
+
+
 def _lua_compile_error(text: str) -> str:
     """First line of the Lua compiler's complaint about ``text``, or "".
 
@@ -2444,8 +2545,7 @@ def _lua_compile_error(text: str) -> str:
     runtime globals is fine. No compiler installed -> "" (the shape checks above
     are all there is, which is why they stay).
     """
-    luac = (_trusted_binary("luac") or _trusted_binary("luac5.4")
-            or _trusted_binary("luac5.3"))
+    luac = next((p for p in (_trusted_binary(n) for n in LUAC_NAMES) if p), "")
     if not luac:
         # Nothing to compare against here: the "no compiler" refusal lives in
         # _assert_lua_compiles, which knows the ORIGINAL text and can therefore
@@ -2568,8 +2668,7 @@ def _assert_lua_compiles(text: str, original: str = "") -> None:
     # token stack, not a parser). With no trusted compiler, refuse to ADD one
     # rather than write a bindings.lua Hyprland drops entirely and report "saved";
     # a file that already had one stays editable, so the row can still be fixed.
-    if not (_trusted_binary("luac") or _trusted_binary("luac4")
-            or _trusted_binary("luac5.4") or _trusted_binary("luac5.3")):
+    if not any(_trusted_binary(n) for n in LUAC_NAMES):
         # COUNT, not presence: a file that already holds one function literal used
         # to whitelist every later one, which is exactly the case this gate exists
         # for (a compiler-less host writing a bindings.lua Hyprland will drop).
@@ -2610,7 +2709,7 @@ def _resolve_bindings_write_path(path: str):
     # The link must point at a file with the SAME NAME as the bindings file: a stale
     # dotfiles link to hyprland.lua (or any other .lua) turned a save into rewriting
     # the compositor's own config.
-    if os.path.basename(resolved).lower() != os.path.basename(path).lower():
+    if os.path.basename(resolved) != os.path.basename(path):
         raise ValueError(
             f"the bindings file resolves to {resolved}, which is a different file; "
             "refusing to write there")
@@ -2776,13 +2875,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         if _uc or not _ut:
             continue
         _heads = _bind_heads_in(_ut)
-        if not _heads:
-            if (_search_in_code(r"\bhl\s*\.\s*[A-Za-z_][\w]*\s*\(", _ut)
-                    and not _search_in_code(r"\bhl\s*\.\s*unbind\b", _ut)):
-                # Some other hl.* registration we do not model: it might own a chord.
-                _unreadable_binds = True
-            continue
-        if len(_heads) > 1:
+        if _unit_certification_problem(_ut):
+            # One predicate, so the panel never offers a control this refuses.
             _unreadable_binds = True
         for _pos in _heads:
             _k = _chord_of_head(_ut, _pos)
@@ -3276,6 +3370,27 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         raise
 
 
+def _run_in_own_group(argv, timeout: int):
+    """Run argv in its own process group, killing the GROUP on timeout.
+
+    subprocess.run kills only the direct child, so a helper hyprctl forked survived
+    the timeout (probe: a ``sleep 300`` grandchild outlived the call). Output is
+    bounded to 64 KiB, which is what configerrors needs.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, start_new_session=True)
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, _err = proc.communicate()
+        raise
+    return proc.returncode, out
+
+
 def reload_hyprland():
     """Reload Hyprland configuration and check for errors."""
     hyprctl = _hyprctl()
@@ -3285,19 +3400,15 @@ def reload_hyprland():
                 "config_errors": "hyprctl was not found in a trusted location; "
                                  "reload the config by hand"}
     try:
-        # Own process group: on a timeout only the direct child used to be killed,
-        # so anything hyprctl started stayed behind. Output is bounded too.
-        res = subprocess.run([hyprctl, "reload"], capture_output=True, text=True,
-                             timeout=10, start_new_session=True)
-        err_res = subprocess.run([hyprctl, "configerrors"], capture_output=True,
-                                 text=True, timeout=10, start_new_session=True)
-        errors = (err_res.stdout or "")[:65536].strip() if err_res.returncode == 0 else ""
+        rc, out = _run_in_own_group([hyprctl, "reload"], 10)
+        _rc2, err_out = _run_in_own_group([hyprctl, "configerrors"], 10)
+        errors = (err_out or "")[:65536].strip() if _rc2 == 0 else ""
         # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
         # it drops every user override in it. A save that leaves errors behind is
         # not "applied".
         return {
-            "success": res.returncode == 0 and not errors,
-            "reload_output": res.stdout.strip(),
+            "success": rc == 0 and not errors,
+            "reload_output": (out or "")[:65536].strip(),
             "config_errors": errors,
         }
     except Exception as e:
@@ -3323,8 +3434,7 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     # written (checking after the first write reported "not saved" about a file that
     # had already changed).
     if keep_disabled and _chord_has_other_live_bind(
-            normalize_key_chord(old_key) if old_key else norm_key,
-            old_description, old_action):
+            norm_key, description, ""):
         return {"success": False,
                 "error": ("another binding of yours uses this shortcut, so the edit "
                           "would switch it off; remove it first or edit that row")}

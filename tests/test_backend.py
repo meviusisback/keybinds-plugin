@@ -6,6 +6,7 @@ import tempfile
 import threading
 import json
 import shutil
+import pathlib
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 import keybinds_manager
@@ -2408,6 +2409,84 @@ class TestRoundSeventeenUnreadableFiles(TestRoundTwelveRegressions):
         os.link(other, self.path)
         res = keybinds_manager.set_keybinding("SUPER + B", "B", "true")
         self.assertFalse(res["success"], res)
+
+
+class TestRoundEighteenCertification(unittest.TestCase):
+    """One predicate: a file that is not fully readable certifies nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = pathlib.Path(self.tmp)
+        (self.home / ".config" / "hypr").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for name in ("USER_BINDINGS_PATH", "MENU_CONFIG_PATH", "CACHE_DIR"):
+            pass
+        self._old = {}
+        for attr, value in (
+                ("USER_BINDINGS_PATH", self.home / ".config" / "hypr" / "bindings.lua"),
+                ("HOME", self.tmp)):
+            if attr == "HOME":
+                self._old[attr] = os.environ.get("HOME")
+                os.environ["HOME"] = value
+                continue
+            self._old[attr] = getattr(keybinds_manager, attr)
+            setattr(keybinds_manager, attr, value)
+            self.path = value
+
+    def tearDown(self):
+        for attr, value in self._old.items():
+            if attr == "HOME":
+                os.environ["HOME"] = value
+            else:
+                setattr(keybinds_manager, attr, value)
+
+    def write(self, text):
+        self.path.write_text(text, encoding="utf-8")
+
+    def test_alias_registration_is_unreadable(self):
+        self.write('local b = o.bind\nb("SUPER + Q", "hidden", "sneaky")\n'
+                   'hl.unbind("SUPER + Q")\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+        result = keybinds_manager.enable_keybinding("SUPER + Q")
+        self.assertFalse(result["success"])
+        self.assertIn('hl.unbind("SUPER + Q")', self.path.read_text(encoding="utf-8"))
+
+    def test_escaped_chord_is_unreadable(self):
+        self.write('hl.unbind("SUPER + Q")\no.bind("\\x53UPER + Q", "Custom", "true")\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + Q")["success"])
+
+    def test_an_unknown_registration_is_unreadable(self):
+        self.write('hl.something_new("SUPER + Q")\nhl.unbind("SUPER + Q")\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+
+    def test_a_chord_free_helper_certifies(self):
+        # hl.on/hl.config cannot put a binding on a key: they must not freeze the file.
+        self.write('hl.config({ gaps_in = 4 })\n'
+                   'hl.on("hyprland.start", function() hl.exec_cmd("nm-applet") end)\n'
+                   'o.bind("SUPER + F6", "Mine", "my-cmd")\n')
+        self.assertFalse(keybinds_manager._file_has_unreadable_binds())
+
+    def test_a_plain_file_certifies(self):
+        self.write('o.bind("SUPER + F6", "Mine", "my-cmd")\n'
+                   'o.bind("SUPER + F7", "Other", hl.dsp.window.close())\n')
+        self.assertFalse(keybinds_manager._file_has_unreadable_binds())
+
+    def test_a_keep_disabled_move_onto_an_occupied_chord_is_refused(self):
+        self.write('o.bind("SUPER + B", "MyBrowser", "omarchy-launch-browser")\n'
+                   'hl.unbind("PRINT")\n')
+        result = keybinds_manager.set_keybinding("SUPER + B", "Print", "", old_key="PRINT",
+                                        old_description="Print", keep_disabled=True)
+        self.assertFalse(result["success"])
+        body = self.path.read_text(encoding="utf-8")
+        self.assertIn("MyBrowser", body)
+
+    def test_a_keep_disabled_move_off_an_occupied_chord_is_allowed(self):
+        self.write('o.bind("SUPER + W", "A", "true")\no.bind("SUPER + W", "B", "false")\n'
+                   'hl.unbind("SUPER + W")\n')
+        result = keybinds_manager.set_keybinding("SUPER + F13", "A", "true", old_key="SUPER + W",
+                                        old_description="A", keep_disabled=True)
+        self.assertTrue(result["success"], result.get("error"))
 
 
 if __name__ == "__main__":

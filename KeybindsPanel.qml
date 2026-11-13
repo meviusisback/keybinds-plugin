@@ -1046,6 +1046,25 @@ Item {
                       }
                     }
 
+                    // Why the controls are hidden/missing, on the row itself: the
+                    // tooltip used to hang off the Enable button, which is hidden in
+                    // every state that sets a reason.
+                    Text {
+                      visible: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
+                      text: "ⓘ"
+                      textFormat: Text.PlainText
+                      color: root.urgent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      Layout.alignment: Qt.AlignVCenter
+                      MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        acceptedButtons: Qt.NoButton
+                        onEntered: root.showToast(activeRow.modelData.blocked_reason, true)
+                      }
+                    }
+
                     // Key Badge
                     KeyBadge {
                       Layout.alignment: Qt.AlignVCenter
@@ -1085,7 +1104,9 @@ Item {
                       Button {
                         visible: Boolean(activeRow.modelData && activeRow.modelData.can_reset)
                         iconText: "↺"
-                        tooltipText: "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
+                        tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
+                                     ? activeRow.modelData.blocked_reason
+                                     : "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key,
@@ -1100,8 +1121,10 @@ Item {
                                           && (activeRow.modelData.can_delete
                                               || activeRow.modelData.can_disable))
                         iconText: Boolean(activeRow.modelData && activeRow.modelData.can_delete) ? "🗑️" : "⊘"
-                        tooltipText: Boolean(activeRow.modelData && activeRow.modelData.can_delete)
-                                     ? "Delete custom binding" : "Disable binding"
+                        tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
+                                     ? activeRow.modelData.blocked_reason
+                                     : (Boolean(activeRow.modelData && activeRow.modelData.can_delete)
+                                        ? "Delete custom binding" : "Disable binding")
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: {
