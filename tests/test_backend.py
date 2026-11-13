@@ -1510,13 +1510,18 @@ class TestSecurityRegressions(unittest.TestCase):
         finally:
             self._unstub_set_keybinding()
 
-    def test_a_chord_without_a_keysym_is_refused(self):
+    def test_junk_chords_are_refused_but_a_lone_modifier_is_not(self):
+        # Omarchy itself ships modifier-only chords (o.bind_hold("ALT + Alt_R", ...))
+        # and switch keysyms with spaces and slashes, so those must pass; junk does not.
         self._stub_set_keybinding()
         try:
             self._write("")
-            for chord in ("SUPER", "SUPER + CTRL"):
+            for chord in ("", "-notakey", "   "):
                 res = keybinds_manager.set_keybinding(chord, "d", "true")
                 self.assertFalse(res["success"], (chord, res))
+            self.assertTrue(keybinds_manager._key_is_plausible("SUPER"))
+            self.assertTrue(keybinds_manager._key_is_plausible("switch:on:Apple SMC power/lid events"))
+            self.assertTrue(keybinds_manager._key_is_plausible("ALT + Alt_R"))
             self.assertEqual(self._read(), "")
         finally:
             self._unstub_set_keybinding()

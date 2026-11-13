@@ -1665,6 +1665,9 @@ Item {
         RowLayout {
           id: toastRow
           anchors.centerIn: parent
+          // Bound to the card so a long refusal really wraps instead of spilling
+          // past the clamped width and being cut at the window edge.
+          width: toastCard.width - Style.space(32)
           spacing: Style.space(10)
 
           Text {

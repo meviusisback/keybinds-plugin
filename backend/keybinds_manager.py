@@ -53,6 +53,47 @@ def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _lua_ast_balanced(expr: str) -> bool:
+    """Cheap bracket/quote balance check (the luac gate is the real parser)."""
+    depth = 0
+    quote = None
+    long_close = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if long_close:
+            if expr.startswith(long_close, i):
+                i += len(long_close)
+                long_close = None
+                continue
+            i += 1
+            continue
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "[":
+            m = re.match(r"\[(=*)\[", expr[i:])
+            if m:
+                long_close = "]" + m.group(1) + "]"
+                i += len(m.group(0))
+                continue
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0 and quote is None and long_close is None
+
+
 def _lua_single_expression_problem(expr: str) -> str:
     """Return why ``expr`` cannot be one Lua expression, or "" when it can.
 
@@ -67,6 +108,13 @@ def _lua_single_expression_problem(expr: str) -> str:
     """
     if "\n" in expr or "\r" in expr:
         return "newlines are not allowed in a raw dispatcher"
+    if re.match(r"^function\s*\(", expr):
+        # A function body is a value: it closes with `end`, not at the end of a
+        # call, so the shape check cannot see it as a trailing expression. Its
+        # internals are the compile gate's job (luac rejects what does not parse).
+        if not re.search(r"\bend\s*$", expr):
+            return "a function action must end with 'end'"
+        return ""
     # Control bytes cannot appear in Lua source: ESC/BEL/DEL produced text luac
     # rejects, i.e. a bindings.lua Hyprland drops entire, reported as saved.
     bad = [ch for ch in expr if (ord(ch) < 32 and ch not in "\t\v\f") or ord(ch) == 127]
@@ -154,12 +202,14 @@ def _key_is_plausible(norm_key: str) -> bool:
     for part in parts[:-1]:
         if part.upper() not in _MODIFIER_NAMES:
             return False
-    if parts[-1].upper() in _MODIFIER_NAMES:
-        return False  # "SUPER" / "SUPER + CTRL" binds nothing
-    # A keysym may contain spaces (switch:on:Lid Switch, shipped by Omarchy) but not
-    # the characters that could break the Lua literal.
-    return (re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.: -]*", parts[-1]) is not None
-            and not re.search(r"['\"\\()\n\r]", parts[-1]))
+    # A keysym may contain spaces and slashes (switch:on:Lid Switch,
+    # switch:on:Apple SMC power/lid events, both shipped by Omarchy). Only what can
+    # end the Lua literal is refused, plus a leading dash (a chord that binds
+    # nothing and would be reported as saved).
+    if parts[-1].startswith("-"):
+        return False
+    return (len(parts[-1]) <= MAX_KEY_LEN
+            and not re.search(r"[\"\']|\\\\|[()\x00-\x1f\x7f]", parts[-1]))
 
 
 _NESTED_BIND_RE = re.compile(r"^\s*o\s*\.\s*bind(?:_toggle)?\s*\(")
@@ -320,7 +370,7 @@ def _unit_is_single_statement(text: str) -> bool:
 
 
 _BIND_HEAD_RE = re.compile(
-    r'o\s*\.\s*bind(?:_toggle)?\s*\(|o\s*\[\s*["\']bind(?:_toggle)?["\']\s*\]\s*\(')
+    r'o\s*\.\s*bind(?:_toggle|_hold)?\s*\(|o\s*\[\s*["\']bind(?:_toggle|_hold)?["\']\s*\]\s*\(')
 
 
 def _bind_head(text: str):
@@ -368,10 +418,13 @@ def _read_lua_string(text: str, pos: int):
 
 
 def _bind_fn(text: str) -> str:
-    """``o.bind_toggle`` or ``o.bind`` for a bind statement (default ``o.bind``)."""
+    """The call the statement uses: o.bind, o.bind_toggle or o.bind_hold."""
     m = _BIND_HEAD_RE.match((text or "").lstrip())
-    if m and "toggle" in m.group(0):
+    head = m.group(0) if m else ""
+    if "toggle" in head:
         return "o.bind_toggle"
+    if "hold" in head:
+        return "o.bind_hold"
     return "o.bind"
 
 
@@ -411,6 +464,7 @@ def _parse_bind_line(line: str):
 
     depth_paren = 0
     depth_brace = 0
+    fn_depth = 0
     in_string = None
     escape_next = False
     action_start = pos
@@ -451,6 +505,16 @@ def _parse_bind_line(line: str):
             pos += len(close) if pos < len(line) else 0
             continue
 
+        if line.startswith("function", pos) and not (pos and (line[pos - 1].isalnum() or line[pos - 1] in "_.:")):
+            fn_depth += 1
+            pos += len("function")
+            continue
+        if line.startswith("end", pos) and fn_depth and not (pos and (line[pos - 1].isalnum() or line[pos - 1] == "_")):
+            nxt = line[pos + 3:pos + 4]
+            if not (nxt.isalnum() or nxt == "_"):
+                fn_depth -= 1
+                pos += 3
+                continue
         if ch == '(':
             depth_paren += 1
         elif ch == ')':
@@ -462,7 +526,7 @@ def _parse_bind_line(line: str):
             depth_brace += 1
         elif ch == '}':
             depth_brace -= 1
-        elif ch == ',' and depth_paren == 0 and depth_brace == 0:
+        elif ch == ',' and depth_paren == 0 and depth_brace == 0 and fn_depth == 0:
             break  # separator before opts
 
         pos += 1
@@ -1585,7 +1649,7 @@ def build_complete_model():
     user_state = parse_user_bindings()
 
     rebound_defaults_map = {}
-    matched_user_bind_keys = set()
+    matched_user_bind_keys = set()  # row identities (see the step-2 skip)
 
     for ub in user_state["binds"]:
         # A default counts as MOVED only when it is really gone from Hyprland: its
@@ -1629,7 +1693,9 @@ def build_complete_model():
             item["default_key"] = k
             item["default_action"] = d["action"]
             all_active.append(item)
-            matched_user_bind_keys.add(k)
+            # Only THIS row is consumed: another user binding on the same chord is a
+            # real binding (and a real conflict) and must stay in the list.
+            same_key_user_bind["_consumed_by_default"] = True
             continue
 
         if k in user_state["unbinds"]:
@@ -1646,7 +1712,7 @@ def build_complete_model():
 
     # 2. Append custom user bindings
     for ub in user_state["binds"]:
-        if ub["key"] in matched_user_bind_keys:
+        if ub.get("_consumed_by_default") or ub["key"] in matched_user_bind_keys:
             continue
         item = dict(ub)
         item["status"] = "custom"
@@ -2148,22 +2214,34 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # `command`: the command can be an untrusted .desktop Exec, and
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
-            fn_name = "o.bind_toggle" if entry.get("fn_name") == "o.bind_toggle" else "o.bind"
+            fn_name = entry.get("fn_name") if entry.get("fn_name") in (
+                "o.bind", "o.bind_toggle", "o.bind_hold") else "o.bind"
             if fn_name == "o.bind_toggle" and not entry.get("action_literal"):
                 # o.bind_toggle prepends "omarchy-toggle-" to its third argument:
                 # a NEW command is not a toggle name, so it goes through o.bind.
                 fn_name = "o.bind"
+            if fn_name == "o.bind_hold" and not entry.get("action_literal"):
+                raise ValueError(
+                    "this is a hold binding (press and release actions): its command "
+                    "cannot be changed here; edit ~/.config/hypr/bindings.lua")
             opts_part = ""
             opts_literal = (entry.get("opts_literal") or "").strip()
             if opts_literal:
                 # o.bind's fourth argument (locked/repeating/non_consuming) decides
                 # how the key behaves; dropping it reported "saved" while the key
-                # stopped repeating.
-                problem = _lua_single_expression_problem(opts_literal)
-                if problem or not opts_literal.startswith("{"):
-                    raise ValueError(
-                        "refusing to rewrite this binding: its options table cannot "
-                        "be validated (" + (problem or "not a table") + ")")
+                # stopped repeating. A bind_hold row's tail is longer (stop
+                # description, stop command, opts) and is kept verbatim.
+                if fn_name == "o.bind_hold":
+                    if not _lua_ast_balanced(opts_literal):
+                        raise ValueError(
+                            "refusing to rewrite this hold binding: its arguments do "
+                            "not balance")
+                else:
+                    problem = _lua_single_expression_problem(opts_literal)
+                    if problem or not opts_literal.startswith("{"):
+                        raise ValueError(
+                            "refusing to rewrite this binding: its options table cannot "
+                            "be validated (" + (problem or "not a table") + ")")
                 opts_part = ", " + opts_literal
 
             if _is_raw_dispatcher(action):
@@ -2197,6 +2275,12 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 if cmd:
                     value = _plain_value(cmd)
                 elif action:
+                    stripped_action = action.strip()
+                    if (stripped_action[:1] in "\"'" or stripped_action.startswith("[")) \
+                            and _pure_literal(stripped_action) is None:
+                        raise ValueError(
+                            "that value starts like a Lua string but continues past "
+                            "it; pass the command as a plain string")
                     value = _identity_value(action)
                 else:
                     value = ""
@@ -2277,17 +2361,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         for _unit, text, is_comment in _lua_units(new_lines):
             if is_comment or not text:
                 continue
-            start = 0
-            while start < len(text):
-                head = _bind_head(text[start:])
-                if not head:
-                    break
-                parsed = _parse_bind_line(text[start + head.start():])
-                if parsed:
-                    key_here = normalize_key_chord(parsed[0])
-                    if key_here in absent_targets:
-                        still_there.append(key_here)
-                start += head.end()
+            # Independent of the bind-name list: any o.<method>("<chord>", ...
+            # registration counts, including forms this writer does not emit
+            # (o.bind_hold is shipped by Omarchy itself).
+            for m_any in re.finditer(r'\bo\s*[.:]\s*\w+\s*\(', text):
+                if not _search_in_code(re.escape(m_any.group(0)), text):
+                    continue
+                _k, _e, _ok = _read_lua_string(text, m_any.end())
+                if _ok and _k and normalize_key_chord(_k) in absent_targets:
+                    still_there.append(normalize_key_chord(_k))
         if still_there:
             raise ValueError(
                 "could not remove the binding for " + ", ".join(sorted(set(still_there))) +
@@ -2513,6 +2595,9 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                         and _pure_literal(row.get("action")) is not None
                         and _identity_value(row.get("action")) == _plain_value(command)):
                     bind_entry["action_literal"] = row.get("action")
+                if row.get("fn") == "o.bind_hold" and bind_entry.get("fn_name") == "o.bind_hold":
+                    # The stop-action tail belongs to the row: keep it byte-identical.
+                    bind_entry["opts_literal"] = row.get("opts") or ""
                 break
     binds = [bind_entry]
 
