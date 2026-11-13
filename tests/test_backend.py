@@ -1664,3 +1664,114 @@ class TestSecurityRegressions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestRoundNineRegressions(unittest.TestCase):
+    """Ninth reviewer round: function dispatchers, keysyms and mouse rows."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self._saved = {
+            "HOME": os.environ.get("HOME"),
+            "UBP": keybinds_manager.USER_BINDINGS_PATH,
+            "run": keybinds_manager.subprocess.run,
+        }
+        os.environ["HOME"] = self.home
+        os.makedirs(os.path.join(self.home, ".config", "hypr"), exist_ok=True)
+        self.path = os.path.join(self.home, ".config", "hypr", "bindings.lua")
+        keybinds_manager.USER_BINDINGS_PATH = self.path
+        keybinds_manager.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout="", stderr="")
+
+    def tearDown(self):
+        keybinds_manager.USER_BINDINGS_PATH = self._saved["UBP"]
+        keybinds_manager.subprocess.run = self._saved["run"]
+        if self._saved["HOME"] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved["HOME"]
+        self._tmp.cleanup()
+
+    def _file(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def test_a_function_that_closes_its_call_early_is_refused(self):
+        problem = keybinds_manager._lua_single_expression_problem(
+            'function() end) os.execute("touch pwned") -- end')
+        self.assertTrue(problem)
+
+    def test_a_well_shaped_function_is_accepted(self):
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            "function() hl.dsp.exec(\"kitty\") end"), "")
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            "function() if x then return 1 end end"), "")
+
+    def test_a_function_branch_keeps_the_control_byte_and_length_rules(self):
+        self.assertIn("control", keybinds_manager._lua_single_expression_problem(
+            'function() return "\x1b]0;pwn\x07" end'))
+        long_expr = "function() hl.dsp.exec(\"" + "a" * 2100 + "\") end"
+        self.assertIn("2000", keybinds_manager._lua_single_expression_problem(long_expr))
+
+    def test_a_side_keysym_survives_normalisation(self):
+        # Omarchy ships push-to-talk as o.bind_hold("ALT + Alt_R", ...). Folding
+        # Alt_R into the ALT modifier made the chord keysym-less, so an edit
+        # rewrote the shortcut and 'disable' reported a live key as off.
+        for raw in ("ALT + Alt_R", "SUPER + SUPER_L", "CTRL + CONTROL_R"):
+            norm = keybinds_manager.normalize_key_chord(raw)
+            self.assertTrue(keybinds_manager._key_is_plausible(norm), norm)
+            self.assertTrue(norm.split(" + ")[-1] != norm.split(" + ")[0]
+                            or len(norm.split(" + ")) > 1, norm)
+
+    def test_a_hold_tail_with_a_call_is_refused(self):
+        line = ('o.bind_hold("SUPER + F6", "d", "cmd", "stop d", os.execute("id"), '
+                '{ locked = true })')
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(line + "\n")
+        entry = keybinds_manager.parse_user_bindings()["binds"][0]
+        res = keybinds_manager.set_keybinding(
+            entry["key"], "d", "", entry["action"], entry["raw_key"],
+            old_description=entry["description"], old_action=entry["action"])
+        self.assertFalse(res["success"])
+
+    def test_a_relative_omarchy_path_is_ignored(self):
+        saved = os.environ.get("OMARCHY_PATH")
+        try:
+            os.environ["OMARCHY_PATH"] = "evil/relative"
+            self.assertEqual(keybinds_manager._omarchy_root(), "/usr/share/omarchy")
+            os.environ["OMARCHY_PATH"] = "/nonexistent/omarchy"
+            self.assertEqual(keybinds_manager._omarchy_root(), "/usr/share/omarchy")
+        finally:
+            if saved is None:
+                os.environ.pop("OMARCHY_PATH", None)
+            else:
+                os.environ["OMARCHY_PATH"] = saved
+
+    def test_a_semicolon_in_a_chord_is_refused(self):
+        self.assertFalse(keybinds_manager._key_is_plausible("SUPER + A;B"))
+
+    def test_a_save_keeps_the_file_mode(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('o.bind("SUPER + Q", "Q", "true")\n')
+        os.chmod(self.path, 0o644)
+        res = keybinds_manager.set_keybinding("SUPER + Q", "Q2", "true")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+
+    def test_a_mouse_binding_saved_shows_as_modified_not_disabled(self):
+        defaults = [b for b in keybinds_manager.parse_default_bindings() if b["is_mouse"]]
+        if not defaults:
+            self.skipTest("no shipped mouse bindings on this machine")
+        d = defaults[0]
+        res = keybinds_manager.set_keybinding(
+            d["key"], "Drag window (mine)", "", d["action"], d["raw_key"],
+            old_description=d["description"], old_action=d["action"])
+        self.assertTrue(res["success"], res)
+        model = keybinds_manager.build_complete_model()
+        active = model["active"] if isinstance(model, dict) else model
+        rows = [r for r in active if r["key"] == d["key"]]
+        self.assertTrue(rows)
+        self.assertNotIn("disabled", [r["status"] for r in rows])

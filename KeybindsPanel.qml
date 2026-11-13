@@ -46,10 +46,12 @@ Item {
   readonly property var categories: [
     "All",
     "Window Management",
-    "Workspaces",
     "Menus & System",
     "Applications",
-    "Media & Audio"
+    "Media & Audio",
+    "Clipboard",
+    "AI & Voice",
+    "General"
   ]
 
   function open(payloadJson) {
@@ -1106,6 +1108,10 @@ Item {
                     text: root.searchQuery.length > 0
                       ? ("No keybinding found for \"" + root.searchQuery + "\"")
                       : "No keybindings match your filter."
+                    // Omarchy creates its workspace, group and bar-panel shortcuts
+                    // inside Lua loops, which a static reader cannot see: saying so
+                    // here stops "my workspace keys are missing" being read as a bug.
+                    wrapMode: Text.WordWrap
                     textFormat: Text.PlainText
                     color: root.foreground
                     font.family: Style.font.family
@@ -1117,7 +1123,8 @@ Item {
                   Text {
                     textFormat: Text.PlainText
                     visible: root.searchQuery.length > 0
-                    text: "This shortcut combination is currently free and unassigned."
+                    text: "Shortcuts Omarchy builds in a loop (workspaces, groups, "
+                          + "bar panels) are not listed; they live in its own files."
                     color: Util.alpha(root.foreground, 0.6)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption

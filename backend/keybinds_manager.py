@@ -17,7 +17,28 @@ import tempfile
 import stat
 import configparser
 
-DEFAULT_BINDINGS_DIR = os.environ.get("OMARCHY_PATH", "/usr/share/omarchy") + "/default/hypr/bindings"
+def _hyprctl() -> str:
+    """Absolute path to hyprctl: a writable PATH entry must not choose the binary."""
+    return shutil.which("hyprctl") or "hyprctl"
+
+
+def _omarchy_root() -> str:
+    """The Omarchy install we read defaults from.
+
+    OMARCHY_PATH is honoured only when it is absolute and the bindings directory
+    really exists: the environment of whoever spawns the backend must not be able
+    to point every default-binding read (whose rows are copied into edits) at an
+    arbitrary tree.
+    """
+    cand = os.environ.get("OMARCHY_PATH", "")
+    if cand and os.path.isabs(cand):
+        if os.path.isdir(os.path.join(cand, "default", "hypr", "bindings")):
+            return cand
+    return "/usr/share/omarchy"
+
+
+OMARCHY_ROOT = _omarchy_root()
+DEFAULT_BINDINGS_DIR = OMARCHY_ROOT + "/default/hypr/bindings"
 USER_BINDINGS_PATH = os.path.expanduser("~/.config/hypr/bindings.lua")
 CACHE_DIR = os.path.expanduser("~/.cache/omarchy")
 
@@ -51,6 +72,50 @@ def sanitize_lua_str(s: str, max_len: int = MAX_TEXT_LEN) -> str:
     if len(s) > max_len:
         s = s[:max_len]
     return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _hold_tail_is_shaped(tail: str) -> bool:
+    """True when a hold tail is exactly: string, string, table.
+
+    o.bind_hold's 4th-6th arguments are the stop description, the stop command and
+    the options. Balance alone accepted ``"stop d", os.execute("id"), { locked =
+    true }`` and wrote it verbatim - a call evaluated when Hyprland loads the file.
+    """
+    text = (tail or "").strip()
+    parts = []
+    i = 0
+    depth = 0
+    quote = None
+    start = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    parts.append(text[start:].strip())
+    if len(parts) != 3 or any(not part for part in parts):
+        return False
+    lit = [parts[0], parts[1]]
+    for part in lit:
+        _v, end, ok = _read_lua_string(part, 0)
+        if not ok or end != len(part):
+            return False
+    return parts[2].startswith("{") and parts[2].endswith("}") and _lua_ast_balanced(parts[2])
 
 
 def _lua_ast_balanced(expr: str) -> bool:
@@ -94,6 +159,58 @@ def _lua_ast_balanced(expr: str) -> bool:
     return depth == 0 and quote is None and long_close is None
 
 
+def _lua_function_problem(expr: str) -> str:
+    """Return why ``function ... end`` cannot be one safe Lua value.
+
+    ``function() end) os.execute("id") -- end`` used to pass with a bare
+    end-anchored regex: the first ``end`` closed o.bind early, the injected call
+    became a top-level statement and the trailing comment hid the orphan paren, so
+    loading bindings.lua ran it. The proof here is structural - the outermost
+    ``function`` must still be open at the final token, which must be its own
+    ``end`` - and it refuses comments, unbalanced brackets and a second statement.
+    """
+    masked = _code_mask(expr)
+    code = "".join(ch if masked[i] else " " for i, ch in enumerate(expr))
+    if "--" in code:
+        return "comments are not allowed in a raw dispatcher"
+    if ";" in code:
+        return "a raw dispatcher may not contain ';'"
+    tokens = [m for m in re.finditer(r"[A-Za-z_]\w*|[()\[\]{}]|.", code)]
+    brackets = []
+    stack = []
+    opened = 0
+    last = None
+    for m in tokens:
+        tok = m.group(0)
+        if not tok.strip():
+            continue
+        if tok in "([{":
+            brackets.append(tok)
+        elif tok in ")]}":
+            want = {")": "(", "]": "[", "}": "{"}[tok]
+            if not brackets or brackets.pop() != want:
+                return "a raw dispatcher must keep its brackets balanced"
+        elif tok == "function":
+            opened += 1
+            stack.append("function")
+        elif tok == "end":
+            if not stack:
+                return "a raw dispatcher may not close an 'end' it did not open"
+            stack.pop()
+        elif tok == "do" or tok == "then":
+            stack.append(tok)
+        last = tok
+    if brackets:
+        return "a raw dispatcher must keep its brackets balanced"
+    if opened == 0:
+        return "a function action must start with 'function'"
+    if stack:
+        return "a function action must close with 'end'"
+    if last != "end":
+        return "a function action must end with 'end'"
+    return ""
+
+
 def _lua_single_expression_problem(expr: str) -> str:
     """Return why ``expr`` cannot be one Lua expression, or "" when it can.
 
@@ -108,13 +225,6 @@ def _lua_single_expression_problem(expr: str) -> str:
     """
     if "\n" in expr or "\r" in expr:
         return "newlines are not allowed in a raw dispatcher"
-    if re.match(r"^function\s*\(", expr):
-        # A function body is a value: it closes with `end`, not at the end of a
-        # call, so the shape check cannot see it as a trailing expression. Its
-        # internals are the compile gate's job (luac rejects what does not parse).
-        if not re.search(r"\bend\s*$", expr):
-            return "a function action must end with 'end'"
-        return ""
     # Control bytes cannot appear in Lua source: ESC/BEL/DEL produced text luac
     # rejects, i.e. a bindings.lua Hyprland drops entire, reported as saved.
     bad = [ch for ch in expr if (ord(ch) < 32 and ch not in "\t\v\f") or ord(ch) == 127]
@@ -122,6 +232,8 @@ def _lua_single_expression_problem(expr: str) -> str:
         return "control characters are not allowed in a raw dispatcher"
     if len(expr) > MAX_CMD_LEN:
         return f"a raw dispatcher may not exceed {MAX_CMD_LEN} characters"
+    if re.match(r"^function\b", expr):
+        return _lua_function_problem(expr)
     closers = {")": "(", "]": "[", "}": "{"}
     depth = []
     quote = None
@@ -209,10 +321,7 @@ def _key_is_plausible(norm_key: str) -> bool:
     if parts[-1].startswith("-"):
         return False
     return (len(parts[-1]) <= MAX_KEY_LEN
-            and not re.search(r"[\"\']|\\\\|[()\x00-\x1f\x7f]", parts[-1]))
-
-
-_NESTED_BIND_RE = re.compile(r"^\s*o\s*\.\s*bind(?:_toggle)?\s*\(")
+            and not re.search(r"[\"\']|\\\\|[();\x00-\x1f\x7f]", parts[-1]))
 
 
 def _registers_a_binding(action: str) -> bool:
@@ -1393,8 +1502,17 @@ def normalize_key_chord(key_chord: str) -> str:
     mods = []
     main_key = ""
 
-    for part in raw_parts:
+    for idx, part in enumerate(raw_parts):
         upper = part.upper()
+        # "ALT + Alt_R" means Right-Alt on its own (Omarchy ships it for
+        # push-to-talk). Folding Alt_R into the ALT modifier turned the chord into
+        # the keysym-less "ALT": an edit rewrote the shortcut and 'disable'
+        # reported a still-bound key as off.
+        if idx == len(raw_parts) - 1 and upper in (
+                "SUPER_L", "SUPER_R", "ALT_L", "ALT_R", "SHIFT_L", "SHIFT_R",
+                "CONTROL_L", "CONTROL_R"):
+            main_key = upper
+            continue
         if upper in ("SUPER", "WIN", "LOGO", "SUPER_L", "SUPER_R", "META", "MOD4"):
             if "SUPER" not in mods:
                 mods.append("SUPER")
@@ -1459,7 +1577,7 @@ def get_mouse_scroll_settings():
     """Retrieve active Hyprland mouse scroll configuration (scroll_factor & natural_scroll)."""
     settings = {"natural_scroll": False, "scroll_factor": 1.0}
     try:
-        res = subprocess.run(["hyprctl", "getoption", "input:scroll_factor", "-j"], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([_hyprctl()] + ["hyprctl", "getoption", "input:scroll_factor", "-j"][1:], capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
             if "float" in data:
@@ -1468,7 +1586,7 @@ def get_mouse_scroll_settings():
         pass
 
     try:
-        res = subprocess.run(["hyprctl", "getoption", "input:natural_scroll", "-j"], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([_hyprctl()] + ["hyprctl", "getoption", "input:natural_scroll", "-j"][1:], capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
             if "bool" in data:
@@ -1635,8 +1753,10 @@ def parse_user_bindings():
 
             if entry["is_mouse"]:
                 result["mouse_binds"].append(entry)
-            else:
-                result["binds"].append(entry)
+            # A mouse binding is still a user binding: it must be matched to the
+            # default row it overrides. Kept only in mouse_binds, saving one made
+            # its default row read "disabled" and the panel's Enable then deleted it.
+            result["binds"].append(entry)
 
     return result
 
@@ -1649,6 +1769,7 @@ def build_complete_model():
     user_state = parse_user_bindings()
 
     rebound_defaults_map = {}
+    _emitted_rebound = set()
     matched_user_bind_keys = set()  # row identities (see the step-2 skip)
 
     for ub in user_state["binds"]:
@@ -1677,6 +1798,12 @@ def build_complete_model():
 
         if k in rebound_defaults_map:
             ub = rebound_defaults_map[k]
+            if k in _emitted_rebound:
+                # Two shipped defaults on one chord (ALT+TAB cycle_next and
+                # bring_to_top): the moved bind is listed once, not twice with a
+                # phantom conflict against itself.
+                continue
+            _emitted_rebound.add(k)
             item = dict(ub)
             item["status"] = "modified"
             item["category"] = d.get("category", "Custom")
@@ -2236,6 +2363,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                         raise ValueError(
                             "refusing to rewrite this hold binding: its arguments do "
                             "not balance")
+                    if not _hold_tail_is_shaped(opts_literal):
+                        raise ValueError(
+                            "refusing to rewrite this hold binding: its stop action "
+                            "and options must be a string and a table")
                 else:
                     problem = _lua_single_expression_problem(opts_literal)
                     if problem or not opts_literal.startswith("{"):
@@ -2434,6 +2565,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     fd, temp_file = tempfile.mkstemp(dir=target_dir, prefix=".bindings_", suffix=".tmp")
     try:
+        if exists:
+            try:
+                os.fchmod(fd, stat.S_IMODE(os.stat(resolved_path).st_mode))
+            except OSError:
+                pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(bom + newline.join(final_output) + newline)
             f.flush()
@@ -2454,8 +2590,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 def reload_hyprland():
     """Reload Hyprland configuration and check for errors."""
     try:
-        res = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=10)
-        err_res = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([_hyprctl()] + ["hyprctl", "reload"][1:], capture_output=True, text=True, timeout=10)
+        err_res = subprocess.run([_hyprctl()] + ["hyprctl", "configerrors"][1:], capture_output=True, text=True, timeout=10)
         errors = err_res.stdout.strip() if err_res.returncode == 0 else ""
         # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
         # it drops every user override in it. A save that leaves errors behind is

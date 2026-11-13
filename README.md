@@ -2,6 +2,8 @@
 
 # Keybindings
 
+Version 1.0.6
+
 **A graphical frontend for Omarchy keybindings: view, search, modify and create Hyprland shortcuts with live key recording, smart free-key recommendations, collision detection and safe Lua sync.**
 
 [![License: MIT](https://img.shields.io/github/license/meviusisback/keybinds-plugin)](LICENSE)
@@ -14,7 +16,7 @@
 
 ## Why
 
-Editing Hyprland keybindings by hand means memorizing chords, guessing free combinations and hoping your Lua still parses. This plugin replaces that loop with a visual manager: see every binding sorted and searchable, record a new chord by pressing it, get told about collisions before they bite, and let the plugin write `bindings.lua` safely — with a backup every time and a live reload, no session restart.
+Editing Hyprland keybindings by hand means memorizing chords, guessing free combinations and hoping your Lua still parses. This plugin replaces that loop with a visual manager: see every binding sorted and searchable (Omarchy builds its workspace, group and bar-panel shortcuts inside Lua loops, which a static reader cannot see, so those are not listed), record a new chord by pressing it, get told about collisions before they bite, and let the plugin write `bindings.lua` safely — with a backup every time and a live reload, no session restart.
 
 ## Features
 
@@ -99,14 +101,14 @@ omarchy-keybinds reload
 
 The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
-- **Custom / rebound keybindings** — generated with `o.bind(...)` directives (or `o.bind_toggle(...)` for a toggle row, whose third argument stays the toggle name).
+- **Custom / rebound keybindings** — generated with `o.bind(...)` directives (or `o.bind_toggle(...)` for a toggle row, whose third argument stays the toggle name, and `o.bind_hold(...)` for a push-to-talk row, whose stop action and options are kept as written).
 - **Disabled keybindings** — generated with `hl.unbind(...)` directives.
 - **Safety backups** — the previous content is copied to `bindings.lua.bak` (beside the resolved target, so symlinked dotfiles work) before every rewrite; the very first write, when there is no file yet, has nothing to back up.
 - **Comment preservation** — personal comments and manual custom blocks in `bindings.lua` are preserved.
 
 ## How it works
 
-The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and every plain command is escaped into a Lua string. Raw Lua dispatchers (`hl.*`, `o.*` helper calls such as `o.launch_terminal()`, and `{...}` tables) are inserted only from the dispatcher slot — the built-in catalog presets and the binding being edited — and each one is checked before it is written (one balanced call or table: no newlines, comments, trailing escape, second statement, and no longer than the command limit). Text typed into the command field is only ever written as a literal command — a value that looks like raw Lua is refused with an error instead of becoming code, so an application's `.desktop` `Exec` cannot either. A write that cannot be completed is refused and reported as such, never as saved. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin adds its own Keybindings Manager launcher entry to; because it is JSONC, the file is re-serialised on that change, so its comments and hand-formatting are lost) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
+The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and every plain command is escaped into a Lua string. Raw Lua dispatchers (`hl.*`, `o.*` helper calls such as `o.launch_terminal()`, and `{...}` tables) are inserted only from the dispatcher slot — the built-in catalog presets and the binding being edited — and each one is checked before it is written (one balanced call, table, or `function ... end` whose body closes exactly at the end: no newlines, comments, trailing escape, second statement, control bytes, or more than the command limit). Text typed into the command field is only ever written as a literal command — a value that looks like raw Lua is refused with an error instead of becoming code, so an application's `.desktop` `Exec` cannot either. A write that cannot be completed is refused and reported as such, never as saved. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin adds its own Keybindings Manager launcher entry to; because it is JSONC, the file is re-serialised on that change, so its comments and hand-formatting are lost) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
 Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 111 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents, bounded reads, in-place edits on a shared chord and the guards that must fail closed.
 
