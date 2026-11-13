@@ -305,7 +305,9 @@ Item {
     var res = []
     for (var i = 0; i < list.length; i++) {
       var item = list[i]
-      if (item.status !== "modified" && item.status !== "custom") continue
+      // A disabled override belongs here too: Enable alone left it with no way to
+      // be reset or deleted from the section that lists personal shortcuts.
+      if (item.status !== "modified" && item.status !== "custom" && !item.disabled_row) continue
       if (cat !== "All" && item.category !== cat) continue
 
       if (q.length > 0) {
@@ -879,7 +881,10 @@ Item {
             target: scrollArea.contentItem
             acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
             onWheel: function(event) {
-              var factor = (root.modelData.mouse_settings && root.modelData.mouse_settings.scroll_factor) || 1.0
+              // `available` is false when hyprctl did not answer: applying 1.0 then
+              // would present a default as if it had been read.
+              var ms = root.modelData.mouse_settings || {}
+              var factor = (ms.available !== false && ms.scroll_factor) ? ms.scroll_factor : 1.0
 
               var dy = event.angleDelta.y
               if (dy === 0) dy = event.pixelDelta.y
@@ -1078,27 +1083,34 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key,
-                                            (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                                            (activeRow.modelData.description_raw !== undefined)
                                         ? activeRow.modelData.description_raw
                                         : activeRow.modelData.description, activeRow.modelData.action)
                       }
 
                       // Disable / Delete
                       Button {
-                        visible: Boolean(activeRow.modelData && activeRow.modelData.status !== "disabled")
-                        iconText: (activeRow.modelData && activeRow.modelData.status === "custom") ? "🗑️" : "⊘"
+                        visible: Boolean(activeRow.modelData
+                                          && (activeRow.modelData.status !== "disabled"
+                                              || activeRow.modelData.status === "custom"))
+                        iconText: (activeRow.modelData
+                                   && (activeRow.modelData.status === "custom"
+                                       || (activeRow.modelData.disabled_row
+                                           && !activeRow.modelData.default_key))) ? "🗑️" : "⊘"
                         tooltipText: (activeRow.modelData && activeRow.modelData.status === "custom") ? "Delete custom binding" : "Disable default binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: {
-                          if (activeRow.modelData.status === "custom") {
+                          if (activeRow.modelData.status === "custom"
+                              || (activeRow.modelData.disabled_row
+                                  && !activeRow.modelData.default_key)) {
                             root.resetKeybinding(activeRow.modelData.key, "",
-                              (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                              (activeRow.modelData.description_raw !== undefined)
                                         ? activeRow.modelData.description_raw
                                         : activeRow.modelData.description, activeRow.modelData.action)
                           } else {
                             root.disableKeybinding(activeRow.modelData.key,
-                                 (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                                 (activeRow.modelData.description_raw !== undefined)
                                         ? activeRow.modelData.description_raw
                                         : activeRow.modelData.description, activeRow.modelData.action)
                           }
@@ -1300,7 +1312,7 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key,
-                                            (modRow.modelData.description_raw !== undefined && modRow.modelData.description_raw !== "")
+                                            (modRow.modelData.description_raw !== undefined)
                                         ? modRow.modelData.description_raw
                                         : modRow.modelData.description, modRow.modelData.action)
                       }
@@ -1312,7 +1324,7 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, "",
-                              (modRow.modelData.description_raw !== undefined && modRow.modelData.description_raw !== "")
+                              (modRow.modelData.description_raw !== undefined)
                                         ? modRow.modelData.description_raw
                                         : modRow.modelData.description, modRow.modelData.action)
                       }

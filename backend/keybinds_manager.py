@@ -139,11 +139,29 @@ def _hold_tail_is_shaped(tail: str) -> bool:
     table = parts[2]
     if not (table.startswith("{") and table.endswith("}") and _lua_ast_balanced(table)):
         return False
+    return _table_carries_no_code(table)
+
+
+def _table_carries_no_code(table: str) -> bool:
+    """True when an options table only holds literals.
+
+    A call runs when Hyprland loads the file: `{ locked = true, os.execute("id") }`
+    passed the old shape check, and `os.execute"id"` / `os.execute[[id]]` passed the
+    round-12 one (no parentheses). Only keys, `=`, `,`, numbers, strings, `true`,
+    `false` and `nil` may appear.
+    """
     masked = _code_mask(table)
     code = "".join(ch if masked[i] else " " for i, ch in enumerate(table))
-    # A call inside the options table runs at load: `{ locked = true,
-    # os.execute("id") }` passed the old shape check and was re-emitted verbatim.
-    return "(" not in code and "--" not in code and ";" not in code
+    if any(ch in code for ch in "()--;"):
+        return False
+    # A name is a KEY only when it is followed by `=`, `,` or the closing brace. A
+    # name followed by a dot, a colon or a literal is a call without parentheses
+    # (`os.execute"id"`), which runs at load.
+    for m in re.finditer(r"[A-Za-z_][\w]*", code):
+        rest = code[m.end():].lstrip()
+        if rest[:1] not in ("=", ",", "}"):
+            return False
+    return True
 
 
 def _lua_ast_balanced(expr: str) -> bool:
@@ -209,6 +227,8 @@ def _lua_function_problem(expr: str) -> str:
     opened = 0
     last = None
     pending_elseif = False
+    pending_if = False
+    prev_kw = ""
     end_offset = -1
     for m in re.finditer(r"[A-Za-z_]\w*|[()\[\]{}]|.", code):
         tok = m.group(0)
@@ -240,14 +260,23 @@ def _lua_function_problem(expr: str) -> str:
                 return "a raw dispatcher may not close an 'until' it did not open"
             stack.pop()
         elif tok == "then":
-            # `elseif ... then` closes with the same `end` as its `if`.
+            # `elseif ... then` closes with the same `end` as its `if`; a `then`
+            # with no `if`/`elseif` before it is not Lua at all (`function() then
+            # end end` used to pass and needed luac to catch it).
+            if not pending_elseif and not pending_if:
+                return "a 'then' without an 'if' is not valid Lua"
             if not pending_elseif:
                 stack.append(tok)
             pending_elseif = False
+            pending_if = False
         if tok == "elseif":
             pending_elseif = True
+            pending_if = True
         elif tok == "if":
             pending_elseif = False
+            pending_if = True
+        if re.match(r"[A-Za-z_]", tok):
+            prev_kw = tok
         last = tok
     if end_offset >= 0:
         if expr[end_offset:].strip():
@@ -1867,6 +1896,7 @@ def build_complete_model():
 
     rebound_defaults_map = {}
     _emitted_rebound = set()
+    _emitted_rebound_rows = set()
     matched_user_bind_keys = set()  # row identities (see the step-2 skip)
 
     for ub in user_state["binds"]:
@@ -1884,7 +1914,7 @@ def build_complete_model():
             # One default row can stand for one moved binding: a second user row
             # with the same action must stay visible as its own custom row instead
             # of silently disappearing from the model.
-            rebound_defaults_map[matched["key"]] = ub
+            rebound_defaults_map[matched["key"]] = (ub, matched)
             matched_user_bind_keys.add(ub["key"])
 
     all_active = []
@@ -1894,19 +1924,26 @@ def build_complete_model():
         k = d["key"]
 
         if k in rebound_defaults_map:
-            ub = rebound_defaults_map[k]
-            if k in _emitted_rebound:
-                # Two shipped defaults on one chord (ALT+TAB cycle_next and
-                # bring_to_top): the moved bind is listed once, not twice with a
-                # phantom conflict against itself.
-                continue
-            _emitted_rebound.add(k)
-            item = dict(ub)
-            item["status"] = "modified"
-            item["category"] = d.get("category", "Custom")
-            item["default_key"] = k
-            item["default_action"] = d.get("action", "")
-            all_active.append(item)
+            ub, matched_default = rebound_defaults_map[k]
+            if k not in _emitted_rebound:
+                _emitted_rebound.add(k)
+                item = dict(ub)
+                item["status"] = "modified"
+                item["category"] = matched_default.get("category", "Custom")
+                item["default_key"] = k
+                # The default this row actually replaces, not whichever default
+                # happens to come first on the chord (ALT+TAB carries two).
+                item["default_action"] = matched_default.get("action", "")
+                all_active.append(item)
+            if d.get("action") != matched_default.get("action"):
+                # The OTHER default on this chord is dead now: the chord carries one
+                # user bind and an unbind. Keep it listed so it can be seen and
+                # reset instead of vanishing from the panel.
+                sibling = dict(d)
+                sibling["status"] = "disabled"
+                sibling["disabled_row"] = True
+                sibling["default_key"] = k
+                all_active.append(sibling)
             continue
 
         same_key_user_bind = next(
@@ -2022,7 +2059,9 @@ def build_complete_model():
         "catalog": catalog,
         "conflicts": conflicts,
         "apps": get_installed_apps(),
-        "total_active": len([b for b in all_active if b.get("status") != "disabled"]),
+        # The tab renders all_active (disabled rows included), so the badge must
+        # count the same list or it reads 205 above 206 rows.
+        "total_active": len(all_active),
         "total_modified": total_modified,
         "total_conflicts": len(conflicts),
         "mouse_settings": get_mouse_scroll_settings(),
@@ -2146,9 +2185,23 @@ def _lua_compile_error(text: str) -> str:
     """
     luac = (_trusted_binary("luac") or _trusted_binary("luac5.4")
             or _trusted_binary("luac5.3"))
-    if not luac or not text.strip():
+    if not luac:
+        # A function body is the one action the shape checks cannot prove (they are
+        # a token stack, not a parser): without a compiler, refuse it rather than
+        # write a bindings.lua Hyprland drops entirely and report "saved".
+        if re.search(r"o\s*\.\s*bind[_a-z]*\s*\([^\n]*?,\s*function\b", text):
+            raise ValueError(
+                "this action is a Lua function and no Lua compiler (luac) was found "
+                "to validate it; install lua or use a dispatcher form")
         return ""
-    fd, tmp = tempfile.mkstemp(suffix=".lua")
+    if not text.strip():
+        return ""
+    # Beside the file it checks, like the other temp writers: a SIGKILL mid-compile
+    # used to leave a copy of bindings.lua (with its commands) in the shared temp.
+    _check_dir = os.path.dirname(os.path.realpath(USER_BINDINGS_PATH))
+    fd, tmp = tempfile.mkstemp(
+        suffix=".lua", prefix=".bindings_check_",
+        dir=_check_dir if os.path.isdir(_check_dir) else None)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
@@ -2438,10 +2491,28 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # a --[[ ]] block (the plugin writes it, a user comments it out to
             # re-enable by hand) used to suppress the emission, so Disable wrote
             # nothing and still reported success.
-            already_emitted = any(
-                not is_comment and text and _search_in_code(re.escape(line_str), text)
-                for _u, text, is_comment in _lua_units(new_lines)
-            )
+            # Hyprland's unbind removes the binds registered BEFORE it, so an
+            # unbind that sits above a user bind does not disable it: with
+            # unbind_at_end that one must not count as "already emitted" or Disable
+            # wrote nothing and reported success on every plugin-written override.
+            units = list(_lua_units(new_lines))
+            if unbind_at_end:
+                last_bind_index = -1
+                for idx, (_u, text, is_comment) in enumerate(units):
+                    if is_comment or not text:
+                        continue
+                    if _bind_head(text):
+                        last_bind_index = idx
+                already_emitted = any(
+                    idx > last_bind_index and not is_comment and text
+                    and _search_in_code(re.escape(line_str), text)
+                    for idx, (_u, text, is_comment) in enumerate(units)
+                )
+            else:
+                already_emitted = any(
+                    not is_comment and text and _search_in_code(re.escape(line_str), text)
+                    for _u, text, is_comment in units
+                )
             if not already_emitted and line_str not in unbind_lines:
                 unbind_lines.append(line_str)
         # Ask the Lua scanner where the leading comments end. Walking physical
@@ -2524,6 +2595,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                             "and options must be a string and a table")
                 else:
                     problem = _lua_single_expression_problem(opts_literal)
+                    if not problem and not _table_carries_no_code(opts_literal):
+                        problem = "its options table may not run code"
                     if problem or not opts_literal.startswith("{"):
                         raise ValueError(
                             "refusing to rewrite this binding: its options table cannot "
@@ -2731,7 +2804,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 mode = 0o600
             # Keep the owner bits, drop group/world WRITE: this file is Lua that
             # Hyprland executes, and the plugin must not hand back a writable copy.
-            mode &= ~(stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+            # Owner-only, like the .bak and the compile temp this same save writes:
+            # a bind command can carry a secret, and group/world read leaked it.
+            mode &= ~(stat.S_IWGRP | stat.S_IWOTH | stat.S_IRGRP | stat.S_IROTH
+                      | stat.S_ISUID | stat.S_ISGID)
             try:
                 os.fchmod(fd, mode | stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
@@ -2976,14 +3052,21 @@ def reset_keybinding(key: str, default_key: str = "", description: str = "",
     default_binds = parse_default_bindings()
     user_state = parse_user_bindings()
 
+    # A moved override frees the chord it moved OFF. The match must be that
+    # binding's own default (same action) AND that chord must carry an hl.unbind,
+    # otherwise deleting an unrelated custom row re-enabled a shortcut the user had
+    # deliberately disabled.
     for ub in user_state["binds"]:
-        if ub["key"] == norm_key:
-            matched_default = next(
-                (d for d in default_binds if d["description"].lower() == ub["description"].lower() or d["action"] == ub["action"]),
-                None
-            )
-            if matched_default and matched_default["key"] not in keys_to_remove:
-                keys_to_remove.append(matched_default["key"])
+        if ub["key"] != norm_key:
+            continue
+        matched_default = next(
+            (d for d in default_binds
+             if d["key"] not in (norm_key, norm_def) and d["action"] == ub["action"]),
+            None
+        )
+        if (matched_default and matched_default["key"] in user_state["unbinds"]
+                and matched_default["key"] not in keys_to_remove):
+            keys_to_remove.append(matched_default["key"])
 
     try:
         # require_absent: the target must really be gone from the output, so a
@@ -3188,7 +3271,11 @@ def _safe_atomic_write_file(path: str, content: str):
     fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".menu_", suffix=".jsonc.tmp")
     try:
         try:
-            os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+            if os.path.exists(path):
+                mode = stat.S_IMODE(os.stat(path).st_mode)
+                mode &= ~(stat.S_IWGRP | stat.S_IWOTH | stat.S_IRGRP | stat.S_IROTH
+                          | stat.S_ISUID | stat.S_ISGID)
+                os.fchmod(fd, mode | stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:

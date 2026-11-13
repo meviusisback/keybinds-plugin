@@ -1754,13 +1754,15 @@ class TestRoundNineRegressions(unittest.TestCase):
     def test_a_semicolon_in_a_chord_is_refused(self):
         self.assertFalse(keybinds_manager._key_is_plausible("SUPER + A;B"))
 
-    def test_a_save_keeps_the_file_mode(self):
+    def test_a_save_leaves_the_file_owner_only(self):
+        # Owner-only, not "keep whatever mode was there": a bind command can carry a
+        # secret, and the same save writes its .bak and compile temp at 0600.
         with open(self.path, "w", encoding="utf-8") as f:
             f.write('o.bind("SUPER + Q", "Q", "true")\n')
-        os.chmod(self.path, 0o644)
+        os.chmod(self.path, 0o646)
         res = keybinds_manager.set_keybinding("SUPER + Q", "Q2", "true")
         self.assertTrue(res["success"], res)
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
     def test_a_mouse_binding_saved_shows_as_modified_not_disabled(self):
         defaults = [b for b in keybinds_manager.parse_default_bindings() if b["is_mouse"]]
@@ -1972,6 +1974,128 @@ class TestRoundElevenRegressions(unittest.TestCase):
             '"stop it", "false", { locked = true, os.execute("id") }'))
         self.assertTrue(keybinds_manager._hold_tail_is_shaped(
             '"Stop dictation (push-to-talk)", "omarchy-dictation stop", { ignore_mods = true }'))
+
+
+class TestRoundTwelveRegressions(unittest.TestCase):
+    """Twelfth reviewer round: Disable on an override, reset scope, siblings."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self._saved = {"HOME": os.environ.get("HOME"),
+                       "UBP": keybinds_manager.USER_BINDINGS_PATH,
+                       "run": keybinds_manager.subprocess.run}
+        os.environ["HOME"] = self.home
+        os.makedirs(os.path.join(self.home, ".config", "hypr"), exist_ok=True)
+        self.path = os.path.join(self.home, ".config", "hypr", "bindings.lua")
+        keybinds_manager.USER_BINDINGS_PATH = self.path
+        keybinds_manager.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout="", stderr="")
+
+    def tearDown(self):
+        keybinds_manager.USER_BINDINGS_PATH = self._saved["UBP"]
+        keybinds_manager.subprocess.run = self._saved["run"]
+        if self._saved["HOME"] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved["HOME"]
+        self._tmp.cleanup()
+
+    def _write(self, text):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return f.read()
+
+    def _rows(self, chord):
+        model = keybinds_manager.build_complete_model()
+        active = model["active"] if isinstance(model, dict) else model
+        return [r for r in active if r["key"] == chord]
+
+    def test_disable_really_disables_a_plugin_written_override(self):
+        defaults = [b for b in keybinds_manager.parse_default_bindings()
+                    if b["action"] and b["command"]]
+        d = defaults[0]
+        self._write("")
+        res = keybinds_manager.set_keybinding(
+            d["key"], "Mine", d["command"], d["action"], d["key"],
+            old_description=d["description"], old_command=d["command"],
+            old_action=d["action"])
+        self.assertTrue(res["success"], res)
+        self.assertEqual(self._read().count("hl.unbind"), 1)  # the shadow, above
+        res = keybinds_manager.disable_keybinding(
+            d["key"], "Mine", d["description"])
+        self.assertTrue(res["success"], res)
+        # A second unbind at the end: the one above the bind removes nothing.
+        self.assertEqual(self._read().count("hl.unbind"), 2, self._read())
+        self.assertEqual([r["status"] for r in self._rows(d["key"])], ["disabled"])
+
+    def test_deleting_a_custom_row_leaves_an_unrelated_disabled_default_alone(self):
+        self._write('hl.unbind("SUPER + W")\n'
+                    'o.bind("SUPER + ALT + K", "Close window", "omarchy-launch-browser")\n')
+        res = keybinds_manager.reset_keybinding(
+            "SUPER + ALT + K", "", description="Close window",
+            action='"omarchy-launch-browser"')
+        self.assertTrue(res["success"], res)
+        self.assertIn('hl.unbind("SUPER + W")', self._read())
+        self.assertNotIn("SUPER + ALT + K", self._read())
+
+    def test_a_nil_description_row_can_be_deleted(self):
+        self._write('o.bind("SUPER + SHIFT + F10", nil, "notify-send hi")\n')
+        row = self._rows("SUPER + SHIFT + F10")[0]
+        self.assertEqual(row.get("description_raw"), "")
+        res = keybinds_manager.reset_keybinding(
+            "SUPER + SHIFT + F10", "", description=row.get("description_raw", ""),
+            action=row["action"])
+        self.assertTrue(res["success"], res)
+        self.assertNotIn("SUPER + SHIFT + F10", self._read())
+
+    def test_a_two_default_chord_keeps_its_other_default_listed(self):
+        self._write('hl.unbind("ALT + TAB")\n'
+                    'o.bind("ALT + TAB", "Reveal active window on top", '
+                    'hl.dsp.window.bring_to_top())\n')
+        rows = self._rows("ALT + TAB")
+        self.assertEqual(len(rows), 2, [(r["status"], r["description"]) for r in rows])
+        mine = [r for r in rows if r["status"] == "modified"][0]
+        self.assertIn("bring_to_top", mine["default_action"])
+        sibling = [r for r in rows if r["status"] == "disabled"][0]
+        self.assertIn("cycle_next", sibling["action"])
+
+    def test_a_then_without_an_if_is_refused(self):
+        self.assertTrue(keybinds_manager._lua_single_expression_problem(
+            "function() then end end"))
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            "function() if a then f() elseif b then g() else h() end end"), "")
+
+    def test_a_function_action_needs_a_compiler_to_be_written(self):
+        # The shape checks are a token stack, not a parser: without luac a body Lua
+        # rejects would land as "saved" and Hyprland would drop the whole file.
+        self._write("")
+        orig = keybinds_manager._trusted_binary
+        keybinds_manager._trusted_binary = lambda name: ""
+        try:
+            res = keybinds_manager.set_keybinding(
+                "SUPER + Y", "y", "", 'function() return 1 os.execute("id") end')
+        finally:
+            keybinds_manager._trusted_binary = orig
+        self.assertFalse(res["success"], res)
+        self.assertIn("Lua compiler", res["error"])
+        self.assertNotIn("SUPER + Y", self._read())
+
+    def test_a_parenless_call_in_an_options_table_is_refused(self):
+        for tail in ('"stop", "stop-cmd", { locked = true, os.execute"id" }',
+                     '"stop", "stop-cmd", { locked = true, os.execute [[id]] }'):
+            with self.subTest(tail=tail):
+                self.assertFalse(keybinds_manager._hold_tail_is_shaped(tail))
+        self.assertTrue(keybinds_manager._hold_tail_is_shaped(
+            '"Stop dictation (push-to-talk)", "omarchy-dictation stop", { ignore_mods = true }'))
+
+    def test_the_active_count_matches_the_rows_the_tab_shows(self):
+        self._write('o.bind("SUPER + Q", "Q", "true")\nhl.unbind("SUPER + W")\n')
+        model = keybinds_manager.build_complete_model()
+        self.assertEqual(model["total_active"], len(model["active"]))
 
 
 if __name__ == "__main__":
