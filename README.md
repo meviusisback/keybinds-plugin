@@ -2,7 +2,7 @@
 
 # Keybindings
 
-Version 1.0.6
+Version 1.0.7
 
 **A graphical frontend for Omarchy keybindings: view, search, modify and create Hyprland shortcuts with live key recording, smart free-key recommendations, collision detection and safe Lua sync.**
 
@@ -71,22 +71,25 @@ CLI reference (full backend engine):
 # List all active keybindings, presets, conflicts, and mouse settings in JSON
 omarchy-keybinds list
 
-# Create or modify a shortcut
-omarchy-keybinds set "<KEY>" "<DESCRIPTION>" "<COMMAND>" "[ACTION_LUA]" "[OLD_KEY]" "[OLD_DESCRIPTION]" "[OLD_COMMAND]" "[OLD_ACTION]"
-# Example:
-omarchy-keybinds set "SUPER + SHIFT + B" "My Browser" "omarchy-launch-browser"
+# Create or modify a shortcut: one JSON object on stdin, never argv (binding
+# commands can carry credentials, and argv is readable by other local accounts)
+printf '%s\n' '{"key":"SUPER + SHIFT + B","description":"My Browser","command":"omarchy-launch-browser"}' | omarchy-keybinds set
 # moving an existing binding also needs its previous row, so the old chord is freed:
-omarchy-keybinds set "SUPER + ALT + B" "My Browser" "omarchy-launch-browser" "" "SUPER + SHIFT + B" "My Browser" "omarchy-launch-browser"
+printf '%s\n' '{"key":"SUPER + ALT + B","description":"My Browser","command":"omarchy-launch-browser","old_key":"SUPER + SHIFT + B","old_description":"My Browser","old_command":"omarchy-launch-browser"}' | omarchy-keybinds set
+# command is required; send "" when the binding is an action-only raw Lua dispatcher.
+# optional keys: action (raw Lua dispatcher), old_action, keep_disabled
 
 # Reset a modified shortcut back to Omarchy default
-omarchy-keybinds reset "SUPER + SHIFT + B"   # optional tail: <default_key> <description> <action>
+printf '%s\n' '{"key":"SUPER + SHIFT + B"}' | omarchy-keybinds reset
+# optional keys: default_key, description, action
 # names ONE row when two bindings share a chord, and frees the default chord of a moved override
 
 # Disable / unbind a shortcut
-omarchy-keybinds disable "SUPER + W"
+printf '%s\n' '{"key":"SUPER + W"}' | omarchy-keybinds disable
+# optional keys: description, action
 
 # Re-enable a previously disabled default shortcut
-omarchy-keybinds enable "SUPER + W"
+printf '%s\n' '{"key":"SUPER + W"}' | omarchy-keybinds enable
 
 # Reload Hyprland configuration
 omarchy-keybinds reload
@@ -112,7 +115,7 @@ The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
 The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and every plain command is escaped into a Lua string. Raw Lua dispatchers (`hl.*`, `o.*` helper calls such as `o.launch_terminal()`, and `{...}` tables) are inserted only from the dispatcher slot — the built-in catalog presets and the binding being edited — and each one is checked before it is written (one balanced call, table, or `function ... end` whose body closes exactly at the end: no newlines, comments, trailing escape, second statement, control bytes, or more than the command limit). Text typed into the command field is only ever written as a literal command — never code; when the dispatcher slot is empty, a value that looks like raw Lua is refused with an error instead, so an application's `.desktop` `Exec` cannot either. A write that cannot be completed is refused and reported as such, never as saved. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin adds its own Keybindings Manager launcher entry to; because it is JSONC, the file is re-serialised on that change, so its comments and hand-formatting are lost) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
-Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 216 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents, bounded reads, in-place edits on a shared chord, the single certification shared by panel and writer (including computed indexes, nested binds, unreadable unbind chords and undecodable files), and the guards that must fail closed.
+Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 244 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents, bounded reads, in-place edits on a shared chord, the single certification shared by panel and writer (including computed indexes, nested binds, unreadable unbind chords and undecodable files), the stdin-only write contract (no binding content in argv), the shared subprocess output budget with group kills, and the guards that must fail closed.
 
 ## Removal
 

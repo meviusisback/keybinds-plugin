@@ -5,13 +5,28 @@ PLUGIN_ID="meviusisback.keybinds"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-  echo "Usage: omarchy-keybinds [list|set|reset|disable|--print]"
+  echo "Usage: omarchy-keybinds [list|set|reset|disable|enable|reload|--print]"
   echo "  (no args)  Open the graphical keybindings manager window"
   echo "  list       Output full JSON model of active binds, catalog, and conflicts"
-  echo "  set        Set a keybinding: omarchy-keybinds set <key> <description> <command>"
-  echo "  reset      Reset a keybinding to default: omarchy-keybinds reset <key>"
-  echo "  disable    Disable/unbind a keybinding: omarchy-keybinds disable <key>"
+  echo "  set        Set a keybinding: read one JSON object from stdin"
+  echo "  reset      Reset a keybinding to default: read one JSON object from stdin"
+  echo "  disable    Disable/unbind a keybinding: read one JSON object from stdin"
+  echo "  enable     Re-enable a disabled keybinding: read one JSON object from stdin"
+  echo "  reload     Reload the Hyprland configuration"
+  echo "  --print    Print keybindings through omarchy-menu-keybindings"
+  echo ""
+  echo "Write verbs no longer take binding text as arguments: another local account"
+  echo "can read argv in /proc. Pipe the JSON payload instead, e.g.:"
+  echo "  printf '%s\\n' '{\"key\":\"SUPER + SHIFT + B\",\"description\":\"My Browser\",\"command\":\"omarchy-launch-browser\"}' | omarchy-keybinds set"
   exit 0
+fi
+
+# Refuse the old argv form loudly instead of letting the secret land in /proc.
+if [[ "$1" == "set" || "$1" == "reset" || "$1" == "disable" || "$1" == "enable" ]] && [[ $# -gt 1 ]]; then
+  echo "omarchy-keybinds: $1 no longer accepts binding text as arguments (visible in /proc to other local accounts)." >&2
+  echo "Pipe one JSON object to stdin instead:" >&2
+  echo "  printf '%s\\n' '{\"key\":\"SUPER + W\",\"description\":\"Close\",\"action\":\"hl.dsp.window.close()\"}' | omarchy-keybinds $1" >&2
+  exit 2
 fi
 
 if [[ "$1" == "--print" || "$1" == "-p" ]]; then

@@ -12,6 +12,8 @@ import json
 import shutil
 import signal
 import subprocess
+import selectors
+import time
 from datetime import datetime
 from pathlib import Path
 import tempfile
@@ -114,6 +116,8 @@ MAX_DIR_FILES = 256  # ceiling on enumerated default-binding files
 MAX_TOTAL_READ = 2_097_152  # 2 MiB cumulative cap across the default-bindings dir
 MAX_APP_FILES = 1_024  # ceiling on enumerated .desktop entries
 MAX_APP_TOTAL_READ = 4_194_304  # 4 MiB cumulative cap across the application dirs
+MAX_SUBPROCESS_OUTPUT = 65_536  # shared stdout+stderr budget for one child
+MAX_PAYLOAD_BYTES = 131_072  # bounded JSON payload read from stdin
 
 MENU_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/extensions/omarchy-menu.jsonc")
 MENU_ENTRY_KEY = "setup.keybindings.gui"
@@ -2048,7 +2052,7 @@ def get_mouse_scroll_settings():
         try:
             # Same group kill as reload: a wedged hyprctl used to leave its own
             # children behind on every `list`.
-            _rc, _out = _run_in_own_group([hyprctl, "getoption", name, "-j"], 2)
+            _rc, _out, _err = _run_in_own_group([hyprctl, "getoption", name, "-j"], 2)
         except Exception:
             continue
         if _rc != 0:
@@ -2678,12 +2682,13 @@ def _lua_compile_error(text: str) -> str:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         try:
-            res = subprocess.run([luac, "-p", tmp], capture_output=True, text=True,
-                                 timeout=10, start_new_session=True)
+            res_rc, res_out, res_err = _run_in_own_group([luac, "-p", tmp], 10)
         except Exception:
             return ""  # a broken compiler is not a reason to lose the edit
-        if res.returncode != 0:
-            first = (res.stderr or res.stdout or "").strip().splitlines()
+        if res_rc is None:
+            return ""  # an unreapable compiler is not a reason to lose the edit
+        if res_rc != 0:
+            first = (res_err or res_out or "").strip().splitlines()
             # The first line starts with our temp file's path, which means nothing
             # to the user and leaks a scratch location into a toast.
             message = first[0].replace(tmp + ":", "line ").strip() if first else ""
@@ -3490,25 +3495,117 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         raise
 
 
-def _run_in_own_group(argv, timeout: int):
-    """Run argv in its own process group, killing the GROUP on timeout.
+class OutputTooLarge(RuntimeError):
+    """A child produced more output than the shared capture budget allows."""
 
-    subprocess.run kills only the direct child, so a helper hyprctl forked survived
-    the timeout (probe: a ``sleep 300`` grandchild outlived the call). Output is
-    bounded to 64 KiB, which is what configerrors needs.
-    """
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            text=True, start_new_session=True)
+
+def _kill_process_group(proc):
+    """SIGKILL the child's whole group, falling back to the direct child."""
     try:
-        out, _err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
             proc.kill()
-        out, _err = proc.communicate()
+        except OSError:
+            pass
+
+
+def _reap(proc, timeout: float = 2) -> bool:
+    """Wait for the child, bounded; True when it is gone."""
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _run_in_own_group(argv, timeout: int, max_output: int = MAX_SUBPROCESS_OUTPUT):
+    """Run argv in its own process group with a hard, shared output cap.
+
+    ``communicate()`` buffers every byte before a caller's ``[:65536]`` slice runs,
+    so a child that floods stdout could exhaust memory before the cap applied.
+    Both pipes are drained through one selector under a single byte budget; on
+    overflow or timeout the whole GROUP is SIGKILLed and reaped, so a grandchild
+    that inherited the pipe cannot keep the caller waiting (the earlier
+    ``sleep 300`` probe outlived a direct-child kill).
+
+    Returns ``(returncode, stdout, stderr)`` as text. The reaping wait is bounded
+    too: one call never exceeds ``timeout`` by more than one or two 2 s reap
+    windows, even for a child that cannot be killed immediately.
+    """
+    selector = selectors.DefaultSelector()
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+    except BaseException:
+        selector.close()
         raise
-    return proc.returncode, out
+    out_chunks = []
+    err_chunks = []
+    total = 0
+    overflow = False
+    timed_out = False
+    try:
+        deadline = time.monotonic() + timeout
+        try:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            selector.register(proc.stderr, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    _kill_process_group(proc)
+                    break
+                for key, _events in selector.select(remaining):
+                    try:
+                        chunk = os.read(key.fd, 4096)
+                    except OSError as exc:
+                        # A pending-pipe read can be interrupted, but anything
+                        # else is a real failure: falling back to EOF would hide
+                        # lost output (configerrors would read as "no errors").
+                        if exc.errno in (errno.EAGAIN, errno.EINTR):
+                            continue
+                        raise
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > max_output:
+                        overflow = True
+                        _kill_process_group(proc)
+                        break
+                    if key.fileobj is proc.stdout:
+                        out_chunks.append(chunk)
+                    else:
+                        err_chunks.append(chunk)
+                if overflow:
+                    break
+        except BaseException:
+            # Any unexpected selector/read failure must not leave a live child
+            # (and its zombie) behind the caller.
+            _kill_process_group(proc)
+            _reap(proc)
+            raise
+        if not _reap(proc):
+            # Pipes closed but the child is still alive, or we just killed it.
+            _kill_process_group(proc)
+            _reap(proc)
+    finally:
+        selector.close()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout)
+    if overflow:
+        raise OutputTooLarge(
+            f"output exceeded the {max_output}-byte cap: {argv[0]}")
+    return (proc.returncode,
+            b"".join(out_chunks).decode("utf-8", "replace"),
+            b"".join(err_chunks).decode("utf-8", "replace"))
 
 
 def reload_hyprland():
@@ -3520,8 +3617,8 @@ def reload_hyprland():
                 "config_errors": "hyprctl was not found in a trusted location; "
                                  "reload the config by hand"}
     try:
-        rc, out = _run_in_own_group([hyprctl, "reload"], 10)
-        _rc2, err_out = _run_in_own_group([hyprctl, "configerrors"], 10)
+        rc, out, _err = _run_in_own_group([hyprctl, "reload"], 10)
+        _rc2, err_out, _err2 = _run_in_own_group([hyprctl, "configerrors"], 10)
         errors = (err_out or "")[:65536].strip() if _rc2 == 0 else ""
         # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
         # it drops every user override in it. A save that leaves errors behind is
@@ -3531,6 +3628,10 @@ def reload_hyprland():
             "reload_output": (out or "")[:65536].strip(),
             "config_errors": errors,
         }
+    except OutputTooLarge:
+        return {"success": False, "reload_output": "",
+                "config_errors": "Hyprland reported more configuration "
+                                 "errors than can be listed"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -3572,8 +3673,8 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if not action.strip() and _is_raw_dispatcher(command.strip()):
         return {
             "success": False,
-            "error": "dispatcher-looking command: pass it as the action argument "
-                     "(set <key> <desc> <command> <action>)",
+            "error": "dispatcher-looking command: pass it in the action field "
+                     "of the JSON payload",
         }
     if _is_raw_dispatcher(action):
         if _registers_a_binding(action):
@@ -3661,8 +3762,8 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
         return {
             "success": False,
             "error": "moving a binding to another chord needs the previous "
-                     "description/command: set <key> <desc> <cmd> <action> "
-                     "<old_key> <old_desc> <old_cmd> <old_action>",
+                     "row: send old_description and old_command (and "
+                     "old_action when it has one) in the set payload",
         }
 
     # Keep the row's call form and options table: rewriting an o.bind_toggle as
@@ -4086,6 +4187,100 @@ def remove_menu_entry():
         return _menu_refusal(e)
 
 
+PAYLOAD_KEYS = {
+    "set": {"key", "description", "command", "action", "old_key",
+            "old_description", "old_command", "old_action", "keep_disabled"},
+    "reset": {"key", "default_key", "description", "action"},
+    "disable": {"key", "description", "action"},
+    "enable": {"key"},
+}
+
+
+def _read_payload():
+    """Read ONE bounded JSON object from stdin; never read binding content
+    from argv.
+
+    The argument list of a process is visible to every local account in
+    ``/proc/<pid>/cmdline``, while a pipe from the panel is private to our own
+    user. The cap is applied to the BYTES read (``readline`` on the binary
+    buffer) so a multi-byte character cannot quadruple it, and the QML side
+    writes the object as a single line so this returns without waiting for EOF.
+    A terminal stdin is refused instead of blocking with no prompt.
+    """
+    if sys.stdin is None:
+        return None, "no payload on stdin: pass a JSON object as one line"
+    if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+        return None, "no payload on stdin: pass a JSON object as one line"
+    buffered = getattr(sys.stdin, "buffer", None)
+    try:
+        if buffered is not None:
+            raw = buffered.readline(MAX_PAYLOAD_BYTES + 1)
+        else:  # tests and in-process callers hand us a text stream
+            raw = sys.stdin.readline(MAX_PAYLOAD_BYTES + 1).encode(
+                "utf-8", "replace")
+    except (OSError, UnicodeError):
+        return None, "could not read the payload from stdin"
+    if len(raw) > MAX_PAYLOAD_BYTES:
+        return None, f"payload exceeds the {MAX_PAYLOAD_BYTES}-byte cap"
+    try:
+        line = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "payload is not valid UTF-8"
+    if not line.strip():
+        return None, "no payload on stdin: pass a JSON object as one line"
+    try:
+        payload = json.loads(line)
+    except (ValueError, RecursionError) as exc:
+        return None, f"payload is not valid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "payload must be a JSON object"
+    return payload, ""
+
+
+def _check_payload_keys(payload, verb: str):
+    """Refuse unknown fields: a typo must not silently reproduce a fixed bug
+    (``keepDisabled`` read as absent re-enabled a disabled row)."""
+    unknown = sorted(set(payload) - PAYLOAD_KEYS[verb])
+    if unknown:
+        raise ValueError("unknown payload field(s) for %s: %s"
+                         % (verb, ", ".join(unknown)))
+
+
+def _payload_text(payload, name: str, limit: int, required: bool = False) -> str:
+    """Return a bounded string field, refusing any other JSON type.
+
+    ``required`` distinguishes an ABSENT field from an explicit empty string:
+    the caller can pass ``"command": ""`` for an action-only binding, while a
+    payload that forgot ``command`` is refused instead of blanking an existing
+    row and reporting success.
+    """
+    if name not in payload or payload[name] is None:
+        if required:
+            raise ValueError(f"{name} is required")
+        return ""
+    value = payload[name]
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if len(value) > limit:
+        raise ValueError(f"{name} exceeds the {limit}-character cap")
+    return value
+
+
+def _payload_flag(payload, name: str) -> bool:
+    """Return a boolean field; refuse a value that is not clearly a boolean."""
+    value = payload.get(name, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps(build_complete_model(), indent=2))
@@ -4096,68 +4291,58 @@ def main():
     if cmd == "list":
         print(json.dumps(build_complete_model()))
 
-    elif cmd == "set":
-        if len(sys.argv) < 5:
-            print(json.dumps({"success": False, "error": "Usage: set <key> <desc> <command> [action] [old_key] [old_desc] [old_command] [old_action] [keep_disabled]"}))
+    elif cmd in ("set", "reset", "disable", "enable"):
+        # Binding text can carry credentials, and argv is world-readable in
+        # /proc. The panel and the CLI hand the write verbs ONE JSON object on
+        # stdin; argv is refused outright so no caller can regress into it.
+        if len(sys.argv) > 2:
+            print(json.dumps({
+                "success": False,
+                "error": "binding content is not accepted in argv; pass a JSON "
+                         "object as one line on stdin",
+            }))
+            sys.exit(2)
+        payload, payload_error = _read_payload()
+        if payload is None:
+            print(json.dumps({"success": False, "error": payload_error}))
             sys.exit(1)
-        key = sys.argv[2]
-        desc = sys.argv[3]
-        command = sys.argv[4]
-        action = sys.argv[5] if len(sys.argv) > 5 else ""
-        old_key = sys.argv[6] if len(sys.argv) > 6 else ""
-        old_desc = sys.argv[7] if len(sys.argv) > 7 else ""
-        old_command = sys.argv[8] if len(sys.argv) > 8 else ""
-        old_action = sys.argv[9] if len(sys.argv) > 9 else ""
-        # "1" when the row being edited is switched off: the save must not
-        # silently switch it back on.
-        keep_disabled = len(sys.argv) > 10 and sys.argv[10] in ("1", "true", "yes")
         try:
-            res = set_keybinding(key, desc, command, action, old_key,
-                                 old_description=old_desc, old_command=old_command,
-                                 old_action=old_action, keep_disabled=keep_disabled)
+            _check_payload_keys(payload, cmd)
+            key = _payload_text(payload, "key", MAX_KEY_LEN, required=True)
+            if not key.strip():
+                raise ValueError("key is required")
+            if cmd == "set":
+                res = set_keybinding(
+                    key,
+                    _payload_text(payload, "description", MAX_TEXT_LEN),
+                    _payload_text(payload, "command", MAX_CMD_LEN, required=True),
+                    _payload_text(payload, "action", MAX_CMD_LEN),
+                    _payload_text(payload, "old_key", MAX_CMD_LEN),
+                    old_description=_payload_text(
+                        payload, "old_description", MAX_CMD_LEN),
+                    old_command=_payload_text(payload, "old_command", MAX_CMD_LEN),
+                    old_action=_payload_text(payload, "old_action", MAX_CMD_LEN),
+                    keep_disabled=_payload_flag(payload, "keep_disabled"))
+            elif cmd == "reset":
+                res = reset_keybinding(
+                    key,
+                    _payload_text(payload, "default_key", MAX_CMD_LEN),
+                    description=_payload_text(payload, "description", MAX_CMD_LEN),
+                    action=_payload_text(payload, "action", MAX_CMD_LEN))
+            elif cmd == "disable":
+                res = disable_keybinding(
+                    key,
+                    description=_payload_text(payload, "description", MAX_CMD_LEN),
+                    action=_payload_text(payload, "action", MAX_CMD_LEN))
+            else:
+                res = enable_keybinding(key)
         except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
             res = {"success": False, "error": str(e)}
         print(json.dumps(res))
-
-    elif cmd == "reset":
-        if len(sys.argv) < 3:
-            print(json.dumps({"success": False,
-                              "error": "Usage: reset <key> [default_key] [description] [action]"}))
+        if isinstance(res, dict) and res.get("success") is False:
+            # The panel reads the JSON, but a shell caller checks $?: a refused
+            # write must not exit 0.
             sys.exit(1)
-        key = sys.argv[2]
-        def_key = sys.argv[3] if len(sys.argv) > 3 else ""
-        row_desc = sys.argv[4] if len(sys.argv) > 4 else ""
-        row_action = sys.argv[5] if len(sys.argv) > 5 else ""
-        try:
-            res = reset_keybinding(key, def_key, description=row_desc, action=row_action)
-        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
-            res = {"success": False, "error": str(e)}
-        print(json.dumps(res))
-
-    elif cmd == "disable":
-        if len(sys.argv) < 3:
-            print(json.dumps({"success": False,
-                              "error": "Usage: disable <key> [description] [action]"}))
-            sys.exit(1)
-        key = sys.argv[2]
-        row_desc = sys.argv[3] if len(sys.argv) > 3 else ""
-        row_action = sys.argv[4] if len(sys.argv) > 4 else ""
-        try:
-            res = disable_keybinding(key, description=row_desc, action=row_action)
-        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
-            res = {"success": False, "error": str(e)}
-        print(json.dumps(res))
-
-    elif cmd == "enable":
-        if len(sys.argv) < 3:
-            print(json.dumps({"success": False, "error": "Usage: enable <key>"}))
-            sys.exit(1)
-        key = sys.argv[2]
-        try:
-            res = enable_keybinding(key)
-        except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
-            res = {"success": False, "error": str(e)}
-        print(json.dumps(res))
 
     elif cmd == "reload":
         res = reload_hyprland()

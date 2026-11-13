@@ -75,6 +75,7 @@ Item {
     // First-run menu entry setup
     if (!menuEntryChecked) {
       menuSetupCheckProc.running = true
+      root.armWatchdog(menuSetupCheckProc, 15000)
     }
     Qt.callLater(function() {
       if (searchInput) searchInput.forceActiveFocus()
@@ -107,31 +108,68 @@ Item {
     onTriggered: root.toastVisible = false
   }
 
-  function loadData() {
+  // Every worker starts through startWorker: it arms ONE independent watchdog
+  // before the Process runs, so a worker that never starts, never exits, or
+  // exits without delivering a collector answer cannot leave the panel spinning
+  // forever. Write verbs take their payload on stdin — argv is readable by every
+  // local account in /proc, and a binding command may carry credentials.
+  function startWorker(proc, timeoutMs, payload) {
+    if (payload !== undefined) proc.pendingPayload = payload + "\n"
+    proc.watchdogStopped = false
+    proc.deadline = Date.now() + timeoutMs
     root.loading = true
-    listProc.running = false
-    listProc.running = true
+    proc.running = false
+    proc.running = true
+    root.scheduleWatchdog()
+  }
+
+  // A worker started directly (the launcher-menu verbs) only needs a deadline;
+  // they do not carry a payload or the loading latch.
+  function armWatchdog(proc, timeoutMs) {
+    proc.watchdogStopped = false
+    proc.deadline = Date.now() + timeoutMs
+    root.scheduleWatchdog()
+  }
+
+  // Arm the ONE timer for the earliest deadline among running workers. Each
+  // worker keeps its own deadline: a 15 s refresh must not shorten a 70 s save
+  // that was already in flight.
+  function scheduleWatchdog() {
+    var workers = [listProc, setProc, resetProc, enableProc, disableProc,
+                   menuSetupCheckProc, menuSetupWriteProc, menuRemoveProc,
+                   refreshMenuProc]
+    var soonest = 0
+    for (var i = 0; i < workers.length; i++) {
+      if (workers[i].running && workers[i].deadline > 0) {
+        if (soonest === 0 || workers[i].deadline < soonest) soonest = workers[i].deadline
+      }
+    }
+    if (soonest === 0) {
+      workerWatchdog.stop()
+      return
+    }
+    workerWatchdog.interval = Math.max(50, soonest - Date.now())
+    workerWatchdog.restart()
+  }
+
+  function loadData() {
+    root.startWorker(listProc, 15000)
   }
 
   function saveKeybinding(key, desc, cmd, action, oldKey, overrideConflict, oldDesc, oldCmd, oldAction) {
-    root.loading = true
-    setProc.running = false
-    setProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
-      "set",
-      key,
-      desc,
-      cmd,
-      action || "",
-      oldKey || "",
-      oldDesc || "",
-      oldCmd || "",
-      oldAction || "",
+    root.startWorker(setProc, 70000, JSON.stringify({
+      key: key,
+      description: desc,
+      command: cmd,
+      action: action || "",
+      old_key: oldKey || "",
+      old_description: oldDesc || "",
+      old_command: oldCmd || "",
+      old_action: oldAction || "",
       // A row that was switched off stays off after an edit: this used to be the
       // only control on a disabled row, and saving re-enabled the shortcut.
-      (editDialog.itemData && editDialog.itemData.status === "disabled") ? "1" : "0"
-    ]
-    setProc.running = true
+      keep_disabled: !!(editDialog.itemData && editDialog.itemData.status === "disabled")
+    }))
   }
 
   // The backend answers {"success": bool, "error"?: string} for every write and
@@ -170,41 +208,24 @@ Item {
   // a chord (Omarchy ships ALT+TAB with two actions), and deleting by chord alone
   // removed a sibling the user never touched.
   function resetKeybinding(key, defaultKey, description, action) {
-    root.loading = true
-    resetProc.running = false
-    resetProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
-      "reset",
-      key,
-      defaultKey || "",
-      (description === undefined || description === null) ? "" : description,
-      (action === undefined || action === null) ? "" : action
-    ]
-    resetProc.running = true
+    root.startWorker(resetProc, 70000, JSON.stringify({
+      key: key,
+      default_key: defaultKey || "",
+      description: (description === undefined || description === null) ? "" : description,
+      action: (action === undefined || action === null) ? "" : action
+    }))
   }
 
   function enableKeybinding(key) {
-    root.loading = true
-    enableProc.running = false
-    enableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
-      "enable",
-      key
-    ]
-    enableProc.running = true
+    root.startWorker(enableProc, 70000, JSON.stringify({ key: key }))
   }
 
   function disableKeybinding(key, description, action) {
-    root.loading = true
-    disableProc.running = false
-    disableProc.command = [
-      Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
-      "disable",
-      key,
-      (description === undefined || description === null) ? "" : description,
-      (action === undefined || action === null) ? "" : action
-    ]
-    disableProc.running = true
+    root.startWorker(disableProc, 70000, JSON.stringify({
+      key: key,
+      description: (description === undefined || description === null) ? "" : description,
+      action: (action === undefined || action === null) ? "" : action
+    }))
   }
 
   // Physically-held modifiers for the record-to-find capture (same
@@ -375,6 +396,8 @@ Item {
   Process {
     id: listProc
     command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "list"]
+    property bool watchdogStopped: false
+    property double deadline: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -393,10 +416,27 @@ Item {
 
   Process {
     id: setProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "set"]
+    stdinEnabled: true
+    property string pendingPayload: ""
+    property bool watchdogStopped: false
+    property double deadline: 0
+    onStarted: {
+      // A start without a payload would block the backend on readline until the
+      // watchdog fires; end it now and let the empty answer report the failure.
+      if (pendingPayload.length === 0) {
+        signal(15)
+        return
+      }
+      write(pendingPayload)
+      pendingPayload = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.loading = false
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) return  // the watchdog already reported and reloaded
         root.loadData()
         root.handleWriteResult(text, "Keybinding saved & applied to Hyprland!")
       }
@@ -405,10 +445,25 @@ Item {
 
   Process {
     id: resetProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "reset"]
+    stdinEnabled: true
+    property string pendingPayload: ""
+    property bool watchdogStopped: false
+    property double deadline: 0
+    onStarted: {
+      if (pendingPayload.length === 0) {
+        signal(15)
+        return
+      }
+      write(pendingPayload)
+      pendingPayload = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.loading = false
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) return
         root.loadData()
         root.handleWriteResult(text, "Keybinding reset to default!")
       }
@@ -417,10 +472,25 @@ Item {
 
   Process {
     id: enableProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "enable"]
+    stdinEnabled: true
+    property string pendingPayload: ""
+    property bool watchdogStopped: false
+    property double deadline: 0
+    onStarted: {
+      if (pendingPayload.length === 0) {
+        signal(15)
+        return
+      }
+      write(pendingPayload)
+      pendingPayload = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.loading = false
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) return
         root.loadData()
         root.handleWriteResult(text, "Keybinding re-enabled!")
       }
@@ -429,10 +499,25 @@ Item {
 
   Process {
     id: disableProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "disable"]
+    stdinEnabled: true
+    property string pendingPayload: ""
+    property bool watchdogStopped: false
+    property double deadline: 0
+    onStarted: {
+      if (pendingPayload.length === 0) {
+        signal(15)
+        return
+      }
+      write(pendingPayload)
+      pendingPayload = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.loading = false
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) return
         root.loadData()
         root.handleWriteResult(text, "Keybinding disabled!")
       }
@@ -443,9 +528,17 @@ Item {
   Process {
     id: menuSetupCheckProc
     command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-check"]
+    property bool watchdogStopped: false
+    property double deadline: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) {
+          menuEntryChecked = true
+          return
+        }
         try {
           var parsed = JSON.parse(text)
           // success:false with exists:false means the file could not be read, not
@@ -473,15 +566,25 @@ Item {
   Process {
     id: menuSetupWriteProc
     command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-install"]
+    property bool watchdogStopped: false
+    property double deadline: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) {
+          menuEntryChecked = true
+          menuSetupDialog.opened = false
+          return
+        }
         try {
           var parsed = JSON.parse(text)
           if (parsed.success) {
             root.launcherEntryInstalled = true
             root.showToast(parsed.message || "Added Keybindings Manager to launcher!")
             refreshMenuProc.running = true
+            root.armWatchdog(refreshMenuProc, 15000)
           } else {
             root.showToast(parsed.message || "Failed to add menu entry.", true)
           }
@@ -498,20 +601,28 @@ Item {
   Process {
     id: refreshMenuProc
     command: ["omarchy-menu", "refresh"]
+    property bool watchdogStopped: false
+    property double deadline: 0
   }
 
   Process {
     id: menuRemoveProc
     command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py", "menu-remove"]
+    property bool watchdogStopped: false
+    property double deadline: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var wasStopped = watchdogStopped
+        watchdogStopped = false
+        if (wasStopped) return
         try {
           var parsed = JSON.parse(text)
           if (parsed.success) {
             root.launcherEntryInstalled = false
             root.showToast(parsed.message || "Removed from launcher.")
             refreshMenuProc.running = true
+            root.armWatchdog(refreshMenuProc, 15000)
           } else {
             root.showToast(parsed.message || "Failed to remove menu entry.", true)
           }
@@ -520,6 +631,67 @@ Item {
           root.showToast("Failed to remove menu entry.", true)
         }
       }
+    }
+  }
+
+  // ONE independent watchdog for every QML worker. It never relies on a
+  // Process signal: a collector that never finishes, a spawn that fails, and a
+  // child that hangs all leave `running` or `loading` behind, and this timer
+  // stops the worker, clears the latch and re-reads the file so the panel shows
+  // what is actually on disk rather than an optimistic write.
+  Timer {
+    id: workerWatchdog
+    interval: 15000
+    repeat: false
+    onTriggered: {
+      var now = Date.now()
+      var workers = [listProc, setProc, resetProc, enableProc, disableProc,
+                     menuSetupCheckProc, menuSetupWriteProc, menuRemoveProc,
+                     refreshMenuProc]
+      var writers = [setProc, resetProc, enableProc, disableProc]
+      var stoppedList = false
+      var stoppedWriter = false
+      var stoppedOther = false
+      var stoppedRefresh = false
+      var i
+      for (i = 0; i < workers.length; i++) {
+        var w = workers[i]
+        // Only the worker whose OWN deadline passed is stopped: a shorter
+        // budget belonging to another worker must not abort this one.
+        if (w.running && w.deadline > 0 && now >= w.deadline) {
+          // Latch EVERY stopped worker: each collector clears its own latch, so
+          // the killed run's late answer cannot overwrite the timeout toast.
+          w.watchdogStopped = true
+          if (w === listProc) stoppedList = true
+          else if (writers.indexOf(w) !== -1) stoppedWriter = true
+          else if (w === refreshMenuProc) stoppedRefresh = true
+          else stoppedOther = true
+          w.deadline = 0
+          w.running = false
+        }
+      }
+      var anyRunning = false
+      for (i = 0; i < workers.length; i++) {
+        if (workers[i].running) anyRunning = true
+      }
+      if (stoppedList || stoppedWriter || stoppedOther || stoppedRefresh) {
+        root.showToast(stoppedList ? "Loading bindings timed out"
+                       : stoppedRefresh ? "The launcher menu refresh timed out"
+                       : "The backend did not finish in time and was stopped", true)
+        // A write may have landed before it was stopped, so re-read the file once.
+        // A hung READ is not retried: a permanently broken backend would then
+        // toast on every timeout.
+        if (stoppedWriter) {
+          root.loadData()
+        } else if (!anyRunning) {
+          root.loading = false
+        }
+      } else if (!anyRunning && root.loading) {
+        // The worker never started (spawn failure) but left the latch armed.
+        root.showToast("The backend did not answer in time", true)
+        root.loading = false
+      }
+      root.scheduleWatchdog()
     }
   }
 
@@ -757,9 +929,11 @@ Item {
                 if (root.launcherEntryInstalled) {
                   menuRemoveProc.running = false
                   menuRemoveProc.running = true
+                  root.armWatchdog(menuRemoveProc, 15000)
                 } else {
                   menuSetupWriteProc.running = false
                   menuSetupWriteProc.running = true
+                  root.armWatchdog(menuSetupWriteProc, 15000)
                 }
               }
             }
@@ -1743,6 +1917,7 @@ Item {
         cancelText: "Not now"
         onConfirmed: {
           menuSetupWriteProc.running = true
+          root.armWatchdog(menuSetupWriteProc, 15000)
         }
         onCanceled: {
           menuEntryChecked = true

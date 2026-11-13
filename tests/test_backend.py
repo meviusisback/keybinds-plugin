@@ -7,6 +7,10 @@ import threading
 import json
 import shutil
 import pathlib
+import io
+import subprocess
+import time
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 import keybinds_manager
@@ -1243,7 +1247,8 @@ class TestSecurityRegressions(unittest.TestCase):
             res = keybinds_manager.set_keybinding(
                 "SUPER + J", "Close", "a", "", "SUPER + K")
             self.assertFalse(res["success"])
-            self.assertIn("previous description", res["error"])
+            self.assertIn("previous row", res["error"])
+            self.assertIn("old_description", res["error"])
             self.assertEqual(self._read(), original)
         finally:
             self._unstub_set_keybinding()
@@ -2634,6 +2639,370 @@ class TestRoundNineteenGuards(unittest.TestCase):
                 res = keybinds_manager.set_keybinding("SUPER + F13", "x", "true")
                 self.assertFalse(res["success"])
                 self.assertEqual(victim.read_text(encoding="utf-8"), "-- private\n")
+
+
+class TestRoundTwentyArgvAndOutputBounds(unittest.TestCase):
+    """Round 20: binding content must not travel in argv, and child output must
+    be bounded while it is read — not after it has all been buffered."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = pathlib.Path(self._tmp.name)
+        (self.tmp / ".config" / "hypr").mkdir(parents=True)
+        self.path = self.tmp / ".config" / "hypr" / "bindings.lua"
+        self.path.write_text("", encoding="utf-8")
+        self._saved = {"UBP": keybinds_manager.USER_BINDINGS_PATH,
+                       "HOME": os.environ.get("HOME")}
+        keybinds_manager.USER_BINDINGS_PATH = str(self.path)
+        os.environ["HOME"] = str(self.tmp)
+
+    def tearDown(self):
+        keybinds_manager.USER_BINDINGS_PATH = self._saved["UBP"]
+        if self._saved["HOME"] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved["HOME"]
+        self._tmp.cleanup()
+
+    # -- stdin payload -----------------------------------------------------
+
+    def _call_main(self, argv, stdin_text):
+        """Run main() with a fake stdin/stdout and no live compositor call."""
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin_text)), \
+                mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(keybinds_manager, "reload_hyprland",
+                                  return_value={"success": True,
+                                                "reload_output": "",
+                                                "config_errors": ""}):
+            try:
+                keybinds_manager.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, out.getvalue()
+
+    def test_set_reads_the_payload_from_stdin(self):
+        payload = {"key": "SUPER + F13", "description": "Secret",
+                   "command": "run --token=stdin-only"}
+        code, out = self._call_main(["keybinds_manager.py", "set"],
+                                    json.dumps(payload) + "\n")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(json.loads(out)["success"], out)
+        self.assertIn("run --token=stdin-only", self.path.read_text())
+
+    def test_argv_bearing_content_is_refused_before_any_write(self):
+        # The old form leaked the command to /proc; it must fail closed now
+        # instead of being silently consumed.
+        code, out = self._call_main(
+            ["keybinds_manager.py", "set", "SUPER + F13", "desc",
+             "SECRET_TOKEN_IN_ARGV"], "")
+        self.assertEqual(code, 2, out)
+        self.assertFalse(json.loads(out)["success"], out)
+        self.assertNotIn("SECRET_TOKEN_IN_ARGV", self.path.read_text())
+
+    def test_argv_is_refused_for_every_write_verb(self):
+        for verb in ("set", "reset", "disable", "enable"):
+            with self.subTest(verb):
+                code, out = self._call_main(
+                    ["keybinds_manager.py", verb, "SUPER + F13"], "")
+                self.assertEqual(code, 2, out)
+                self.assertIn("argv", json.loads(out)["error"])
+
+    def test_reset_disable_and_enable_read_stdin(self):
+        for verb, payload in (
+                ("reset", {"key": "SUPER + F13", "default_key": "SUPER + F13"}),
+                ("disable", {"key": "SUPER + F13", "description": "d"}),
+                ("enable", {"key": "SUPER + F13"})):
+            with self.subTest(verb):
+                code, out = self._call_main(
+                    ["keybinds_manager.py", verb], json.dumps(payload) + "\n")
+                self.assertEqual(code, 0, out)
+                self.assertIn("success", json.loads(out))
+
+    def test_a_long_hand_written_row_can_still_be_disabled(self):
+        # The row-identity fields are not display fields: a hand-written
+        # description over MAX_TEXT_LEN must still select the row.
+        long_desc = "d" * 500
+        self.path.write_text(
+            'o.bind("SUPER + F13", "%s", "true")\n' % long_desc,
+            encoding="utf-8")
+        payload = {"key": "SUPER + F13", "description": long_desc, "action": ""}
+        code, out = self._call_main(["keybinds_manager.py", "disable"],
+                                    json.dumps(payload) + "\n")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(json.loads(out)["success"], out)
+        self.assertIn('hl.unbind("SUPER + F13")', self.path.read_text())
+
+    def test_read_payload_rejects_malformed_and_oversized_input(self):
+        cases = [
+            ("", "no payload"),
+            ("not json\n", "not valid JSON"),
+            ("[1, 2]\n", "JSON object"),
+            ("x" * (keybinds_manager.MAX_PAYLOAD_BYTES + 10) + "\n", "cap"),
+        ]
+        for text, expected in cases:
+            with self.subTest(text[:20]):
+                with mock.patch.object(sys, "stdin", io.StringIO(text)):
+                    payload, error = keybinds_manager._read_payload()
+                self.assertIsNone(payload)
+                self.assertIn(expected, error)
+
+    def test_read_payload_refuses_a_terminal_instead_of_blocking(self):
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        with mock.patch.object(sys, "stdin", FakeTTY("")):
+            payload, error = keybinds_manager._read_payload()
+        self.assertIsNone(payload)
+        self.assertIn("no payload on stdin", error)
+
+    def test_read_payload_caps_bytes_not_characters(self):
+        # One multi-byte character per 4 bytes must hit the BYTE cap.
+        text = "\u00e9" * keybinds_manager.MAX_PAYLOAD_BYTES
+        with mock.patch.object(sys, "stdin", io.StringIO(text + "\n")):
+            payload, error = keybinds_manager._read_payload()
+        self.assertIsNone(payload)
+        self.assertIn("cap", error)
+
+    def test_read_payload_uses_the_real_binary_buffer(self):
+        # The panel and CLI hand us a real stdin with .buffer; the StringIO
+        # fallback above must not be the only exercised path.
+        stream = io.TextIOWrapper(io.BytesIO(b'{"key": "A"}\n'),
+                                  encoding="utf-8")
+        with mock.patch.object(sys, "stdin", stream):
+            payload, error = keybinds_manager._read_payload()
+        self.assertEqual(error, "")
+        self.assertEqual(payload, {"key": "A"})
+
+    def test_a_closed_stdin_is_refused_with_json(self):
+        with mock.patch.object(sys, "stdin", None):
+            payload, error = keybinds_manager._read_payload()
+        self.assertIsNone(payload)
+        self.assertIn("no payload", error)
+
+    def test_deeply_nested_json_is_refused_without_a_traceback(self):
+        with mock.patch.object(sys, "stdin", io.StringIO("[" * 120000 + "\n")):
+            payload, error = keybinds_manager._read_payload()
+        self.assertIsNone(payload)
+        self.assertIn("not valid JSON", error)
+
+    def test_read_payload_accepts_one_json_object(self):
+        with mock.patch.object(sys, "stdin", io.StringIO('{"key": "A"}\n')):
+            payload, error = keybinds_manager._read_payload()
+        self.assertEqual(error, "")
+        self.assertEqual(payload, {"key": "A"})
+
+    def test_payload_fields_are_type_and_length_checked(self):
+        with self.assertRaises(ValueError):
+            keybinds_manager._payload_text({"key": 5}, "key", 64)
+        with self.assertRaises(ValueError):
+            keybinds_manager._payload_text(
+                {"command": "x" * 3000}, "command", keybinds_manager.MAX_CMD_LEN)
+        with self.assertRaises(ValueError):
+            keybinds_manager._payload_text({}, "command", 64, required=True)
+        self.assertEqual(
+            keybinds_manager._payload_text({"command": ""}, "command", 64,
+                                           required=True), "")
+        self.assertTrue(keybinds_manager._payload_flag({"keep_disabled": "1"},
+                                                       "keep_disabled"))
+        self.assertFalse(keybinds_manager._payload_flag({}, "keep_disabled"))
+        with self.assertRaises(ValueError):
+            keybinds_manager._payload_flag({"keep_disabled": 1}, "keep_disabled")
+
+    def test_a_set_payload_that_forgot_its_command_is_refused(self):
+        # The old argc guard rejected this; without a required-presence check the
+        # backend blanked an existing row's command and reported success.
+        payload = {"key": "SUPER + F13", "description": "d"}
+        code, out = self._call_main(["keybinds_manager.py", "set"],
+                                    json.dumps(payload) + "\n")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(json.loads(out)["success"], out)
+        self.assertIn("command is required", json.loads(out)["error"])
+        self.assertEqual(self.path.read_text(), "")
+
+    def test_unknown_payload_fields_are_refused(self):
+        payload = {"key": "SUPER + F13", "command": "true",
+                   "keepDisabled": True}
+        code, out = self._call_main(["keybinds_manager.py", "set"],
+                                    json.dumps(payload) + "\n")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(json.loads(out)["success"], out)
+        self.assertIn("keepDisabled", json.loads(out)["error"])
+
+    def test_no_write_path_reads_binding_content_from_argv(self):
+        source = (pathlib.Path(__file__).parent.parent / "backend"
+                  / "keybinds_manager.py").read_text(encoding="utf-8")
+        # Catches sys.argv[2], sys.argv[2:], and any other positional read.
+        self.assertNotIn("sys.argv[2", source)
+        self.assertNotIn("sys.argv[3", source)
+
+    # -- bounded child output ---------------------------------------------
+
+    def test_small_output_is_returned(self):
+        rc, out, err = keybinds_manager._run_in_own_group(
+            [sys.executable, "-c", "print('ok')"], 10)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "ok")
+        self.assertEqual(err, "")
+
+    def test_stderr_is_captured_inside_the_same_budget(self):
+        rc, out, err = keybinds_manager._run_in_own_group(
+            [sys.executable, "-c",
+             "import sys; sys.stderr.write('lua: bad thing')"], 10)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertIn("bad thing", err)
+
+    def test_stdout_flood_is_killed_at_the_cap(self):
+        started = time.monotonic()
+        with self.assertRaises(keybinds_manager.OutputTooLarge):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c",
+                 "import sys; sys.stdout.write('x' * 500000)"], 10,
+                max_output=4096)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_stderr_shares_the_same_budget(self):
+        with self.assertRaises(keybinds_manager.OutputTooLarge):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c",
+                 "import sys; sys.stderr.write('y' * 500000)"], 10,
+                max_output=4096)
+
+    def test_the_budget_is_shared_not_per_stream(self):
+        # 3000 bytes on each stream is under 4096 apiece but over the shared cap.
+        code = ("import sys; sys.stdout.write('x' * 3000); "
+                "sys.stdout.flush(); sys.stderr.write('y' * 3000)")
+        with self.assertRaises(keybinds_manager.OutputTooLarge):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c", code], 10, max_output=4096)
+
+    def test_a_flooding_child_is_killed_and_reaped(self):
+        pid_file = self.tmp / "flood.pid"
+        code = ("import os, sys, time\n"
+                "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                "while True: sys.stdout.write('x' * 4096); sys.stdout.flush()\n")
+        with self.assertRaises(keybinds_manager.OutputTooLarge):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c", code, str(pid_file)], 10,
+                max_output=4096)
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"flooding child {pid} survived the group kill")
+
+    def test_the_cli_wrapper_refuses_argv_without_running_the_backend(self):
+        wrapper = (pathlib.Path(__file__).parent.parent
+                   / "bin" / "omarchy-keybinds")
+        r = subprocess.run([str(wrapper), "set", "SUPER + F13",
+                            "SECRET_IN_ARGV"], capture_output=True, text=True,
+                           env={"HOME": str(self.tmp), "PATH": os.environ["PATH"]})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("stdin", r.stderr)
+        self.assertFalse(self.path.exists() and self.path.read_text())
+
+    def test_a_grandchild_that_keeps_the_pipe_open_cannot_extend_the_call(self):
+        # The direct child exits; the grandchild inherits stdout/stderr, so a
+        # collector that waited for EOF would hang. The deadline must win.
+        pid_file = self.tmp / "holder.pid"
+        code = (
+            "import subprocess, sys, time\n"
+            "g = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import time; time.sleep(30)'])\n"
+            "open(sys.argv[1], 'w').write(str(g.pid))\n"
+            "time.sleep(0.1)\n"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c", code, str(pid_file)], 1)
+        self.assertLess(time.monotonic() - started, 10)
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"grandchild {pid} survived the group kill")
+
+    def test_timeout_kills_the_whole_group_not_just_the_child(self):
+        pid_file = self.tmp / "grandchild.pid"
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import time; time.sleep(30)'])\n"
+            "open(sys.argv[1], 'w').write(str(child.pid))\n"
+            "time.sleep(30)\n"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            keybinds_manager._run_in_own_group(
+                [sys.executable, "-c", code, str(pid_file)], 1)
+        self.assertLess(time.monotonic() - started, 10)
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"grandchild {pid} survived the group kill")
+
+    def test_reload_maps_output_overflow_to_failure(self):
+        with mock.patch.object(keybinds_manager, "_hyprctl",
+                               return_value="/usr/bin/hyprctl"), \
+                mock.patch.object(keybinds_manager, "_run_in_own_group",
+                                  side_effect=keybinds_manager.OutputTooLarge("x")):
+            res = keybinds_manager.reload_hyprland()
+        self.assertFalse(res["success"])
+        self.assertIn("more configuration errors", res["config_errors"])
+
+    def test_an_unreapable_compiler_is_not_blamed_for_the_edit(self):
+        with mock.patch.object(keybinds_manager, "_trusted_binary",
+                               return_value="/usr/bin/luac"), \
+                mock.patch.object(keybinds_manager, "_run_in_own_group",
+                                  return_value=(None, "", "")):
+            self.assertEqual(
+                keybinds_manager._lua_compile_error("o.bind('A', 'b', 'c')"), "")
+
+    # -- QML side ----------------------------------------------------------
+
+    def test_panel_writes_over_stdin_and_has_an_independent_watchdog(self):
+        qml = (pathlib.Path(__file__).parent.parent
+               / "KeybindsPanel.qml").read_text(encoding="utf-8")
+        backend = ("Quickshell.env(\"HOME\") + \"/.config/omarchy/plugins/"
+                   "meviusisback.keybinds/backend/keybinds_manager.py\"")
+        for verb in ("set", "reset", "enable", "disable"):
+            with self.subTest(verb):
+                # The verb is the ONLY argv element: no binding text can follow.
+                self.assertIn(f"{backend}, \"{verb}\"]", qml)
+        self.assertEqual(qml.count("stdinEnabled: true"), 4)
+        self.assertEqual(qml.count("onStarted: {"), 4)
+        self.assertEqual(qml.count("JSON.stringify({"), 4)
+        # The watchdog must actually be ARMED by every start path, and a stopped
+        # write must reload once instead of double-reporting through its collector.
+        self.assertIn("root.scheduleWatchdog()", qml)
+        self.assertIn("if (stoppedWriter) {", qml)
+        self.assertIn("root.handleWriteResult(text, \"Keybinding saved", qml)
+        # One timer, independent of every Process signal, that stops workers.
+        self.assertIn("id: workerWatchdog", qml)
+        self.assertIn("repeat: false", qml)
+        self.assertIn("writers.indexOf(w)", qml)
+        self.assertIn("watchdogStopped = true", qml)
 
 
 if __name__ == "__main__":
