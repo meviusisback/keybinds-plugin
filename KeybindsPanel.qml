@@ -52,7 +52,8 @@ Item {
     "Media & Audio",
     "Clipboard",
     "AI & Voice",
-    "General"
+    "General",
+    "Custom"
   ]
 
   function open(payloadJson) {
@@ -1077,7 +1078,9 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key,
-                                            activeRow.modelData.description, activeRow.modelData.action)
+                                            (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                                        ? activeRow.modelData.description_raw
+                                        : activeRow.modelData.description, activeRow.modelData.action)
                       }
 
                       // Disable / Delete
@@ -1090,10 +1093,14 @@ Item {
                         onClicked: {
                           if (activeRow.modelData.status === "custom") {
                             root.resetKeybinding(activeRow.modelData.key, "",
-                              activeRow.modelData.description, activeRow.modelData.action)
+                              (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                                        ? activeRow.modelData.description_raw
+                                        : activeRow.modelData.description, activeRow.modelData.action)
                           } else {
                             root.disableKeybinding(activeRow.modelData.key,
-                                 activeRow.modelData.description, activeRow.modelData.action)
+                                 (activeRow.modelData.description_raw !== undefined && activeRow.modelData.description_raw !== "")
+                                        ? activeRow.modelData.description_raw
+                                        : activeRow.modelData.description, activeRow.modelData.action)
                           }
                         }
                       }
@@ -1293,7 +1300,9 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key,
-                                            modRow.modelData.description, modRow.modelData.action)
+                                            (modRow.modelData.description_raw !== undefined && modRow.modelData.description_raw !== "")
+                                        ? modRow.modelData.description_raw
+                                        : modRow.modelData.description, modRow.modelData.action)
                       }
 
                       Button {
@@ -1303,7 +1312,9 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, "",
-                              modRow.modelData.description, modRow.modelData.action)
+                              (modRow.modelData.description_raw !== undefined && modRow.modelData.description_raw !== "")
+                                        ? modRow.modelData.description_raw
+                                        : modRow.modelData.description, modRow.modelData.action)
                       }
                     }
                   }
@@ -1314,7 +1325,7 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 visible: root.filteredModified.length === 0
-                text: "No modified or custom keybindings found. All shortcuts are currently set to Omarchy defaults."
+                text: "No modified or custom keybindings match this filter."
                 color: Util.alpha(root.foreground, 0.5)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body

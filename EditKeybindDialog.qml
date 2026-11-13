@@ -204,7 +204,9 @@ Item {
     root.actionDispatcher = (bindingItem && bindingItem.action) || ""
     root.actionCategory = (bindingItem && bindingItem.category) || "Custom"
     root.actionKey = (bindingItem && bindingItem.key) || ""
-    root.oldKey = (bindingItem && bindingItem.key) || ""
+    // raw_key is the chord as it stands in the file: the backend re-emits it when
+    // the chord itself did not change, so "ALT + Alt_R" keeps Omarchy's spelling.
+    root.oldKey = (bindingItem && (bindingItem.raw_key || bindingItem.key)) || ""
     // Identity of the row being edited. Several bindings can share a chord, so
     // the backend needs this to replace exactly this line and not a sibling.
     // RAW description as written in the file: a nil/empty description is what the

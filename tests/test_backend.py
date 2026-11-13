@@ -1510,7 +1510,7 @@ class TestSecurityRegressions(unittest.TestCase):
         finally:
             self._unstub_set_keybinding()
 
-    def test_junk_chords_are_refused_but_a_lone_modifier_is_not(self):
+    def test_junk_chords_are_refused_and_a_lone_modifier_too(self):
         # Omarchy itself ships modifier-only chords (o.bind_hold("ALT + Alt_R", ...))
         # and switch keysyms with spaces and slashes, so those must pass; junk does not.
         self._stub_set_keybinding()
@@ -1519,7 +1519,9 @@ class TestSecurityRegressions(unittest.TestCase):
             for chord in ("", "-notakey", "   "):
                 res = keybinds_manager.set_keybinding(chord, "d", "true")
                 self.assertFalse(res["success"], (chord, res))
-            self.assertTrue(keybinds_manager._key_is_plausible("SUPER"))
+            # A lone modifier is not a keysym: it binds nothing, so it is refused
+            # now instead of being reported as saved.
+            self.assertFalse(keybinds_manager._key_is_plausible("SUPER"))
             self.assertTrue(keybinds_manager._key_is_plausible("switch:on:Apple SMC power/lid events"))
             self.assertTrue(keybinds_manager._key_is_plausible("ALT + Alt_R"))
             self.assertEqual(self._read(), "")
@@ -1878,6 +1880,98 @@ class TestRoundTenRegressions(unittest.TestCase):
         self.assertTrue(res["success"], res)
         mode = os.stat(self.path).st_mode & 0o777
         self.assertFalse(mode & 0o022, oct(mode))
+
+
+class TestRoundElevenRegressions(unittest.TestCase):
+    """Eleventh reviewer round: moved-override reset, disable visibility, identity."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self._saved = {"HOME": os.environ.get("HOME"),
+                       "UBP": keybinds_manager.USER_BINDINGS_PATH,
+                       "run": keybinds_manager.subprocess.run}
+        os.environ["HOME"] = self.home
+        os.makedirs(os.path.join(self.home, ".config", "hypr"), exist_ok=True)
+        self.path = os.path.join(self.home, ".config", "hypr", "bindings.lua")
+        keybinds_manager.USER_BINDINGS_PATH = self.path
+        keybinds_manager.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout="", stderr="")
+
+    def tearDown(self):
+        keybinds_manager.USER_BINDINGS_PATH = self._saved["UBP"]
+        keybinds_manager.subprocess.run = self._saved["run"]
+        if self._saved["HOME"] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved["HOME"]
+        self._tmp.cleanup()
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return f.read()
+
+    def _rows(self):
+        model = keybinds_manager.build_complete_model()
+        return model["active"] if isinstance(model, dict) else model
+
+    def test_reset_of_a_moved_override_frees_the_default_chord(self):
+        defaults = [b for b in keybinds_manager.parse_default_bindings()
+                    if b["action"] and b["key"]]
+        d = defaults[0]
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("")
+        res = keybinds_manager.set_keybinding(
+            "SUPER + ALT + F9", d["description"], d["command"], d["action"], d["key"],
+            old_description=d["description"], old_command=d["command"],
+            old_action=d["action"])
+        self.assertTrue(res["success"], res)
+        self.assertIn("hl.unbind", self._read())
+        res = keybinds_manager.reset_keybinding(
+            "SUPER + ALT + F9", d["key"], d["description"], d["action"])
+        self.assertTrue(res["success"], res)
+        self.assertNotIn("hl.unbind", self._read())
+        rows = [r for r in self._rows() if r["key"] == d["key"]]
+        self.assertEqual([r["status"] for r in rows], ["default"])
+
+    def test_a_disabled_user_row_is_reported_disabled(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('o.bind("SUPER + W", "Close window (mine)", "killactive")\n')
+        res = keybinds_manager.disable_keybinding(
+            "SUPER + W", "Close window (mine)", "killactive")
+        self.assertTrue(res["success"], res)
+        rows = [r for r in self._rows() if r["key"] == "SUPER + W"]
+        self.assertEqual([r["status"] for r in rows], ["disabled"])
+        res = keybinds_manager.enable_keybinding("SUPER + W")
+        self.assertTrue(res["success"], res)
+        rows = [r for r in self._rows() if r["key"] == "SUPER + W"]
+        self.assertNotIn("disabled", [r["status"] for r in rows])
+        self.assertIn("killactive", self._read())
+
+    def test_a_user_bind_on_a_two_default_chord_is_listed_once(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('o.bind("ALT + TAB", "Focus on next window", hl.dsp.window.cycle_next())\n')
+        rows = [r for r in self._rows() if r["key"] == "ALT + TAB"]
+        self.assertEqual(len(rows), 2, [(r["status"], r["description"]) for r in rows])
+        self.assertEqual(len({r["description"] for r in rows}), 2)
+
+    def test_a_function_cannot_carry_a_masked_literal_after_its_end(self):
+        for expr in ('function() end "x"', 'function() end[[x]]', 'function() end)'):
+            with self.subTest(expr=expr):
+                self.assertTrue(keybinds_manager._lua_single_expression_problem(expr), expr)
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            "function() if a then x() elseif b then y() end end"), "")
+        self.assertEqual(keybinds_manager._lua_single_expression_problem(
+            "function() repeat x() until y end"), "")
+
+    def test_a_lone_modifier_is_refused(self):
+        self.assertFalse(keybinds_manager._key_is_plausible("SUPER"))
+
+    def test_a_hold_table_carrying_a_call_is_refused(self):
+        self.assertFalse(keybinds_manager._hold_tail_is_shaped(
+            '"stop it", "false", { locked = true, os.execute("id") }'))
+        self.assertTrue(keybinds_manager._hold_tail_is_shaped(
+            '"Stop dictation (push-to-talk)", "omarchy-dictation stop", { ignore_mods = true }'))
 
 
 if __name__ == "__main__":

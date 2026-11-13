@@ -136,7 +136,14 @@ def _hold_tail_is_shaped(tail: str) -> bool:
         _v, end, ok = _read_lua_string(part, 0)
         if not ok or end != len(part):
             return False
-    return parts[2].startswith("{") and parts[2].endswith("}") and _lua_ast_balanced(parts[2])
+    table = parts[2]
+    if not (table.startswith("{") and table.endswith("}") and _lua_ast_balanced(table)):
+        return False
+    masked = _code_mask(table)
+    code = "".join(ch if masked[i] else " " for i, ch in enumerate(table))
+    # A call inside the options table runs at load: `{ locked = true,
+    # os.execute("id") }` passed the old shape check and was re-emitted verbatim.
+    return "(" not in code and "--" not in code and ";" not in code
 
 
 def _lua_ast_balanced(expr: str) -> bool:
@@ -186,9 +193,10 @@ def _lua_function_problem(expr: str) -> str:
     ``function() end) os.execute("id") -- end`` used to pass with a bare
     end-anchored regex: the first ``end`` closed o.bind early, the injected call
     became a top-level statement and the trailing comment hid the orphan paren, so
-    loading bindings.lua ran it. The proof here is structural - the outermost
-    ``function`` must still be open at the final token, which must be its own
-    ``end`` - and it refuses comments, unbalanced brackets and a second statement.
+    loading bindings.lua ran it. The proof is structural and byte-level: the token
+    that empties the block stack must be the outermost function's ``end``, and
+    nothing may follow it - not even a literal the token stream masks, which would
+    still be a second expression and a file that does not parse.
     """
     masked = _code_mask(expr)
     code = "".join(ch if masked[i] else " " for i, ch in enumerate(expr))
@@ -196,20 +204,19 @@ def _lua_function_problem(expr: str) -> str:
         return "comments are not allowed in a raw dispatcher"
     if ";" in code:
         return "a raw dispatcher may not contain ';'"
-    tokens = [m for m in re.finditer(r"[A-Za-z_]\w*|[()\[\]{}]|.", code)]
     brackets = []
     stack = []
     opened = 0
     last = None
-    for m in tokens:
+    pending_elseif = False
+    end_offset = -1
+    for m in re.finditer(r"[A-Za-z_]\w*|[()\[\]{}]|.", code):
         tok = m.group(0)
         if not tok.strip():
             continue
-        if opened and not stack:
-            # `function() end, os.execute("id"), function() end` was written as
-            # o.bind's 4th argument and evaluated when Hyprland loaded the file.
+        if end_offset >= 0:
             return "a second expression follows the function"
-        if tok in (",", ";", "=") and not stack:
+        if tok in (",", "=") and not stack:
             return "a raw dispatcher may not continue after the function"
         if tok in "([{":
             brackets.append(tok)
@@ -224,9 +231,28 @@ def _lua_function_problem(expr: str) -> str:
             if not stack:
                 return "a raw dispatcher may not close an 'end' it did not open"
             stack.pop()
-        elif tok == "do" or tok == "then":
+            if opened and not stack:
+                end_offset = m.end()
+        elif tok in ("do", "repeat"):
             stack.append(tok)
+        elif tok == "until":
+            if not stack or stack[-1] != "repeat":
+                return "a raw dispatcher may not close an 'until' it did not open"
+            stack.pop()
+        elif tok == "then":
+            # `elseif ... then` closes with the same `end` as its `if`.
+            if not pending_elseif:
+                stack.append(tok)
+            pending_elseif = False
+        if tok == "elseif":
+            pending_elseif = True
+        elif tok == "if":
+            pending_elseif = False
         last = tok
+    if end_offset >= 0:
+        if expr[end_offset:].strip():
+            return "a second expression follows the function"
+        return ""
     if brackets:
         return "a raw dispatcher must keep its brackets balanced"
     if opened == 0:
@@ -337,6 +363,10 @@ def _key_is_plausible(norm_key: str) -> bool:
     """
     parts = [p.strip() for p in (norm_key or "").split("+")]
     if not parts or any(not p for p in parts):
+        return False
+    if len(parts) == 1 and parts[0].upper() in _MODIFIER_NAMES:
+        # A lone modifier is not a keysym: Hyprland binds nothing, and the panel
+        # used to report it saved.
         return False
     for part in parts[:-1]:
         if part.upper() not in _MODIFIER_NAMES:
@@ -1601,26 +1631,33 @@ def normalize_key_chord(key_chord: str) -> str:
 
 
 def get_mouse_scroll_settings():
-    """Retrieve active Hyprland mouse scroll configuration (scroll_factor & natural_scroll)."""
-    settings = {"natural_scroll": False, "scroll_factor": 1.0}
-    try:
-        res = subprocess.run([_hyprctl()] + ["hyprctl", "getoption", "input:scroll_factor", "-j"][1:], capture_output=True, text=True, timeout=10)
-        if res.returncode == 0:
-            data = json.loads(res.stdout)
-            if "float" in data:
-                settings["scroll_factor"] = float(data["float"])
-    except Exception:
-        pass
+    """Read the compositor's scroll factor and natural-scroll flag.
 
-    try:
-        res = subprocess.run([_hyprctl()] + ["hyprctl", "getoption", "input:natural_scroll", "-j"][1:], capture_output=True, text=True, timeout=10)
-        if res.returncode == 0:
+    One resolver, one short timeout, and an explicit `available` flag: the old
+    version spawned hyprctl twice with a 10 s timeout each (a wedged compositor
+    added 20 s to every `list`), and an empty trusted path made argv[0] = "" whose
+    failure was swallowed, so the panel showed 1.0/False as if read.
+    """
+    settings = {"natural_scroll": False, "scroll_factor": 1.0, "available": False}
+    hyprctl = _hyprctl()
+    if not hyprctl:
+        return settings
+    for name, key in (("input:scroll_factor", "float"), ("input:natural_scroll", "bool")):
+        try:
+            res = subprocess.run([hyprctl, "getoption", name, "-j"],
+                                 capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        if res.returncode != 0:
+            continue
+        try:
             data = json.loads(res.stdout)
-            if "bool" in data:
-                settings["natural_scroll"] = bool(data["bool"])
-    except Exception:
-        pass
-
+        except ValueError:
+            continue
+        if key in data:
+            settings["scroll_factor" if key == "float" else "natural_scroll"] = (
+                float(data["float"]) if key == "float" else bool(data["bool"]))
+            settings["available"] = True
     return settings
 
 
@@ -1788,6 +1825,39 @@ def parse_user_bindings():
     return result
 
 
+def _chords_disabled_by_unbind():
+    """Chords that Hyprland ends up with NO binding for.
+
+    ``hl.unbind(k)`` removes the binds on ``k`` registered BEFORE it, so an unbind
+    at the top shadows only the default while a user bind after it stays live. Only
+    a chord whose unbind comes after its last bind (or that has no bind at all) is
+    actually disabled.
+    """
+    try:
+        content = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except (OSError, UnicodeDecodeError):
+        content = None
+    if not content:
+        return set()
+    last_bind = {}
+    last_unbind = {}
+    for index, (_lines, text, is_comment) in enumerate(_lua_units(content.splitlines())):
+        if is_comment or not text:
+            continue
+        m_unbind = _search_in_code(
+            r'\bhl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', text)
+        if m_unbind:
+            value, _end, ok = _read_lua_string(text, m_unbind.end())
+            if ok and value:
+                last_unbind[normalize_key_chord(value)] = index
+            continue
+        parsed = _parse_bind_line(text)
+        if parsed:
+            last_bind[normalize_key_chord(parsed[0])] = index
+    return {k for k in last_unbind
+            if k not in last_bind or last_unbind[k] > last_bind[k]}
+
+
 def build_complete_model():
     """
     Construct the unified model of active bindings, catalog, conflicts, and mouse scroll settings.
@@ -1839,7 +1909,10 @@ def build_complete_model():
             all_active.append(item)
             continue
 
-        same_key_user_bind = next((ub for ub in user_state["binds"] if ub["key"] == k and ub["key"] not in matched_user_bind_keys), None)
+        same_key_user_bind = next(
+            (ub for ub in user_state["binds"]
+             if ub["key"] == k and ub["key"] not in matched_user_bind_keys
+             and not ub.get("_consumed_by_default")), None)
         if same_key_user_bind:
             item = dict(same_key_user_bind)
             item["status"] = "modified" if same_key_user_bind["description"].lower() == d["description"].lower() else "custom"
@@ -1873,6 +1946,16 @@ def build_complete_model():
         item["category"] = "Custom"
         item["default_key"] = ""
         all_active.append(item)
+
+    # 2b. A chord carrying an hl.unbind is DISABLED in Hyprland, whatever its own
+    #     statement says: Disable keeps the user's line (so Enable can bring it
+    #     back), and that used to leave the row looking live with no Enable button.
+    disabled_chords = _chords_disabled_by_unbind()
+    for item in all_active:
+        if (item.get("status") in ("modified", "custom")
+                and item.get("key") in disabled_chords):
+            item["status"] = "disabled"
+            item["disabled_row"] = True
 
     # 3. Sort Alphabetically by Description (case-insensitive)
     all_active.sort(key=lambda x: (x.get("description", "").lower(), x.get("key", "")))
@@ -2390,6 +2473,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     if lines_to_add:
         for entry in lines_to_add:
             key = normalize_key_chord(entry.get("key", ""))
+            if not key or not _key_is_plausible(key):
+                # Fail closed at the sink: a future caller with an unsafe key used
+                # to make the writer emit o.bind("", ...) and report success.
+                raise ValueError("invalid key combination")
             stored_raw = (entry.get("raw_key") or "").strip()
             if (stored_raw and normalize_key_chord(stored_raw) == key
                     and _key_is_plausible(stored_raw)
@@ -2644,7 +2731,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 mode = 0o600
             # Keep the owner bits, drop group/world WRITE: this file is Lua that
             # Hyprland executes, and the plugin must not hand back a writable copy.
-            mode &= ~(stat.S_IWGRP | stat.S_IWOTH)
+            mode &= ~(stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
             try:
                 os.fchmod(fd, mode | stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
@@ -2910,8 +2997,11 @@ def reset_keybinding(key: str, default_key: str = "", description: str = "",
         if identity:
             # Identity-scoped: the chord may still carry a SIBLING binding the user
             # never clicked (Omarchy ships ALT+TAB twice), so requiring the whole
-            # chord to be absent refused a legitimate delete.
-            write_user_bindings(keys_to_remove=[norm_key], previous_entry=identity,
+            # chord to be absent refused a legitimate delete. The default chord is
+            # still part of the reset: a MOVED override leaves its hl.unbind behind,
+            # and dropping it here left the shipped shortcut dead while the panel
+            # toasted success.
+            write_user_bindings(keys_to_remove=keys_to_remove, previous_entry=identity,
                                 require_removal=True)
         else:
             write_user_bindings(keys_to_remove=keys_to_remove,
