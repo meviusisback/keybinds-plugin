@@ -186,6 +186,16 @@ Item {
   // A COMPLETE quoted literal is data, though - the backend stores it as the string
   // and it runs through the shell, so a command that merely starts with "{" or "hl."
   // (a brace group: "{ a; b; }") must not be refused here.
+  function keyIsOnlyModifiers(chord) {
+    var parts = String(chord || "").split("+").map(function (p) { return p.trim().toLowerCase() })
+    if (parts.length === 0 || parts[parts.length - 1] === "") return true
+    var mods = ["super", "ctrl", "alt", "shift", "meta", "hyper", "mod"]
+    for (var i = 0; i < parts.length; i++) {
+      if (mods.indexOf(parts[i]) === -1) return false
+    }
+    return true
+  }
+
   function isRawAction(a) {
     if (!a) return false
     if (/^\s*"(?:[^"\\]|\\.)*"\s*$/.test(a) || /^\s*'(?:[^'\\]|\\.)*'\s*$/.test(a)) return false
@@ -1620,7 +1630,11 @@ Item {
             selected: true
             horizontalPadding: Style.space(22)
             verticalPadding: Style.space(6)
-            enabled: root.actionTitle.trim().length > 0 && root.actionKey.trim().length > 0 && (root.actionCommand.trim().length > 0 || (root.actionDispatcher && root.actionDispatcher.trim().length > 0))
+            // A lone modifier is refused by the backend ("Invalid key combination"),
+            // so Save must not look ready for it.
+            enabled: root.actionTitle.trim().length > 0 && root.actionKey.trim().length > 0
+                     && !root.keyIsOnlyModifiers(root.actionKey)
+                     && (root.actionCommand.trim().length > 0 || (root.actionDispatcher && root.actionDispatcher.trim().length > 0))
             onClicked: {
               // Raw Lua is written only from the dispatcher slot, which this
               // dialog fills from a catalog preset or from the binding being

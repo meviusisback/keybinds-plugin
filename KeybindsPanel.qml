@@ -41,6 +41,10 @@ Item {
 
   // Menu entry setup (first-run)
   property bool menuEntryChecked: false
+  // False when the backend cannot certify bindings.lua: every save is refused, so
+  // the Edit form must not be offered either.
+  readonly property bool fileReadable: root.modelData.file_readable !== false
+  readonly property string fileBlockedReason: String(root.modelData.file_blocked_reason || "")
   property bool launcherEntryInstalled: false
 
   readonly property var categories: [
@@ -217,6 +221,13 @@ Item {
       .replace(/[\x00-\x1F\x7F]/g, " ")
       .replace(/[<>&"']/g, "")
       .slice(0, 120)
+  }
+
+  // A blocked reason is a sentence, not a label: sanitise it without cutting it.
+  function reasonText(s) {
+    return String(s === undefined || s === null ? "" : s)
+      .replace(/[\x00-\x1F\x7F]/g, " ")
+      .replace(/[<>&"']/g, "")
   }
 
   function clearFindHolds() {
@@ -1081,6 +1092,7 @@ Item {
                       // Edit
                       Button {
                         iconText: "✏️"
+                        visible: root.fileReadable
                         tooltipText: "Modify Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
@@ -1094,7 +1106,7 @@ Item {
                         iconText: "✓"
                         accent: "#4CAF50"
                         tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
-                                     ? activeRow.modelData.blocked_reason : "Re-enable Keybinding"
+                                     ? root.reasonText(activeRow.modelData.blocked_reason) : "Re-enable Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.enableKeybinding(activeRow.modelData.key)
@@ -1105,7 +1117,7 @@ Item {
                         visible: Boolean(activeRow.modelData && activeRow.modelData.can_reset)
                         iconText: "↺"
                         tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
-                                     ? activeRow.modelData.blocked_reason
+                                     ? root.reasonText(activeRow.modelData.blocked_reason)
                                      : "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
@@ -1122,7 +1134,7 @@ Item {
                                               || activeRow.modelData.can_disable))
                         iconText: Boolean(activeRow.modelData && activeRow.modelData.can_delete) ? "🗑️" : "⊘"
                         tooltipText: Boolean(activeRow.modelData && activeRow.modelData.blocked_reason)
-                                     ? activeRow.modelData.blocked_reason
+                                     ? root.reasonText(activeRow.modelData.blocked_reason)
                                      : (Boolean(activeRow.modelData && activeRow.modelData.can_delete)
                                         ? "Delete custom binding" : "Disable binding")
                         horizontalPadding: Style.space(8)
@@ -1286,6 +1298,24 @@ Item {
                           font.bold: true
                         }
 
+                        // Same reason marker as the list above: this tab also lists
+                        // rows whose controls are all hidden.
+                        Text {
+                          visible: Boolean(modRow.modelData && modRow.modelData.blocked_reason)
+                          text: "ⓘ"
+                          textFormat: Text.PlainText
+                          color: root.urgent
+                          font.family: Style.font.family
+                          font.pixelSize: Style.font.caption
+                          Layout.alignment: Qt.AlignVCenter
+                          MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
+                            onEntered: root.showToast(modRow.modelData.blocked_reason, true)
+                          }
+                        }
+
                         BorderSurface {
                           Layout.preferredHeight: Style.space(16)
                           Layout.preferredWidth: modCatLabel.implicitWidth + Style.space(8)
@@ -1329,6 +1359,7 @@ Item {
 
                       Button {
                         iconText: "✏️"
+                        visible: root.fileReadable
                         tooltipText: "Modify Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
@@ -1341,7 +1372,7 @@ Item {
                         iconText: "✓"
                         accent: "#4CAF50"
                         tooltipText: Boolean(modRow.modelData && modRow.modelData.blocked_reason)
-                                     ? modRow.modelData.blocked_reason : "Re-enable Keybinding"
+                                     ? root.reasonText(modRow.modelData.blocked_reason) : "Re-enable Keybinding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.enableKeybinding(modRow.modelData.key)
@@ -1350,7 +1381,9 @@ Item {
                       Button {
                         visible: Boolean(modRow.modelData && modRow.modelData.can_reset)
                         iconText: "↺"
-                        tooltipText: "Reset to Default (" + root.plainText(modRow.modelData && modRow.modelData.default_key) + ")"
+                        tooltipText: Boolean(modRow.modelData && modRow.modelData.blocked_reason)
+                                     ? root.reasonText(modRow.modelData.blocked_reason)
+                                     : "Reset to Default (" + root.plainText(modRow.modelData && modRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key,
@@ -1362,7 +1395,9 @@ Item {
                       Button {
                         visible: Boolean(modRow.modelData && modRow.modelData.can_delete)
                         iconText: "🗑️"
-                        tooltipText: "Delete custom binding"
+                        tooltipText: Boolean(modRow.modelData && modRow.modelData.blocked_reason)
+                                     ? root.reasonText(modRow.modelData.blocked_reason)
+                                     : "Delete custom binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: root.resetKeybinding(modRow.modelData.key, "",

@@ -2132,9 +2132,17 @@ class TestRoundThirteenRegressions(TestRoundTwelveRegressions):
         key = "SUPER + SHIFT + B"
         keybinds_manager.set_keybinding(key, "Browser Override", "my-browser")
         keybinds_manager.disable_keybinding(key, "Browser Override", "my-browser")
-        row = self._row_for(key)
+        # The row that carries the override: the shipped default on the same chord is
+        # shadowed by it, and offers neither Reset nor Enable (both would be lies).
+        rows = [b for b in keybinds_manager.build_complete_model()["active"]
+                if b["key"] == key]
+        row = next(b for b in rows if b["description"] == "Browser Override")
+        shadowed = next(b for b in rows if b["description"] == "Browser")
         self.assertEqual(row["status"], "disabled")
         self.assertTrue(row["disabled_row"])
+        self.assertTrue(shadowed["blocked_reason"])
+        self.assertFalse(shadowed["can_enable"])
+        self.assertFalse(shadowed["can_reset"])
         # A row on a default chord is restored (Reset); Delete belongs to custom rows.
         self.assertTrue(row["can_reset"])
         self.assertFalse(row["can_delete"])
@@ -2487,6 +2495,145 @@ class TestRoundEighteenCertification(unittest.TestCase):
         result = keybinds_manager.set_keybinding("SUPER + F13", "A", "true", old_key="SUPER + W",
                                         old_description="A", keep_disabled=True)
         self.assertTrue(result["success"], result.get("error"))
+
+
+class TestRoundNineteenCertification(unittest.TestCase):
+    """Shapes that certified and made Enable delete the user's own unbind."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = pathlib.Path(self.tmp)
+        (self.home / ".config" / "hypr").mkdir(parents=True)
+        self.path = self.home / ".config" / "hypr" / "bindings.lua"
+        self._old = {}
+        for attr, value in (("USER_BINDINGS_PATH", self.path), ("HOME", self.tmp)):
+            if attr == "HOME":
+                self._old[attr] = os.environ.get("HOME")
+                os.environ["HOME"] = value
+                continue
+            self._old[attr] = getattr(keybinds_manager, attr)
+            setattr(keybinds_manager, attr, value)
+
+    def tearDown(self):
+        for attr, value in self._old.items():
+            if attr == "HOME":
+                os.environ["HOME"] = value
+            else:
+                setattr(keybinds_manager, attr, value)
+
+    def _write(self, text):
+        self.path.write_text(text, encoding="utf-8")
+
+    def test_computed_index_is_unreadable(self):
+        self._write('local k = "bind"\no[k]("SUPER + W", "mine", "s")\nhl.unbind("SUPER + W")\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+        res = keybinds_manager.enable_keybinding("SUPER + W")
+        self.assertFalse(res["success"])
+        self.assertIn('hl.unbind("SUPER + W")', self.path.read_text(encoding="utf-8"))
+
+    def test_parenless_and_bracket_alias_are_unreadable(self):
+        for body in ('o.helper "SUPER + W"\nhl.unbind("SUPER + W")\n',
+                     'local b = o["bind"]\nb "SUPER + W"\nhl.unbind("SUPER + W")\n',
+                     'hl["un" .. "bind"]("SUPER + W")\nhl.unbind("SUPER + W")\n'):
+            with self.subTest(body):
+                self._write(body)
+                self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+
+    def test_a_bind_nested_in_control_flow_is_unreadable(self):
+        self._write('if true then o.bind("SUPER + W", "mine", "s") end\n'
+                    'hl.unbind("SUPER + W")\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + W")["success"])
+
+    def test_an_unbind_with_an_unreadable_chord_is_unreadable(self):
+        for body in ('hl.unbind(k)\n', 'hl.unbind("\\x53UPER + W")\n',
+                     'hl.unbind(("SUPER + W"))\n'):
+            with self.subTest(body):
+                self._write(body)
+                self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+
+    def test_a_chord_free_helper_still_certifies(self):
+        self._write('hl.config({ gaps_in = 4 })\n'
+                    'hl.on("hyprland.start", function() hl.exec_cmd("nm-applet") end)\n'
+                    'o.bind("SUPER + F6", "Mine", "my-cmd")\n')
+        self.assertFalse(keybinds_manager._file_has_unreadable_binds())
+
+    def test_an_undecodable_file_is_unreadable(self):
+        self.path.write_bytes(b'o.bind("SUPER + W", "d", "c")\n-- caf\xe9\n')
+        self.assertTrue(keybinds_manager._file_has_unreadable_binds())
+
+    def test_no_enable_on_a_chord_that_carries_my_own_bind(self):
+        self._write('o.bind("SUPER + W", "Mine", "a")\n'
+                    'o.bind("SUPER + W", "Theirs", "b")\n'
+                    'hl.unbind("SUPER + W")\n')
+        model = keybinds_manager.build_complete_model()
+        rows = [b for b in model["active"] if b["key"] == "SUPER + W"]
+        self.assertTrue(rows)
+        self.assertFalse(any(b.get("can_enable") for b in rows))
+
+    def test_renaming_a_disabled_row_is_not_a_collision_with_itself(self):
+        self._write('o.bind("SUPER + B", "Old name", "cmd")\nhl.unbind("SUPER + B")\n')
+        res = keybinds_manager.set_keybinding(
+            "SUPER + B", "New name", "cmd", old_key="SUPER + B",
+            old_description="Old name", old_command="cmd", keep_disabled=True)
+        self.assertTrue(res["success"], res.get("error"))
+        self.assertIn("New name", self.path.read_text(encoding="utf-8"))
+
+
+class TestRoundNineteenGuards(unittest.TestCase):
+    """Guards that a deletion sweep showed nothing was pinning."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        (self.tmp / ".config" / "hypr").mkdir(parents=True)
+        self.path = self.tmp / ".config" / "hypr" / "bindings.lua"
+        self.path.write_text("", encoding="utf-8")
+        self._old = {}
+        for attr, value in (("USER_BINDINGS_PATH", self.path), ("HOME", str(self.tmp))):
+            if attr == "HOME":
+                self._old[attr] = os.environ.get("HOME")
+                os.environ["HOME"] = value
+                continue
+            self._old[attr] = getattr(keybinds_manager, attr)
+            setattr(keybinds_manager, attr, value)
+
+    def tearDown(self):
+        for attr, value in self._old.items():
+            if attr == "HOME":
+                os.environ["HOME"] = value
+            else:
+                setattr(keybinds_manager, attr, value)
+
+    def _symlink_target(self, target, link_name="bindings.lua"):
+        link = self.path.parent / link_name
+        os.symlink(str(target), str(link))
+        return link
+
+    def test_a_target_outside_home_is_refused(self):
+        outside = pathlib.Path(tempfile.mkdtemp()) / "bindings.lua"
+        outside.write_text("-- outside\n", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, str(outside.parent), True)
+        os.unlink(self.path)
+        self._symlink_target(outside)
+        res = keybinds_manager.set_keybinding("SUPER + F13", "x", "true")
+        self.assertFalse(res["success"])
+        self.assertEqual(outside.read_text(encoding="utf-8"), "-- outside\n")
+
+    def test_a_credential_directory_is_refused(self):
+        for denied in (".ssh", ".gnupg", ".aws"):
+            with self.subTest(denied):
+                folder = self.tmp / denied
+                folder.mkdir(exist_ok=True)
+                victim = folder / "bindings.lua"
+                victim.write_text("-- private\n", encoding="utf-8")
+                if self.path.is_symlink() or self.path.exists():
+                    os.unlink(self.path)
+                self._symlink_target(victim)
+                res = keybinds_manager.set_keybinding("SUPER + F13", "x", "true")
+                self.assertFalse(res["success"])
+                self.assertEqual(victim.read_text(encoding="utf-8"), "-- private\n")
 
 
 if __name__ == "__main__":

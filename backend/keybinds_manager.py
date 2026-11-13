@@ -683,13 +683,22 @@ def _call_span(code: str, open_idx: int) -> int:
 
 
 def _unit_certification_problem(text: str) -> str:
-    """Why this unit cannot be certified, or "" when it can.
+    r"""Why this unit cannot be certified, or "" when it can.
 
     ONE predicate for the model and the writer: they used to disagree, so a row
-    published a button the other side then refused. A unit certifies only when
-    everything in code position is a bind we can read or an ``hl.unbind`` we can
-    read; anything else (a second statement, an alias such as ``local b = o.bind``,
-    a call through a helper, a chord written with escapes) is unreadable.
+    published a control the other side then refused. The unit certifies only when,
+    after removing the calls we understand, nothing is left in code position:
+
+    * a bind head must be the unit's own top-level statement (a bind nested in
+      ``if ... then`` or inside ``hl.on(..., function() ... end)`` is invisible to
+      ``parse_user_bindings``, so it must make the file unreadable instead);
+    * its chord must be one plain literal (\x53 / \83 / \u{53} are a different
+      string to us than to Lua);
+    * an ``hl.unbind`` we blank must have a chord we can read, or Enable would claim
+      to have re-enabled a key it never touched;
+    * nothing else may remain: a computed index (``o[k](``), a parenless call
+      (``o.helper "x"``), a bracket alias, a second statement, a wrapper or
+      ``require`` all make the file unreadable.
     """
     code = _code_only(text)
     if not code.strip():
@@ -697,60 +706,145 @@ def _unit_certification_problem(text: str) -> str:
     heads = _bind_heads_in(text)
     if len(heads) > 1:
         return "two statements on one line"
+    _unbind_re = re.compile(
+        r"\bhl\s*(?:\.\s*unbind|\[\s*[\"']unbind[\"']\s*\])\s*\(")
+    _unbinds = [m for m in _unbind_re.finditer(text)]
+    if (heads or _unbinds) and not _unit_is_single_statement(text):
+        # A second statement in the same unit: the writer refuses to cut the line,
+        # so the panel must not offer the control in the first place.
+        return "another statement on this line"
     span_free = list(code)
     for pos in heads:
+        if "".join(span_free[:pos]).strip():
+            # Something precedes the head in code position: an `if`, a `local`
+            # alias, or another call. A bind there is invisible to the parser.
+            return "a binding registered through an alias"
         if not _chord_of_head(text, pos):
             return "a key Botty cannot read"
-        # \x53 / \83 / \u{53} are the same chord to Lua and something else to us, so
-        # they were certified and then mis-read. Read the raw literal, not the mask.
         open_idx = code.find("(", pos)
-        if open_idx != -1:
-            quote_at = -1
-            for _q in (text.find('"', open_idx), text.find("'", open_idx)):
-                if _q != -1 and (quote_at == -1 or _q < quote_at):
-                    quote_at = _q
-            if quote_at != -1:
-                j = quote_at + 1
-                while j < len(text) and text[j] != text[quote_at]:
-                    if text[j] == "\\":
-                        return "a key written with escapes"
-                    j += 1
+        if open_idx != -1 and _lua_string_has_escapes(text, open_idx):
+            return "a key written with escapes"
         end = _call_span(code, open_idx) if open_idx != -1 else len(code)
-        # Blank the head too (``o.bind``), not only the parentheses.
-        head_start = open_idx
-        while head_start > 0 and (code[head_start - 1].isalnum()
-                                  or code[head_start - 1] in "_.:"):
-            head_start -= 1
-        for i in range(head_start, min(end, len(code))):
+        # Blank the head from its own start (``o["bind"]`` included), not from a
+        # backward scan that stops at the bracket.
+        for i in range(pos, min(end, len(code))):
             span_free[i] = " "
-    # A bind hidden inside another call (hl.on("x", function() hl.bind(..) end))
-    # would slip through the blanking below, so check the strict mask first.
-    _strict = list(code)
-    for pos in heads:
-        _open = code.find("(", pos)
-        _end = _call_span(code, _open) if _open != -1 else len(code)
-        for i in range(pos, min(_end, len(code))):
-            _strict[i] = " "
-    if re.search(r"\b(?:bind|bind_toggle|bind_hold)\b", "".join(_strict)):
-        return "a binding registered through an alias"
 
-    # hl.unbind(...) units are ours to remove, so they are readable.
-    for m in re.finditer(r"\bhl\s*(?:\.\s*unbind|\[\s*[\"']unbind[\"']\s*\])\s*\(",
-                         "".join(span_free)):
-        end = _call_span("".join(span_free), m.end() - 1)
-        for i in range(m.start(), min(end, len(span_free))):
-            span_free[i] = " "
+    # hl.unbind(...) units are ours to remove, but only when we can read the chord:
+    # a computed or escaped chord made Enable answer "re-enabled" about a key it
+    # could not find.
     rest = "".join(span_free)
-    # Chord-free helpers are fine: they cannot put a binding on a key. Anything
-    # else might (o.<custom>(...), a wrapper, require(...)), so it is not readable.
-    rest = re.sub(r"\bhl\s*\.\s*(?:config|env|on|exec|exec_cmd|notify|dsp"
-                  r"(?:\s*\.\s*[A-Za-z_][\w]*)?)\s*\(", " ", rest)
-    rest = re.sub(r"\bfunction\s*\(", " ", rest)
-    if re.search(r"[A-Za-z_][\w.:]*\s*\(", rest):
-        return "a call Botty does not model"
-    if re.search(r"\b(?:load|loadstring|require|dofile)\b", rest):
-        # `local b = require(...)` can register a binding no head shows.
+    for m in reversed(_unbinds):
+        open_idx = m.end() - 1
+        if _lua_string_has_escapes(text, open_idx):
+            return "a key written with escapes"
+        arg = _read_lua_string(text, open_idx + 1)
+        if not arg[2] or not str(arg[0] or "").strip():
+            # hl.unbind(k) / hl.unbind(("K")): the chord is not a plain literal.
+            return "a key Botty cannot read"
+        end = _call_span(rest, open_idx)
+        span_free = list(rest)
+        for i in range(m.start(), min(end, len(rest))):
+            span_free[i] = " "
+        rest = "".join(span_free)
+
+    # Chord-free helpers cannot put a binding on a key, so they stay readable.
+    for pattern in (
+            r"\bhl\s*\.\s*(?:config|env|on|exec|exec_cmd|notify)\s*\(",
+            r"\bhl\s*\.\s*dsp(?:\s*\.\s*[A-Za-z_][\w]*)?\s*\(",
+    ):
+        while True:
+            m = re.search(pattern, rest)
+            if not m:
+                break
+            end = _call_span(rest, m.end() - 1)
+            rest = rest[:m.start()] + " " * (end - m.start()) + rest[end:]
+    rest = re.sub(r"\bfunction\s*\(", " " * 10, rest)
+
+    # What is left must be nothing, or a plain local assignment of a literal.
+    if rest.strip() and not re.fullmatch(
+            r"\s*local\s+[A-Za-z_]\w*\s*=\s*[-+0-9.eE\s]*", rest):
+        if re.search(r"[A-Za-z_][\w.:]*\s*[\[(]", rest):
+            return "a call Botty does not model"
         return "a binding registered through an alias"
+    return ""
+
+
+def _lua_string_has_escapes(text: str, open_idx: int) -> bool:
+    """True when the first string literal after ``open_idx`` contains an escape."""
+    quote_at = -1
+    for q in (text.find('"', open_idx), text.find("'", open_idx)):
+        if q != -1 and (quote_at == -1 or q < quote_at):
+            quote_at = q
+    if quote_at == -1:
+        return False
+    j = quote_at + 1
+    while j < len(text) and text[j] != text[quote_at]:
+        if text[j] == "\\":
+            return True
+        j += 1
+    return False
+
+
+def _chord_occupancy() -> dict:
+    """For each chord in the file: how many binds it holds and whether an unbind
+    is the chord's last statement with no bind after it (what Enable can remove)."""
+    out = {}
+    try:
+        raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except Exception:
+        return out
+    if not raw:
+        return out
+    lines, _nl = _split_lines(raw)
+    last_kind = {}
+    for _ul, text, is_comment in _lua_units(lines):
+        if is_comment or not text:
+            continue
+        for pos in _bind_heads_in(text):
+            chord = _chord_of_head(text, pos)
+            if chord:
+                entry = out.setdefault(chord, {"binds": 0, "unbind_only": False,
+                                               "rows": []})
+                entry["binds"] += 1
+                entry["unbind_only"] = False
+                parsed = _parse_bind_line(text[pos:].split("\n")[0])
+                if parsed:
+                    entry["rows"].append(((parsed[1] or "").strip().lower(),
+                                          _identity_value(parsed[2])))
+        for m in re.finditer(
+                r"\bhl\s*(?:\.\s*unbind|\[\s*[\"']unbind[\"']\s*\])\s*\(", text):
+            arg = _read_lua_string(text, m.end())
+            chord = normalize_key_chord(str(arg[0] or "")) if arg[2] else ""
+            if chord:
+                entry = out.setdefault(chord, {"binds": 0, "unbind_only": False,
+                                               "rows": []})
+                entry["unbind_only"] = True
+    return out
+
+
+def _file_unreadable_reason() -> str:
+    """The first reason this file cannot be certified, or "" when it can.
+
+    A file we cannot READ is unreadable too: an undecodable byte or an oversized
+    file used to certify as fine, and the row then answered with a raw codec message.
+    """
+    try:
+        raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except Exception:
+        return "a file Botty cannot read"
+    if not raw:
+        return ""
+    if _has_bare_cr(raw):
+        # A CR is a statement boundary to Lua but not to our line splitter.
+        return "a CR line ending"
+    lines, _newline = _split_lines(raw)
+    for _unit_lines, text, is_comment in _lua_units(lines):
+        if is_comment or not text:
+            continue
+        problem = _unit_certification_problem(text)
+        if problem:
+            return problem
     return ""
 
 
@@ -760,34 +854,31 @@ def _file_has_unreadable_binds() -> bool:
     The writer refuses to guess in that state (a computed key could be on the chord
     being enabled), so the model must not offer Enable/Reset either.
     """
-    try:
-        raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
-    except Exception:
-        return False
-    if not raw:
-        return False
-    if _has_bare_cr(raw):
-        # A CR is a statement boundary to Lua but not to our line splitter: refuse to
-        # certify anything about the file rather than guess.
-        return True
-    lines, _newline = _split_lines(raw)
-    for _unit_lines, text, is_comment in _lua_units(lines):
-        if is_comment or not text:
-            continue
-        if _unit_certification_problem(text):
-            return True
-    return False
+    return bool(_file_unreadable_reason())
 
 
-def _chord_has_other_live_bind(chord: str, description: str, action: str) -> bool:
-    """True when a DIFFERENT live user binding sits on this chord."""
+def _chord_has_other_live_bind(chord: str, description: str, action: str,
+                               skip_description: str = "",
+                               skip_command: str = "") -> bool:
+    """True when a DIFFERENT live user binding sits on this chord.
+
+    ``skip_*`` name the row being edited, so renaming it is not mistaken for a
+    sibling: the check used to compare the NEW description and then refuse the
+    user's own line as "another binding of yours".
+    """
     desc = (description or "").strip().lower()
     act = _identity_value(action)
+    skip_desc = (skip_description or "").strip().lower()
+    skip_cmd = _identity_value(skip_command)
     for ub in parse_user_bindings()["binds"]:
         if ub["key"] != chord:
             continue
-        if ((desc and (ub.get("description", "") or "").strip().lower() == desc)
-                or (act and _identity_value(ub.get("action")) == act)):
+        ub_desc = (ub.get("description", "") or "").strip().lower()
+        ub_act = _identity_value(ub.get("action"))
+        ub_cmd = _identity_value(ub.get("command"))
+        if skip_desc and ub_desc == skip_desc and (not skip_cmd or ub_cmd == skip_cmd):
+            continue
+        if (desc and ub_desc == desc) or (act and ub_act == act):
             continue
         return True
     return False
@@ -1948,15 +2039,15 @@ def get_mouse_scroll_settings():
         return settings
     for name, key in (("input:scroll_factor", "float"), ("input:natural_scroll", "bool")):
         try:
-            res = subprocess.run([hyprctl, "getoption", name, "-j"],
-                                 capture_output=True, text=True, timeout=2,
-                                 start_new_session=True)
+            # Same group kill as reload: a wedged hyprctl used to leave its own
+            # children behind on every `list`.
+            _rc, _out = _run_in_own_group([hyprctl, "getoption", name, "-j"], 2)
         except Exception:
             continue
-        if res.returncode != 0:
+        if _rc != 0:
             continue
         try:
-            data = json.loads(res.stdout)
+            data = json.loads(_out or "")
         except ValueError:
             continue
         if key in data:
@@ -2297,8 +2388,11 @@ def build_complete_model():
     # What the row can do, decided HERE: the panel used to gate Reset on
     # status=='modified' and Delete on status=='custom', so a disabled override
     # was listed with neither button and could only be removed via Enable.
-    live_chords = {b["key"] for b in all_active
-                   if b.get("status") in ("default", "modified", "custom")}
+    # Per-chord facts from the FILE, not from row status: a chord with one of the
+    # user's binds on it is occupied whatever a row says, and Enable only works on a
+    # chord whose last statement is an unbind with no bind after it.
+    _occupancy = _chord_occupancy()
+    live_chords = {k for k, v in _occupancy.items() if v["binds"]}
     _unreadable = _file_has_unreadable_binds()
     _blocked_reason = ("Botty cannot read every binding in your file (a computed or "
                        "escaped key, two statements on one line, a CR line ending, a "
@@ -2309,7 +2403,12 @@ def build_complete_model():
         on_default_chord = bool(item.get("default_key"))
         # Reset restores the shipped action, so it is the right control for ANY row
         # tied to a default chord - including one disabled by a hand-written unbind.
-        _shadowed = (status == "disabled" and item["key"] in live_chords)
+        # "Shadowed" is another of YOUR binds on this chord, not this row's own line.
+        _desc = (item.get("description", "") or "").strip().lower()
+        _act = _identity_value(item.get("action"))
+        _others = [r for r in _occupancy.get(item["key"], {}).get("rows", [])
+                   if not ((_desc and r[0] == _desc) or (_act and r[1] == _act))]
+        _shadowed = (status == "disabled" and bool(_others))
         item["can_reset"] = (on_default_chord and status in ("modified", "disabled")
                              and not _shadowed and not _unreadable)
         if _shadowed:
@@ -2325,13 +2424,18 @@ def build_complete_model():
         # chord's unbind belongs to THAT move. Re-enabling this one would re-arm both.
         _sibling_moved = any(
             other is not item
-            and other.get("default_key") and other["key"] == item["key"]
+            and other.get("default_key") == item["key"]
             and (other.get("description") or "").strip().lower()
             != (item.get("description") or "").strip().lower()
             and other.get("status") in ("modified", "custom")
             for other in all_active)
-        item["can_enable"] = (status == "disabled" and item["key"] not in live_chords
-                              and not _unreadable and not _sibling_moved)
+        # Enable removes the unbind that hides the chord, so it works only when the
+        # chord ends in an unbind and carries no bind of yours: otherwise the click
+        # re-arms the wrong action (or nothing at all) and still toasts "re-enabled".
+        _st = _occupancy.get(item["key"], {"binds": 0, "unbind_only": False})
+        item["can_enable"] = (status == "disabled" and _st["unbind_only"]
+                              and not _others and not _unreadable
+                              and not _sibling_moved)
         if (_sibling_moved and status == "disabled"
                 and not item.get("blocked_reason")):
             item["blocked_reason"] = ("another default on this shortcut was moved "
@@ -2600,7 +2704,9 @@ def _code_only(text: str) -> str:
             i += 1
             while i < n:
                 if src[i] == "\\":
-                    out.append(" ")
+                    # Two source characters, two spaces: every later index taken
+                    # from the raw text has to stay valid against the mask.
+                    out.append("  ")
                     i += 2
                     continue
                 out.append(" " if src[i] != "\n" else "\n")
@@ -2871,13 +2977,16 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     _units = list(_lua_units(current_lines))
     _bind_index_by_chord = {}
     _unreadable_binds = _has_bare_cr(existing_content or "")
+    _unreadable_reason = "a CR line ending" if _unreadable_binds else ""
     for _i, (_ul, _ut, _uc) in enumerate(_units):
         if _uc or not _ut:
             continue
         _heads = _bind_heads_in(_ut)
-        if _unit_certification_problem(_ut):
+        _problem = _unit_certification_problem(_ut)
+        if _problem:
             # One predicate, so the panel never offers a control this refuses.
             _unreadable_binds = True
+            _unreadable_reason = _unreadable_reason or _problem
         for _pos in _heads:
             _k = _chord_of_head(_ut, _pos)
             if _k:
@@ -2888,10 +2997,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 _unreadable_binds = True
     if (unbind_only_keys or clean_keys or remove_unbinds_only) and _unreadable_binds:
         raise ValueError(
-            "this file holds a binding Botty cannot read (a computed key, two "
-            "statements on one line, a CR line ending or another hl.* call); "
-            "nothing was written: refusing to remove an unbind that might belong "
-            "to it")
+            "this file holds a binding Botty cannot read ("
+            + (_unreadable_reason or "a key or statement Botty does not model")
+            + "); nothing was written: refusing to remove an unbind that might "
+              "belong to it")
 
     trailing_unbind_units = set()
     for _i, (_ul, _ut, _uc) in enumerate(_units):
@@ -3434,7 +3543,8 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     # written (checking after the first write reported "not saved" about a file that
     # had already changed).
     if keep_disabled and _chord_has_other_live_bind(
-            norm_key, description, ""):
+            norm_key, description, "", skip_description=old_description,
+            skip_command=old_command):
         return {"success": False,
                 "error": ("another binding of yours uses this shortcut, so the edit "
                           "would switch it off; remove it first or edit that row")}
