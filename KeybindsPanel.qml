@@ -120,7 +120,10 @@ Item {
       oldKey || "",
       oldDesc || "",
       oldCmd || "",
-      oldAction || ""
+      oldAction || "",
+      // A row that was switched off stays off after an edit: this used to be the
+      // only control on a disabled row, and saving re-enabled the shortcut.
+      (editDialog.itemData && editDialog.itemData.status === "disabled") ? "1" : "0"
     ]
     setProc.running = true
   }
@@ -1077,7 +1080,7 @@ Item {
 
                       // Reset (if modified)
                       Button {
-                        visible: Boolean(activeRow.modelData && activeRow.modelData.status === "modified")
+                        visible: Boolean(activeRow.modelData && activeRow.modelData.can_reset)
                         iconText: "↺"
                         tooltipText: "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
@@ -1091,19 +1094,15 @@ Item {
                       // Disable / Delete
                       Button {
                         visible: Boolean(activeRow.modelData
-                                          && (activeRow.modelData.status !== "disabled"
-                                              || activeRow.modelData.status === "custom"))
-                        iconText: (activeRow.modelData
-                                   && (activeRow.modelData.status === "custom"
-                                       || (activeRow.modelData.disabled_row
-                                           && !activeRow.modelData.default_key))) ? "🗑️" : "⊘"
-                        tooltipText: (activeRow.modelData && activeRow.modelData.status === "custom") ? "Delete custom binding" : "Disable default binding"
+                                          && (activeRow.modelData.can_delete
+                                              || activeRow.modelData.can_disable))
+                        iconText: Boolean(activeRow.modelData && activeRow.modelData.can_delete) ? "🗑️" : "⊘"
+                        tooltipText: Boolean(activeRow.modelData && activeRow.modelData.can_delete)
+                                     ? "Delete custom binding" : "Disable binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: {
-                          if (activeRow.modelData.status === "custom"
-                              || (activeRow.modelData.disabled_row
-                                  && !activeRow.modelData.default_key)) {
+                          if (activeRow.modelData.can_delete) {
                             root.resetKeybinding(activeRow.modelData.key, "",
                               (activeRow.modelData.description_raw !== undefined)
                                         ? activeRow.modelData.description_raw
@@ -1306,7 +1305,7 @@ Item {
                       }
 
                       Button {
-                        visible: Boolean(modRow.modelData && modRow.modelData.status === "modified")
+                        visible: Boolean(modRow.modelData && modRow.modelData.can_reset)
                         iconText: "↺"
                         tooltipText: "Reset to Default (" + root.plainText(modRow.modelData && modRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
@@ -1318,7 +1317,7 @@ Item {
                       }
 
                       Button {
-                        visible: Boolean(modRow.modelData && modRow.modelData.status === "custom")
+                        visible: Boolean(modRow.modelData && modRow.modelData.can_delete)
                         iconText: "🗑️"
                         tooltipText: "Delete custom binding"
                         horizontalPadding: Style.space(8)

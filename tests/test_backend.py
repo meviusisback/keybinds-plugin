@@ -2098,5 +2098,101 @@ class TestRoundTwelveRegressions(unittest.TestCase):
         self.assertEqual(model["total_active"], len(model["active"]))
 
 
+class TestRoundThirteenRegressions(TestRoundTwelveRegressions):
+    """Thirteenth reviewer round: Enable, disabled rows, row identity, luac."""
+
+    def _row_for(self, key):
+        keybinds_manager.parse_user_bindings = keybinds_manager.parse_user_bindings
+        model = keybinds_manager.build_complete_model()
+        return next((b for b in model["active"] if b["key"] == key), None)
+
+    def test_enable_keeps_the_shadow_unbind_that_hides_the_default(self):
+        # Disable -> Enable used to delete EVERY unbind, so Omarchy's default came
+        # back beside the user's binding and one keypress ran both actions.
+        self._write("")
+        key = "SUPER + RETURN"  # a shipped default, so the save shadows it
+        keybinds_manager.set_keybinding(key, "Terminal Override", "my-term")
+        self.assertEqual(self._read().count('hl.unbind("' + key + '")'), 1, self._read())
+        keybinds_manager.disable_keybinding(key, "Terminal Override", "my-term")
+        self.assertEqual(self._read().count('hl.unbind("' + key + '")'), 2, self._read())
+        keybinds_manager.enable_keybinding(key)
+        text = self._read()
+        self.assertEqual(text.count('hl.unbind("' + key + '")'), 1, text)
+        self.assertIn("my-term", text)
+
+    def test_a_disabled_override_keeps_reset_and_delete(self):
+        self._write("")
+        key = "SUPER + SHIFT + B"
+        keybinds_manager.set_keybinding(key, "Browser Override", "my-browser")
+        keybinds_manager.disable_keybinding(key, "Browser Override", "my-browser")
+        row = self._row_for(key)
+        self.assertEqual(row["status"], "disabled")
+        self.assertTrue(row["disabled_row"])
+        self.assertTrue(row["can_reset"])
+        self.assertFalse(row["can_delete"])  # it sits on a default chord
+        self.assertTrue(row["can_enable"])
+
+    def test_a_second_bind_on_an_overridden_chord_stays_visible(self):
+        self._write('hl.unbind("ALT + TAB")\n'
+                    'o.bind("ALT + TAB", "Next", hl.dsp.window.cycle_next())\n'
+                    'o.bind("ALT + TAB", "Other thing", "other-cmd")\n')
+        model = keybinds_manager.build_complete_model()
+        descriptions = [b["description"] for b in model["active"]
+                        if b["key"] == "ALT + TAB"]
+        self.assertIn("Other thing", descriptions)
+
+    def test_an_existing_function_row_does_not_block_an_unrelated_save(self):
+        # The no-luac refusal compared the WHOLE rendered file, so one hand-written
+        # function row blocked every later edit and blamed the row being saved.
+        self._write('o.bind("SUPER + F6", "Existing", function() return 1 end)\n')
+        orig = keybinds_manager._trusted_binary
+        keybinds_manager._trusted_binary = lambda name: ""
+        try:
+            res = keybinds_manager.set_keybinding("SUPER + F7", "Unrelated", "plain-cmd")
+        finally:
+            keybinds_manager._trusted_binary = orig
+        self.assertTrue(res["success"], res)
+        self.assertIn("plain-cmd", self._read())
+
+    def test_a_nested_function_action_is_refused_without_a_compiler(self):
+        self._write("")
+        orig = keybinds_manager._trusted_binary
+        keybinds_manager._trusted_binary = lambda name: ""
+        try:
+            for payload in ('f(function() if x end)',
+                            't.x( function() if x end )',
+                            '{ run = ( function() if x end ) }'):
+                with self.subTest(payload=payload):
+                    res = keybinds_manager.set_keybinding("SUPER + F5", "t", "", payload)
+                    self.assertFalse(res["success"], res)
+        finally:
+            keybinds_manager._trusted_binary = orig
+
+    def test_a_bare_name_call_in_an_options_table_is_refused(self):
+        for table in ('{ locked = dofile "/tmp/pwn.lua" }',
+                      '{ locked = dofile [[/tmp/pwn.lua]] }'):
+            with self.subTest(table=table):
+                self.assertFalse(keybinds_manager._table_carries_no_code(table))
+        self.assertTrue(keybinds_manager._table_carries_no_code("{ locked = true, n = -2 }"))
+
+    def test_a_raw_dispatcher_may_not_start_with_a_long_string(self):
+        self.assertTrue(keybinds_manager._lua_single_expression_problem(
+            '[[x]] os.execute("id")'))
+
+    def test_editing_a_disabled_row_keeps_it_disabled(self):
+        self._write("")
+        key = "SUPER + SHIFT + F"
+        keybinds_manager.set_keybinding(key, "Files Override", "my-files")
+        keybinds_manager.disable_keybinding(key, "Files Override", "my-files")
+        res = keybinds_manager.set_keybinding(
+            key, "Files Override", "my-files-2",
+            old_key=key, old_description="Files Override",
+            old_command="my-files", keep_disabled=True)
+        self.assertTrue(res["success"], res)
+        text = self._read()
+        self.assertEqual(text.count('hl.unbind("' + key + '")'), 2, text)
+        self.assertIn(key, keybinds_manager._chords_disabled_by_unbind())
+
+
 if __name__ == "__main__":
     unittest.main()

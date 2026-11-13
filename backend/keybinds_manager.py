@@ -152,7 +152,9 @@ def _table_carries_no_code(table: str) -> bool:
     """
     masked = _code_mask(table)
     code = "".join(ch if masked[i] else " " for i, ch in enumerate(table))
-    if any(ch in code for ch in "()--;"):
+    if any(ch in code for ch in "();"):
+        return False
+    if "--" in code or "//" in code:
         return False
     # A name is a KEY only when it is followed by `=`, `,` or the closing brace. A
     # name followed by a dot, a colon or a literal is a call without parentheses
@@ -160,6 +162,12 @@ def _table_carries_no_code(table: str) -> bool:
     for m in re.finditer(r"[A-Za-z_][\w]*", code):
         rest = code[m.end():].lstrip()
         if rest[:1] not in ("=", ",", "}"):
+            return False
+        # The RAW text decides: masking blanks a literal, so `dofile "x"` looked
+        # like a key. A string, a long bracket or a table right after the name is
+        # a call without parentheses, which runs when Hyprland loads the file.
+        raw_rest = table[m.end():].lstrip()
+        if raw_rest[:1] in ('"', "'", "[", "{"):
             return False
     return True
 
@@ -305,6 +313,12 @@ def _lua_single_expression_problem(expr: str) -> str:
     as o.bind's fourth argument is evaluated at load time), and requires the
     outermost call or table to close exactly at the end of the text.
     """
+    # A raw dispatcher starts with a call or a table (the documented forms). A
+    # leading long-bracket string is consumed as a literal by the scanner, so
+    # "[[x]] os.execute(\"id\")" used to close nothing and pass; refuse it.
+    if re.match(r"\s*\[=*\[", expr or ""):
+        return "a raw dispatcher must start with a call or a table"
+
     if "\n" in expr or "\r" in expr:
         return "newlines are not allowed in a raw dispatcher"
     # Control bytes cannot appear in Lua source: ESC/BEL/DEL produced text luac
@@ -1674,7 +1688,8 @@ def get_mouse_scroll_settings():
     for name, key in (("input:scroll_factor", "float"), ("input:natural_scroll", "bool")):
         try:
             res = subprocess.run([hyprctl, "getoption", name, "-j"],
-                                 capture_output=True, text=True, timeout=2)
+                                 capture_output=True, text=True, timeout=2,
+                                 start_new_session=True)
         except Exception:
             continue
         if res.returncode != 0:
@@ -1896,8 +1911,8 @@ def build_complete_model():
 
     rebound_defaults_map = {}
     _emitted_rebound = set()
-    _emitted_rebound_rows = set()
-    matched_user_bind_keys = set()  # row identities (see the step-2 skip)
+    matched_user_rows = set()  # id() of the rows paired as a moved override
+    matched_user_bind_keys = set()  # the chords they left, for conflict bookkeeping
 
     for ub in user_state["binds"]:
         # A default counts as MOVED only when it is really gone from Hyprland: its
@@ -1915,6 +1930,7 @@ def build_complete_model():
             # with the same action must stay visible as its own custom row instead
             # of silently disappearing from the model.
             rebound_defaults_map[matched["key"]] = (ub, matched)
+            matched_user_rows.add(id(ub))
             matched_user_bind_keys.add(ub["key"])
 
     all_active = []
@@ -1948,7 +1964,7 @@ def build_complete_model():
 
         same_key_user_bind = next(
             (ub for ub in user_state["binds"]
-             if ub["key"] == k and ub["key"] not in matched_user_bind_keys
+             if ub["key"] == k and id(ub) not in matched_user_rows
              and not ub.get("_consumed_by_default")), None)
         if same_key_user_bind:
             item = dict(same_key_user_bind)
@@ -1976,7 +1992,7 @@ def build_complete_model():
 
     # 2. Append custom user bindings
     for ub in user_state["binds"]:
-        if ub.get("_consumed_by_default") or ub["key"] in matched_user_bind_keys:
+        if ub.get("_consumed_by_default") or id(ub) in matched_user_rows:
             continue
         item = dict(ub)
         item["status"] = "custom"
@@ -1991,8 +2007,22 @@ def build_complete_model():
     for item in all_active:
         if (item.get("status") in ("modified", "custom")
                 and item.get("key") in disabled_chords):
+            item["disabled_from"] = item["status"]
             item["status"] = "disabled"
             item["disabled_row"] = True
+
+    # What the row can do, decided HERE: the panel used to gate Reset on
+    # status=='modified' and Delete on status=='custom', so a disabled override
+    # was listed with neither button and could only be removed via Enable.
+    for item in all_active:
+        status = item.get("status")
+        on_default_chord = bool(item.get("default_key"))
+        item["can_reset"] = on_default_chord and (
+            status == "modified" or bool(item.get("disabled_row")))
+        item["can_delete"] = (status == "custom"
+                              or (bool(item.get("disabled_row")) and not on_default_chord))
+        item["can_enable"] = status == "disabled"
+        item["can_disable"] = status in ("default", "modified", "custom")
 
     # 3. Sort Alphabetically by Description (case-insensitive)
     all_active.sort(key=lambda x: (x.get("description", "").lower(), x.get("key", "")))
@@ -2052,7 +2082,12 @@ def build_complete_model():
 
     catalog.sort(key=lambda x: x.get("name", "").lower())
 
-    total_modified = len([b for b in all_active if b.get("status") in ("modified", "custom")])
+    # Count what the Modified & Custom tab RENDERS: a disabled override is listed
+    # there (with Reset/Delete), so leaving it out of the badge made the two
+    # disagree (0 in the badge, 1 row in the list).
+    total_modified = len([b for b in all_active
+                          if b.get("status") in ("modified", "custom")
+                          or b.get("disabled_row")])
 
     return {
         "active": all_active,
@@ -2186,13 +2221,9 @@ def _lua_compile_error(text: str) -> str:
     luac = (_trusted_binary("luac") or _trusted_binary("luac5.4")
             or _trusted_binary("luac5.3"))
     if not luac:
-        # A function body is the one action the shape checks cannot prove (they are
-        # a token stack, not a parser): without a compiler, refuse it rather than
-        # write a bindings.lua Hyprland drops entirely and report "saved".
-        if re.search(r"o\s*\.\s*bind[_a-z]*\s*\([^\n]*?,\s*function\b", text):
-            raise ValueError(
-                "this action is a Lua function and no Lua compiler (luac) was found "
-                "to validate it; install lua or use a dispatcher form")
+        # Nothing to compare against here: the "no compiler" refusal lives in
+        # _assert_lua_compiles, which knows the ORIGINAL text and can therefore
+        # blame only the edit (an existing function row must not block every save).
         return ""
     if not text.strip():
         return ""
@@ -2212,13 +2243,32 @@ def _lua_compile_error(text: str) -> str:
             return ""  # a broken compiler is not a reason to lose the edit
         if res.returncode != 0:
             first = (res.stderr or res.stdout or "").strip().splitlines()
-            return first[0] if first else "luac rejected it"
+            # The first line starts with our temp file's path, which means nothing
+            # to the user and leaks a scratch location into a toast.
+            message = first[0].replace(tmp + ":", "line ").strip() if first else ""
+            return message or "luac rejected it"
         return ""
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def _has_function_action(text: str) -> bool:
+    """True when ``text`` holds a Lua ``function`` literal in code position.
+
+    Masked, so a description or a command string that merely contains the word
+    does not count, and nested literals (``f(function() ... end)``,
+    ``{ run = (function() ... end) }``) are found - the old comma-adjacency regex
+    saw only the direct ``o.bind(K, D, function()`` spelling.
+    """
+    flags = _code_mask(text)
+    if isinstance(flags, list):
+        masked = "".join(ch if code else " " for ch, code in zip(text, flags))
+    else:
+        masked = flags
+    return bool(re.search(r"(?<![\w.:])function\b", masked))
 
 
 def _assert_lua_compiles(text: str, original: str = "") -> None:
@@ -2229,6 +2279,16 @@ def _assert_lua_compiles(text: str, original: str = "") -> None:
     before must still compile - otherwise one bad save makes Hyprland drop every
     user override in it.
     """
+    # A function body is the one action the shape checks cannot prove (they are a
+    # token stack, not a parser). With no trusted compiler, refuse to ADD one
+    # rather than write a bindings.lua Hyprland drops entirely and report "saved";
+    # a file that already had one stays editable, so the row can still be fixed.
+    if not (_trusted_binary("luac") or _trusted_binary("luac4")
+            or _trusted_binary("luac5.4") or _trusted_binary("luac5.3")):
+        if _has_function_action(text) and not _has_function_action(original):
+            raise ValueError(
+                "this action is a Lua function and no Lua compiler (luac) was found "
+                "to validate it; install lua or use a dispatcher form")
     error = _lua_compile_error(text)
     if not error:
         return
@@ -2247,6 +2307,16 @@ def _resolve_bindings_write_path(path: str):
     resolved regular file. Dangling links and loops become ValueError.
     """
     resolved = os.path.realpath(path)
+    # Dotfile links are followed on purpose, but the TARGET was unbounded: a stale
+    # or planted link turned any save into a rewrite of an arbitrary user-writable
+    # file (probe: bindings.lua -> /var/tmp/victim.lua, rewritten, .bak dropped
+    # beside it). Keep it inside the home directory.
+    home = os.path.realpath(os.path.expanduser("~"))
+    if home not in ("", "/") and not (resolved == home
+                                      or resolved.startswith(home + os.sep)):
+        raise ValueError(
+            "the bindings file resolves outside your home folder "
+            f"({resolved}); refusing to write there")
     try:
         fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -2368,13 +2438,34 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     clean_keys = set(normalize_key_chord(k) for k in (keys_to_remove or []))
     unbind_only_keys = set(normalize_key_chord(k) for k in (remove_unbinds_only or []))
 
+    # Which unbind units are the one Disable appended: the unbind that comes AFTER
+    # the last bind on that chord. The shadow unbind a save writes ABOVE the user's
+    # bind has to stay, or Enable would resurrect the Omarchy default beside the
+    # user's own binding and one keypress would run both actions.
+    _units = list(_lua_units(current_lines))
+    _last_bind_index = -1
+    for _i, (_ul, _ut, _uc) in enumerate(_units):
+        if not _uc and _ut and _bind_head(_ut):
+            _last_bind_index = _i
+    trailing_unbind_units = set()
+    for _i, (_ul, _ut, _uc) in enumerate(_units):
+        if _uc or not _ut or _i <= _last_bind_index:
+            continue
+        _m = _search_in_code(
+            r'\bhl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', _ut)
+        if not _m:
+            continue
+        _value, _err, _ok = _read_lua_string(_ut, _m.end())
+        if _ok and _value and normalize_key_chord(_value) in unbind_only_keys:
+            trailing_unbind_units.add(_i)
+
     new_lines = []
     removed_positions = []
 
     # Work on logical statements, not physical lines: a hand-formatted
     # multi-line o.bind must be replaced or removed as a whole, and text inside
     # a --[[ ]] block is a comment even though its lines do not start with --.
-    for unit_lines, text, is_comment in _lua_units(current_lines):
+    for _unit_index, (unit_lines, text, is_comment) in enumerate(_units):
         if is_comment or not text:
             new_lines.extend(unit_lines)
             continue
@@ -2388,7 +2479,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 value, _end, ok = _read_lua_string(text, m_unbind.end())
                 if ok and value is not None:
                     unbind_key = normalize_key_chord(value)
-            if unbind_key and unbind_key in unbind_only_keys:
+            if (unbind_key and unbind_key in unbind_only_keys
+                    and _unit_index in trailing_unbind_units):
                 # Enable: drop the unbind, keep the user's own binding.
                 if not _unit_is_single_statement(text):
                     raise ValueError(
@@ -2855,7 +2947,8 @@ def reload_hyprland():
 
 def set_keybinding(key: str, description: str, command: str, action: str = "", old_key: str = "",
                    override_conflicts: bool = True,
-                   old_description: str = "", old_command: str = "", old_action: str = ""):
+                   old_description: str = "", old_command: str = "", old_action: str = "",
+                   keep_disabled: bool = False):
     """Set, modify, or replace a keybinding.
 
     ``old_description`` / ``old_command`` / ``old_action`` describe the binding
@@ -3016,6 +3109,16 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                                                if (in_place and previous_entry) else []))
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    if keep_disabled:
+        # Editing a row that was switched off must not switch it on: the only
+        # reachable control on a disabled row is Edit, and a save silently
+        # re-enabled the shortcut. Emit the unbind again, AFTER the bind (the
+        # shadow unbind that hides the default stays where it is).
+        try:
+            write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[],
+                                unbind_at_end=True)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
 
     return {
@@ -3364,7 +3467,7 @@ def main():
 
     elif cmd == "set":
         if len(sys.argv) < 5:
-            print(json.dumps({"success": False, "error": "Usage: set <key> <desc> <command> [action] [old_key] [old_desc] [old_command] [old_action]"}))
+            print(json.dumps({"success": False, "error": "Usage: set <key> <desc> <command> [action] [old_key] [old_desc] [old_command] [old_action] [keep_disabled]"}))
             sys.exit(1)
         key = sys.argv[2]
         desc = sys.argv[3]
@@ -3374,10 +3477,13 @@ def main():
         old_desc = sys.argv[7] if len(sys.argv) > 7 else ""
         old_command = sys.argv[8] if len(sys.argv) > 8 else ""
         old_action = sys.argv[9] if len(sys.argv) > 9 else ""
+        # "1" when the row being edited is switched off: the save must not
+        # silently switch it back on.
+        keep_disabled = len(sys.argv) > 10 and sys.argv[10] in ("1", "true", "yes")
         try:
             res = set_keybinding(key, desc, command, action, old_key,
                                  old_description=old_desc, old_command=old_command,
-                                 old_action=old_action)
+                                 old_action=old_action, keep_disabled=keep_disabled)
         except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
             res = {"success": False, "error": str(e)}
         print(json.dumps(res))
