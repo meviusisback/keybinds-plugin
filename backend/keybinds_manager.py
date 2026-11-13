@@ -156,7 +156,10 @@ def _key_is_plausible(norm_key: str) -> bool:
             return False
     if parts[-1].upper() in _MODIFIER_NAMES:
         return False  # "SUPER" / "SUPER + CTRL" binds nothing
-    return re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.:-]*", parts[-1]) is not None
+    # A keysym may contain spaces (switch:on:Lid Switch, shipped by Omarchy) but not
+    # the characters that could break the Lua literal.
+    return (re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.: -]*", parts[-1]) is not None
+            and not re.search(r"['\"\\()\n\r]", parts[-1]))
 
 
 _NESTED_BIND_RE = re.compile(r"^\s*o\s*\.\s*bind(?:_toggle)?\s*\(")
@@ -168,7 +171,7 @@ def _registers_a_binding(action: str) -> bool:
     The anchored check missed a registration inside a table or a function body
     (`{ o.bind(...) }`), which Hyprland evaluates at load time.
     """
-    return _search_in_code(r'\bo\s*\.\s*bind(?:_toggle)?\s*\(', action or "") is not None
+    return _bind_head(action or "") is not None
 
 
 def _is_raw_dispatcher(action: str) -> bool:
@@ -180,8 +183,17 @@ def _is_raw_dispatcher(action: str) -> bool:
     literal command string and silently break the shortcut.
     """
     stripped = (action or "").strip()
-    return (stripped.startswith("{") or stripped.startswith("hl.")
-            or re.match(r"^o\.[A-Za-z_][A-Za-z0-9_.]*\s*\(", stripped) is not None)
+    if not stripped:
+        return False
+    if stripped.startswith("{"):
+        return True
+    # A complete string literal is data, whatever it looks like.
+    if _pure_literal(stripped) is not None:
+        return False
+    # A call with no space before its "(" is code: hl.dsp.*, o.launch_terminal(),
+    # but also Omarchy's bare helpers (send_shortcut_once("CTRL", "A")). A shell
+    # command like `notify-send (x)` or `sh -c ...` does not match.
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_.:]*\(", stripped) is not None
 
 
 def _code_mask(text: str):
@@ -279,7 +291,8 @@ def _unit_is_single_statement(text: str) -> bool:
     # Same tolerant head as detection: `o .bind(...)` and `o["bind"](...)` are
     # legal Lua, and a strict spelling here refused to edit rows the scanner had
     # already matched (the write then certified success without removing them).
-    head = re.match(r"\s*(?:" + _BIND_HEAD_RE.pattern + r"|hl\s*\.\s*unbind\s*\()", text)
+    head = re.match(r"\s*(?:" + _BIND_HEAD_RE.pattern
+                    + r"|hl\s*(?:\.\s*unbind|\[\s*[\"\']unbind[\"\']\s*\])\s*\()", text)
     if not head:
         return False
     i = text.index("(", head.start())
@@ -1434,10 +1447,10 @@ def parse_default_bindings():
             continue
         total_read += len(content.encode("utf-8"))
 
-        for line in content.splitlines():
-            stripped = line.strip()
-            if stripped.startswith('--'):
+        for _unit_lines, unit_text, unit_is_comment in _lua_units(content.splitlines()):
+            if unit_is_comment or not unit_text:
                 continue
+            stripped = unit_text.strip()
 
             parsed = _parse_bind_line(stripped)
             if not parsed:
@@ -1447,9 +1460,9 @@ def parse_default_bindings():
             fn_name = _bind_fn(stripped)
 
             norm_key = normalize_key_chord(raw_key)
-            if fn_name == "o.bind_toggle":
-                clean_target = action_raw.strip('"\'')
-                action_raw = f'"omarchy-toggle-{clean_target}"'
+            # o.bind_toggle prefixes "omarchy-toggle-" itself, so the stored third
+            # argument is the toggle NAME. Rewriting it here made a re-emitted row
+            # run "omarchy-toggle-omarchy-toggle-bar".
             if not desc:
                 desc = action_raw.strip('"\'')
 
@@ -1518,11 +1531,15 @@ def parse_user_bindings():
         if is_comment or not text:
             continue
 
-        m_unbind = re.match(r'hl\.unbind\s*\(\s*["\']([^"\']+)["\']\s*\)', text)
+        # `hl["unbind"]("K")` is legal Lua and Hyprland honours it; the anchored
+        # spelling alone showed such a chord as still bound.
+        m_unbind = _search_in_code(
+            r'hl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', text)
         if m_unbind:
-            raw_key = m_unbind.group(1).strip()
-            result["unbinds"].add(normalize_key_chord(raw_key))
-            continue
+            _unbind_key, _unbind_end, _unbind_ok = _read_lua_string(text, m_unbind.end())
+            if _unbind_ok and _unbind_key:
+                result["unbinds"].add(normalize_key_chord(_unbind_key))
+                continue
 
         parsed = _parse_bind_line(text)
         if parsed:
@@ -1997,7 +2014,8 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
         is_targeted = False
         if clean_keys:
-            m_unbind = _search_in_code(r'\bhl\s*\.\s*unbind\s*\(', text)
+            m_unbind = _search_in_code(
+                r'\bhl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', text)
             unbind_key = ""
             if m_unbind:
                 value, _end, ok = _read_lua_string(text, m_unbind.end())
@@ -2025,6 +2043,13 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 _parsed_bind = _parse_bind_line(text[m_bind.start():])
                 if _parsed_bind:
                     bind_key = normalize_key_chord(_parsed_bind[0])
+                else:
+                    flat = re.sub(r"\s+", " ", text)
+                    if any(k and k in flat for k in clean_keys):
+                        raise ValueError(
+                            "the file holds a binding for this chord this plugin "
+                            "cannot parse (a computed key or description); "
+                            "refusing to edit it")
             if bind_key and bind_key in clean_keys:
                 if bind_key in overrides:
                     if not _unit_is_single_statement(text):
@@ -2124,6 +2149,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             # deciding "this is code" from a prefix in that data let `Exec=hl.…`
             # inject statements into the file Hyprland executes.
             fn_name = "o.bind_toggle" if entry.get("fn_name") == "o.bind_toggle" else "o.bind"
+            if fn_name == "o.bind_toggle" and not entry.get("action_literal"):
+                # o.bind_toggle prepends "omarchy-toggle-" to its third argument:
+                # a NEW command is not a toggle name, so it goes through o.bind.
+                fn_name = "o.bind"
             opts_part = ""
             opts_literal = (entry.get("opts_literal") or "").strip()
             if opts_literal:
@@ -2374,6 +2403,9 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
 
+    if not command.strip() and action.strip() == "exec":
+        return {"success": False,
+                "error": "no command: pick an application or type the command to run"}
     # A dispatcher-looking command is almost always a lost argument; writing it
     # as a quoted shell command would silently break the binding. Raw Lua is
     # accepted only from the explicit dispatcher slot.
@@ -2462,11 +2494,13 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     # Keep the row's call form and options table: rewriting an o.bind_toggle as
     # o.bind changed what the key does, and dropping { locked = true, repeating =
     # true } made media keys stop repeating while the panel said "applied".
-    if in_place:
+    if norm_old_key or in_place:
+        # Also for a move: the row lives at the OLD chord and must be found there.
+        source_key = norm_old_key or norm_key
         user_rows = parse_user_bindings()["binds"]
-        candidates = [b for b in user_rows if b["key"] == norm_key]
+        candidates = [b for b in user_rows if b["key"] == source_key]
         if not candidates:
-            candidates = [d for d in parse_default_bindings() if d["key"] == norm_key]
+            candidates = [d for d in parse_default_bindings() if d["key"] == source_key]
         target_ident = _written_bind_identity(previous_entry) if previous_entry else None
         for row in candidates:
             same = (target_ident is not None

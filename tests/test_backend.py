@@ -1371,10 +1371,22 @@ class TestSecurityRegressions(unittest.TestCase):
         finally:
             self._unstub_set_keybinding()
 
+    def test_a_bracketed_unbind_is_removable(self):
+        # `hl["unbind"]("K")` is legal Lua and Hyprland honours it: it used to be
+        # invisible, so the chord showed as enabled while it stayed unbound.
+        self._stub_set_keybinding()
+        try:
+            self._write('hl["unbind"]("SUPER + X")\n')
+            res = keybinds_manager.enable_keybinding("SUPER + X")
+            self.assertTrue(res["success"], res)
+            self.assertNotIn("unbind", self._read())
+        finally:
+            self._unstub_set_keybinding()
+
     def test_enable_refuses_when_the_unbind_cannot_be_removed(self):
         self._stub_set_keybinding()
         try:
-            original = 'hl["unbind"]("SUPER + X")\n'
+            original = 'hl.unbind(("SUPER + X"))\n'
             self._write(original)
             res = keybinds_manager.enable_keybinding("SUPER + X")
             self.assertFalse(res["success"], res)

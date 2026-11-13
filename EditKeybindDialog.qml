@@ -138,6 +138,7 @@ Item {
   }
 
   function openCreate(presetItem) {
+    root.inlineError = ""
     root.isEditing = false
     root.itemData = presetItem || null
     root.oldKey = ""
@@ -188,6 +189,7 @@ Item {
   }
 
   function openEdit(bindingItem) {
+    root.inlineError = ""
     root.isEditing = true
     root.itemData = bindingItem || null
     root.actionTitle = (bindingItem && bindingItem.description) || ""

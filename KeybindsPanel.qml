@@ -53,6 +53,12 @@ Item {
   ]
 
   function open(payloadJson) {
+    // A capture left running must not survive a close: the focused search field
+    // would then swallow the keys the recorder is waiting for.
+    if (recordingSearch) {
+      recordingSearch = false
+      searchInput.text = ""
+    }
     closingFromHost = false
     window.visible = true
     loadData()
