@@ -829,9 +829,16 @@ def _file_unreadable_reason() -> str:
     A file we cannot READ is unreadable too: an undecodable byte or an oversized
     file used to certify as fine, and the row then answered with a raw codec message.
     """
+    if not os.path.exists(str(USER_BINDINGS_PATH)):
+        return ""
     try:
         raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
     except Exception:
+        return "a file Botty cannot read"
+    if raw is None:
+        # The bounded reader refuses an oversized or non-regular file by returning
+        # None: that is unreadable, not "empty and fine" (206 dead controls came
+        # from this).
         return "a file Botty cannot read"
     if not raw:
         return ""
@@ -2519,6 +2526,10 @@ def build_complete_model():
             _item["blocked_reason"] = _blocked_reason
     return {
         "active": all_active,
+        # The panel gates Edit and draws the file-level banner from these: without
+        # them the gate was inert (`undefined !== false` is true).
+        "file_readable": not _unreadable,
+        "file_blocked_reason": _blocked_reason,
         "catalog": catalog,
         "conflicts": conflicts,
         "apps": get_installed_apps(),
