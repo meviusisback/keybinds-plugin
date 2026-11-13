@@ -29,7 +29,7 @@ Editing Hyprland keybindings by hand means memorizing chords, guessing free comb
 - **Actions catalog** — pre-configured Hyprland / Omarchy window-management, workspace, media and system presets ready to bind.
 - **Mouse scroll sync** — respects your scroll sensitivity multiplier (`scroll_factor`) and direction (`natural_scroll`), read live from the compositor (`hyprctl getoption`), the same values the [Mouse Settings](https://github.com/meviusisback/mouse-settings) plugin (`meviusisback.mouse-settings`) sets.
 - **Record-to-find lookup** — press **Record to Find** next to the search bar and hit any key chord to locate its assigned action instantly (or get a 1-click **+ Create Keybinding** when it's unassigned).
-- **Safe Lua sync & live reload** — writes directly to `~/.config/hypr/bindings.lua` (a `.bak` copy of the previous content sits next to the file it resolves to, and dotfile symlinks are preserved) and invokes `hyprctl reload` for instantaneous application without session restarts.
+- **Safe Lua sync & live reload** — writes directly to `~/.config/hypr/bindings.lua` (a `.bak` copy of the previous content sits next to the file it resolves to, dotfile symlinks are preserved, and group/world write permission on the file is cleared because Hyprland executes it) and invokes `hyprctl reload` for instantaneous application without session restarts.
 
 ## Install
 
@@ -101,16 +101,17 @@ omarchy-keybinds reload
 
 The plugin manages personal overrides in `~/.config/hypr/bindings.lua`:
 
+- **Descriptions are text** — what you type is written as text: a Lua escape sequence (`\t`, `\n`) in a description is stored literally, not expanded.
 - **Custom / rebound keybindings** — generated with `o.bind(...)` directives (or `o.bind_toggle(...)` for a toggle row, whose third argument stays the toggle name, and `o.bind_hold(...)` for a push-to-talk row, whose stop action and options are kept as written).
 - **Disabled keybindings** — generated with `hl.unbind(...)` directives.
 - **Safety backups** — the previous content is copied to `bindings.lua.bak` (beside the resolved target, so symlinked dotfiles work) before every rewrite; the very first write, when there is no file yet, has nothing to back up.
-- **Comment preservation** — personal comments and manual custom blocks in `bindings.lua` are preserved.
+- **Comment preservation** — comment lines and manual custom blocks in `bindings.lua` are preserved; a comment left at the END of a line the plugin rewrites goes with that line (the plugin writes one statement per line).
 
 ## How it works
 
 The Python engine (`backend/keybinds_manager.py`) parses the Omarchy default bindings plus your `bindings.lua`, evaluates conflicts and mouse-scroll sync, and writes changes back via atomic rename: chords that could break out of a Lua literal are rejected and every plain command is escaped into a Lua string. Raw Lua dispatchers (`hl.*`, `o.*` helper calls such as `o.launch_terminal()`, and `{...}` tables) are inserted only from the dispatcher slot — the built-in catalog presets and the binding being edited — and each one is checked before it is written (one balanced call, table, or `function ... end` whose body closes exactly at the end: no newlines, comments, trailing escape, second statement, control bytes, or more than the command limit). Text typed into the command field is only ever written as a literal command — a value that looks like raw Lua is refused with an error instead of becoming code, so an application's `.desktop` `Exec` cannot either. A write that cannot be completed is refused and reported as such, never as saved. The QML panels (`KeybindsPanel`, `EditKeybindDialog`, `KeyRecorder`, `KeyBadge`) are the frontend. Local-only: no network access, no telemetry, and the only files read are your keybinding files, Omarchy's default bindings (`/usr/share/omarchy/default/hypr/bindings`), the Omarchy menu definition (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which the plugin adds its own Keybindings Manager launcher entry to; because it is JSONC, the file is re-serialised on that change, so its comments and hand-formatting are lost) and the desktop entries used to name applications (`~/.local/share/applications`, `/usr/share/applications`, `/usr/local/share/applications`) — the interactive recorder captures keystrokes in memory just to display the pressed chord; nothing is persisted or transmitted.
 
-Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 111 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents, bounded reads, in-place edits on a shared chord and the guards that must fail closed.
+Verify with `python3 -m unittest discover -s tests -p "test_*.py"` — 120 tests covering key normalization, Lua-literal escaping, statement-aware editing, comment handling, unbind detection, backup contents, bounded reads, in-place edits on a shared chord and the guards that must fail closed.
 
 ## Removal
 

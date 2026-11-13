@@ -1662,8 +1662,7 @@ class TestSecurityRegressions(unittest.TestCase):
             keybinds_manager.MENU_CONFIG_PATH = saved
 
 
-if __name__ == "__main__":
-    unittest.main()
+
 
 class TestRoundNineRegressions(unittest.TestCase):
     """Ninth reviewer round: function dispatchers, keysyms and mouse rows."""
@@ -1775,3 +1774,111 @@ class TestRoundNineRegressions(unittest.TestCase):
         rows = [r for r in active if r["key"] == d["key"]]
         self.assertTrue(rows)
         self.assertNotIn("disabled", [r["status"] for r in rows])
+
+
+class TestRoundTenRegressions(unittest.TestCase):
+    """Tenth reviewer round: unbind ordering, disable/enable fidelity, row identity."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        self._saved = {"HOME": os.environ.get("HOME"),
+                       "UBP": keybinds_manager.USER_BINDINGS_PATH,
+                       "run": keybinds_manager.subprocess.run}
+        os.environ["HOME"] = self.home
+        os.makedirs(os.path.join(self.home, ".config", "hypr"), exist_ok=True)
+        self.path = os.path.join(self.home, ".config", "hypr", "bindings.lua")
+        keybinds_manager.USER_BINDINGS_PATH = self.path
+        keybinds_manager.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout="", stderr="")
+
+    def tearDown(self):
+        keybinds_manager.USER_BINDINGS_PATH = self._saved["UBP"]
+        keybinds_manager.subprocess.run = self._saved["run"]
+        if self._saved["HOME"] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved["HOME"]
+        self._tmp.cleanup()
+
+    def _write(self, text):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_unbind_never_lands_after_the_row_it_shadows(self):
+        # The edited row was the file's last statement and only a comment followed:
+        # insert_at ended up below it, so the unbind killed the binding just saved.
+        self._write('-- my overrides\n'
+                    'o.bind("SUPER + W", "Close", "hyprctl dispatch killactive")\n'
+                    '-- TODO: tidy this file')
+        res = keybinds_manager.set_keybinding(
+            "SUPER + W", "Close window", "hyprctl dispatch killactive", "",
+            "SUPER + W", old_description="Close",
+            old_command="hyprctl dispatch killactive", old_action="")
+        self.assertTrue(res["success"], res)
+        lines = [l for l in self._read().splitlines() if l.strip()]
+        unbind_at = next(i for i, l in enumerate(lines) if "hl.unbind" in l)
+        bind_at = next(i for i, l in enumerate(lines) if "o.bind" in l)
+        self.assertLess(unbind_at, bind_at, lines)
+
+    def test_disable_then_enable_keeps_the_users_own_command(self):
+        self._write('o.bind("SUPER + mouse:272", "Move window", "my-drag-command")\n')
+        res = keybinds_manager.disable_keybinding(
+            "SUPER + mouse:272", "Move window", "my-drag-command")
+        self.assertTrue(res["success"], res)
+        self.assertIn("my-drag-command", self._read())
+        self.assertIn("hl.unbind", self._read())
+        res = keybinds_manager.enable_keybinding("SUPER + mouse:272")
+        self.assertTrue(res["success"], res)
+        content = self._read()
+        self.assertIn("my-drag-command", content)
+        self.assertNotIn("hl.unbind", content)
+
+    def test_deleting_a_row_leaves_its_sibling_on_the_chord(self):
+        self._write('o.bind("SUPER + Y","First custom","alpha")\n'
+                    'o.bind("SUPER + Y","Second custom","beta")\n')
+        res = keybinds_manager.reset_keybinding(
+            "SUPER + Y", "", description="First custom", action="alpha")
+        self.assertTrue(res["success"], res)
+        content = self._read()
+        self.assertIn("Second custom", content)
+        self.assertNotIn("First custom", content)
+
+    def test_a_function_cannot_be_followed_by_another_expression(self):
+        for expr in ('function() end, os.execute("id"), function() end',
+                     'function() end, hl.unbind("SUPER + Q"), function() end',
+                     'function() end do os.execute("id") end'):
+            with self.subTest(expr=expr):
+                self.assertTrue(
+                    keybinds_manager._lua_single_expression_problem(expr), expr)
+        self.assertEqual(
+            keybinds_manager._lua_single_expression_problem("function(a, b) return a + b end"), "")
+
+    def test_the_chord_keeps_the_spelling_it_was_written_with(self):
+        defaults = [b for b in keybinds_manager.parse_default_bindings()
+                    if b["raw_key"] == "ALT + Alt_R"]
+        if not defaults:
+            self.skipTest("no dictation row on this machine")
+        d = defaults[0]
+        res = keybinds_manager.set_keybinding(
+            d["key"], "Dictate", d["command"], d["action"], d["raw_key"],
+            old_description=d["description"], old_command=d["command"],
+            old_action=d["action"])
+        self.assertTrue(res["success"], res)
+        self.assertIn('"ALT + Alt_R"', self._read())
+
+    def test_a_rewrite_clears_group_write_permission(self):
+        self._write('o.bind("SUPER + Q", "Q", "true")\n')
+        os.chmod(self.path, 0o666)
+        res = keybinds_manager.set_keybinding("SUPER + Q", "Q2", "true")
+        self.assertTrue(res["success"], res)
+        mode = os.stat(self.path).st_mode & 0o777
+        self.assertFalse(mode & 0o022, oct(mode))
+
+
+if __name__ == "__main__":
+    unittest.main()

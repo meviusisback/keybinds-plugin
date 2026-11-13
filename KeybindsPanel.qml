@@ -46,6 +46,7 @@ Item {
   readonly property var categories: [
     "All",
     "Window Management",
+    "Workspaces",
     "Menus & System",
     "Applications",
     "Media & Audio",
@@ -155,14 +156,19 @@ Item {
     if (editDialog.opened) editDialog.opened = false
   }
 
-  function resetKeybinding(key, defaultKey) {
+  // description + action name the ONE row that was clicked: two bindings can share
+  // a chord (Omarchy ships ALT+TAB with two actions), and deleting by chord alone
+  // removed a sibling the user never touched.
+  function resetKeybinding(key, defaultKey, description, action) {
     root.loading = true
     resetProc.running = false
     resetProc.command = [
       Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "reset",
       key,
-      defaultKey || ""
+      defaultKey || "",
+      (description === undefined || description === null) ? "" : description,
+      (action === undefined || action === null) ? "" : action
     ]
     resetProc.running = true
   }
@@ -178,13 +184,15 @@ Item {
     enableProc.running = true
   }
 
-  function disableKeybinding(key) {
+  function disableKeybinding(key, description, action) {
     root.loading = true
     disableProc.running = false
     disableProc.command = [
       Quickshell.env("HOME") + "/.config/omarchy/plugins/meviusisback.keybinds/backend/keybinds_manager.py",
       "disable",
-      key
+      key,
+      (description === undefined || description === null) ? "" : description,
+      (action === undefined || action === null) ? "" : action
     ]
     disableProc.running = true
   }
@@ -1068,7 +1076,8 @@ Item {
                         tooltipText: "Reset to Default (" + root.plainText(activeRow.modelData && activeRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key)
+                        onClicked: root.resetKeybinding(activeRow.modelData.key, activeRow.modelData.default_key,
+                                            activeRow.modelData.description, activeRow.modelData.action)
                       }
 
                       // Disable / Delete
@@ -1080,9 +1089,11 @@ Item {
                         verticalPadding: Style.space(4)
                         onClicked: {
                           if (activeRow.modelData.status === "custom") {
-                            root.resetKeybinding(activeRow.modelData.key, "")
+                            root.resetKeybinding(activeRow.modelData.key, "",
+                              activeRow.modelData.description, activeRow.modelData.action)
                           } else {
-                            root.disableKeybinding(activeRow.modelData.key)
+                            root.disableKeybinding(activeRow.modelData.key,
+                                 activeRow.modelData.description, activeRow.modelData.action)
                           }
                         }
                       }
@@ -1281,7 +1292,8 @@ Item {
                         tooltipText: "Reset to Default (" + root.plainText(modRow.modelData && modRow.modelData.default_key) + ")"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key)
+                        onClicked: root.resetKeybinding(modRow.modelData.key, modRow.modelData.default_key,
+                                            modRow.modelData.description, modRow.modelData.action)
                       }
 
                       Button {
@@ -1290,7 +1302,8 @@ Item {
                         tooltipText: "Delete custom binding"
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
-                        onClicked: root.resetKeybinding(modRow.modelData.key, "")
+                        onClicked: root.resetKeybinding(modRow.modelData.key, "",
+                              modRow.modelData.description, modRow.modelData.action)
                       }
                     }
                   }

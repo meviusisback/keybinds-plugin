@@ -17,9 +17,30 @@ import tempfile
 import stat
 import configparser
 
+def _trusted_binary(name: str) -> str:
+    """An absolute path to ``name``, or "" when no trustworthy one exists.
+
+    The docstring used to promise that a writable PATH entry could not choose the
+    binary while returning ``which(name) or name`` - which is exactly PATH order,
+    plus a bare name that execvp re-resolves. Anything the plugin executes (hyprctl
+    reload, the luac compile gate) goes through here instead.
+    """
+    found = shutil.which(name)
+    if not found or not os.path.isabs(found):
+        return ""
+    parent = os.path.dirname(found)
+    try:
+        st = os.stat(parent)
+    except OSError:
+        return ""
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return ""
+    return found
+
+
 def _hyprctl() -> str:
-    """Absolute path to hyprctl: a writable PATH entry must not choose the binary."""
-    return shutil.which("hyprctl") or "hyprctl"
+    """Absolute path to hyprctl, or "" (the caller then reports the reload skipped)."""
+    return _trusted_binary("hyprctl")
 
 
 def _omarchy_root() -> str:
@@ -184,6 +205,12 @@ def _lua_function_problem(expr: str) -> str:
         tok = m.group(0)
         if not tok.strip():
             continue
+        if opened and not stack:
+            # `function() end, os.execute("id"), function() end` was written as
+            # o.bind's 4th argument and evaluated when Hyprland loaded the file.
+            return "a second expression follows the function"
+        if tok in (",", ";", "=") and not stack:
+            return "a raw dispatcher may not continue after the function"
         if tok in "([{":
             brackets.append(tok)
         elif tok in ")]}":
@@ -1660,7 +1687,7 @@ def parse_default_bindings():
                 cat = "Menus & System"
             elif base == "clipboard":
                 cat = "Clipboard"
-            elif base == "voxtype":
+            elif base in ("voxtype", "dictation"):
                 cat = "AI & Voice"
 
             is_release = opts_raw and ("on_release = true" in opts_raw or "on_release=true" in opts_raw)
@@ -2034,7 +2061,8 @@ def _lua_compile_error(text: str) -> str:
     runtime globals is fine. No compiler installed -> "" (the shape checks above
     are all there is, which is why they stay).
     """
-    luac = shutil.which("luac") or shutil.which("luac5.4") or shutil.which("luac5.3")
+    luac = (_trusted_binary("luac") or _trusted_binary("luac5.4")
+            or _trusted_binary("luac5.3"))
     if not luac or not text.strip():
         return ""
     fd, tmp = tempfile.mkstemp(suffix=".lua")
@@ -2104,7 +2132,8 @@ def _resolve_bindings_write_path(path: str):
 def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=None,
                         preserve_entry=None, previous_entry=None, override_keys=None,
                         require_absent=None, require_removal=False,
-                        no_duplicate_keys=None):
+                        no_duplicate_keys=None, unbind_at_end=False,
+                        remove_unbinds_only=None):
     """
     Safely modify ~/.config/hypr/bindings.lua.
     Preserves comments and mouse bindings, ensures clean formatted sections.
@@ -2127,6 +2156,14 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     ``require_removal``: the write must remove at least one statement (a verb that
     only deletes). Counting units catches every detection blind spot, including
     forms the anchored patterns do not even recognise.
+
+    ``unbind_at_end``: place the emitted hl.unbind AFTER every user statement
+    instead of above them. Hyprland's unbind() removes the binds registered before
+    it, so this disables a chord while KEEPING the user's own lines recoverable -
+    Disable followed by Enable used to destroy a hand-written command.
+
+    ``remove_unbinds_only``: chords whose hl.unbind statements are removed while
+    their o.bind statements stay (what Enable needs after the above).
     """
     cfg_dir = os.path.dirname(USER_BINDINGS_PATH)
     preserve_identity = _written_bind_identity(preserve_entry) if preserve_entry else None
@@ -2193,6 +2230,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         ]
 
     clean_keys = set(normalize_key_chord(k) for k in (keys_to_remove or []))
+    unbind_only_keys = set(normalize_key_chord(k) for k in (remove_unbinds_only or []))
 
     new_lines = []
     removed_positions = []
@@ -2206,7 +2244,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
             continue
 
         is_targeted = False
-        if clean_keys:
+        if clean_keys or unbind_only_keys:
             m_unbind = _search_in_code(
                 r'\bhl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', text)
             unbind_key = ""
@@ -2214,7 +2252,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 value, _end, ok = _read_lua_string(text, m_unbind.end())
                 if ok and value is not None:
                     unbind_key = normalize_key_chord(value)
-            if unbind_key and unbind_key in clean_keys:
+            if unbind_key and unbind_key in unbind_only_keys:
+                # Enable: drop the unbind, keep the user's own binding.
+                if not _unit_is_single_statement(text):
+                    raise ValueError(
+                        "the line holding this chord also holds another "
+                        "statement; refusing to edit it (split it into its "
+                        "own line first)")
+                is_targeted = True
+            elif unbind_key and unbind_key in clean_keys:
                 if not _unit_is_single_statement(text):
                     raise ValueError(
                         "the line holding this chord also holds another "
@@ -2243,6 +2289,10 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                             "the file holds a binding for this chord this plugin "
                             "cannot parse (a computed key or description); "
                             "refusing to edit it")
+            if bind_key and bind_key in unbind_only_keys:
+                # Never removed in unbind-only mode.
+                new_lines.extend(unit_lines)
+                continue
             if bind_key and bind_key in clean_keys:
                 if bind_key in overrides:
                     if not _unit_is_single_statement(text):
@@ -2290,6 +2340,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
         new_lines.extend(unit_lines)
 
     inserted_unbind_count = 0
+    unbind_insert_at = 0
     if unbinds_to_add:
         # Place unbinds at the top of the body, not at the end: Hyprland's
         # unbind() removes every bind on the chord registered before it, and the
@@ -2322,6 +2373,16 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
                 insert_at = consumed
                 continue
             break
+        # When the edited row was the file's last statement, the comments that
+        # used to follow it are "leading" once it is removed, so insert_at landed
+        # BELOW the row's old slot and the unbind was emitted after the new o.bind -
+        # killing the shortcut the save had just written. Never insert past the
+        # row being restored.
+        if removed_positions:
+            insert_at = min(insert_at, removed_positions[0])
+        if unbind_at_end:
+            insert_at = len(new_lines)
+        unbind_insert_at = insert_at
         for offset, line_str in enumerate(unbind_lines):
             new_lines.insert(insert_at + offset, line_str)
         inserted_unbind_count = len(unbind_lines)
@@ -2329,6 +2390,13 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     if lines_to_add:
         for entry in lines_to_add:
             key = normalize_key_chord(entry.get("key", ""))
+            stored_raw = (entry.get("raw_key") or "").strip()
+            if (stored_raw and normalize_key_chord(stored_raw) == key
+                    and _key_is_plausible(stored_raw)
+                    and not re.search(r"[\\\"']", stored_raw)):
+                # Nothing about the chord changed: re-emit the exact spelling from
+                # the file so a description-only save cannot respell it.
+                key = stored_raw
             raw_desc = _plain_value(entry.get("description", ""))
             if len(raw_desc) > MAX_TEXT_LEN:
                 raise ValueError(
@@ -2422,8 +2490,7 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
     # A one-for-one replacement goes back where it was (comment above it intact).
     if len(removed_positions) == 1 and lines_to_add and len(lines_to_add) == 1:
-        pos = removed_positions[0]
-        pos += inserted_unbind_count
+        pos = unbind_insert_at + inserted_unbind_count
         if 0 <= pos < len(new_lines):
             new_lines.insert(pos, new_lines.pop())
 
@@ -2542,6 +2609,11 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     # in it, and no shape check of ours can promise a parser's verdict.
     _assert_lua_compiles(newline.join(final_output), existing_content)
 
+    # A command that changes nothing must not rewrite bytes: `enable` on a chord
+    # with no unbind collapsed the file's blank lines and replaced the inode.
+    if exists and (bom + newline.join(final_output) + newline) == original_content_for_backup:
+        return {"success": True, "key": None, "message": "no change"}
+
     if exists:
         backup_path = resolved_path + ".bak"
         # Unique temp file + atomic replace instead of O_TRUNC on the predictable
@@ -2567,7 +2639,14 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     try:
         if exists:
             try:
-                os.fchmod(fd, stat.S_IMODE(os.stat(resolved_path).st_mode))
+                mode = stat.S_IMODE(os.stat(resolved_path).st_mode)
+            except OSError:
+                mode = 0o600
+            # Keep the owner bits, drop group/world WRITE: this file is Lua that
+            # Hyprland executes, and the plugin must not hand back a writable copy.
+            mode &= ~(stat.S_IWGRP | stat.S_IWOTH)
+            try:
+                os.fchmod(fd, mode | stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
                 pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2589,9 +2668,15 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
 
 def reload_hyprland():
     """Reload Hyprland configuration and check for errors."""
+    hyprctl = _hyprctl()
+    if not hyprctl:
+        # No trustworthy binary: say so instead of reporting an applied reload.
+        return {"success": False, "reload_output": "",
+                "config_errors": "hyprctl was not found in a trusted location; "
+                                 "reload the config by hand"}
     try:
-        res = subprocess.run([_hyprctl()] + ["hyprctl", "reload"][1:], capture_output=True, text=True, timeout=10)
-        err_res = subprocess.run([_hyprctl()] + ["hyprctl", "configerrors"][1:], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([hyprctl, "reload"], capture_output=True, text=True, timeout=10)
+        err_res = subprocess.run([hyprctl, "configerrors"], capture_output=True, text=True, timeout=10)
         errors = err_res.stdout.strip() if err_res.returncode == 0 else ""
         # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
         # it drops every user override in it. A save that leaves errors behind is
@@ -2660,6 +2745,10 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
 
     bind_entry = {
         "key": norm_key,
+        # The chord as the user (or Omarchy) wrote it: normalization cannot
+        # round-trip "ALT + Alt_R" (it becomes "ALT + ALT_R"), and an edit that
+        # only changed the description used to respell the shortcut.
+        "raw_key": key.strip() if normalize_key_chord(key) == norm_key else "",
         "description": description or command,
         "command": command,
         "action": action,
@@ -2672,6 +2761,16 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     if old_literal and not action.strip() and not _is_raw_dispatcher(old_literal):
         if _identity_value(old_literal) == _plain_value(command):
             bind_entry["action_literal"] = old_literal
+
+    # The row's own spelling travels in old_key (the panel passes raw_key): prefer
+    # it when the chord did not change, so a description-only save keeps
+    # "ALT + Alt_R" exactly as the file had it.
+    old_raw_key = (old_key or "").strip()
+    if (old_raw_key and norm_old_key == norm_key
+            and normalize_key_chord(old_raw_key) == norm_key
+            and _key_is_plausible(old_raw_key)
+            and not re.search(r"[\\\"']", old_raw_key)):
+        bind_entry["raw_key"] = old_raw_key
 
     binds = [bind_entry]
 
@@ -2767,10 +2866,18 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
     }
 
 
-def reset_keybinding(key: str, default_key: str = ""):
-    """Reset a keybinding back to default Omarchy configuration."""
+def reset_keybinding(key: str, default_key: str = "", description: str = "",
+                     action: str = ""):
+    """Reset a keybinding back to default Omarchy configuration.
+
+    ``description`` + ``action`` name ONE row: two binds can share a chord
+    (Omarchy ships ALT+TAB with two actions), and deleting by chord alone removed a
+    sibling the user never clicked.
+    """
     norm_key = normalize_key_chord(key)
     norm_def = normalize_key_chord(default_key) if default_key else ""
+    identity = {"key": norm_key, "description": description, "action": action} \
+        if (description or action) else None
 
     if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
@@ -2800,8 +2907,15 @@ def reset_keybinding(key: str, default_key: str = ""):
         state = parse_user_bindings()
         has_statement = (any(b["key"] in keys_to_remove for b in state["binds"])
                          or bool(state["unbinds"] & set(keys_to_remove)))
-        write_user_bindings(keys_to_remove=keys_to_remove,
-                            require_absent=keys_to_remove, require_removal=has_statement)
+        if identity:
+            # Identity-scoped: the chord may still carry a SIBLING binding the user
+            # never clicked (Omarchy ships ALT+TAB twice), so requiring the whole
+            # chord to be absent refused a legitimate delete.
+            write_user_bindings(keys_to_remove=[norm_key], previous_entry=identity,
+                                require_removal=True)
+        else:
+            write_user_bindings(keys_to_remove=keys_to_remove,
+                                require_absent=keys_to_remove, require_removal=has_statement)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -2811,14 +2925,27 @@ def reset_keybinding(key: str, default_key: str = ""):
             "reload_success": bool(reload_status.get("success", False))}
 
 
-def disable_keybinding(key: str):
-    """Disable/unbind a keybinding."""
+def disable_keybinding(key: str, description: str = "", action: str = ""):
+    """Disable a keybinding.
+
+    With a row identity (description + action) only that statement is touched and
+    every other binding on the chord is kept; without one, every statement on the
+    chord goes (the historical behaviour of the panel's Disable button).
+
+    The unbind is emitted at the END so the user's own lines survive: Disable then
+    Enable used to delete a hand-written command for good, since Enable only
+    removed the unbind and the next save overwrote the .bak.
+    """
     norm_key = normalize_key_chord(key)
     if not norm_key or not _key_is_plausible(norm_key):
         return {"success": False, "error": "Invalid key combination"}
+    entry = {"key": norm_key, "description": description, "action": action} \
+        if (description or action) else None
     try:
-        write_user_bindings(unbinds_to_add=[norm_key], keys_to_remove=[norm_key],
-                            require_absent=[norm_key])
+        write_user_bindings(unbinds_to_add=[norm_key],
+                            keys_to_remove=[] if entry else [norm_key],
+                            previous_entry=entry,
+                            unbind_at_end=True)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -2837,8 +2964,9 @@ def enable_keybinding(key: str):
         content = _read_bounded_regular_file(USER_BINDINGS_PATH) or ""
         has_unbind = (norm_key in parse_user_bindings()["unbinds"]
                       or _file_mentions_unbind(content, norm_key))
-        write_user_bindings(keys_to_remove=[norm_key], require_absent=[norm_key],
-                            require_removal=has_unbind)
+        # Remove ONLY the hl.unbind: the chord's own o.bind lines (the user's
+        # command, or one the plugin wrote) must come back to life.
+        write_user_bindings(remove_unbinds_only=[norm_key], require_removal=has_unbind)
     except ValueError as e:
         return {"success": False, "error": str(e)}
     reload_status = reload_hyprland()
@@ -2969,6 +3097,10 @@ def _safe_atomic_write_file(path: str, content: str):
     os.makedirs(dir_name, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".menu_", suffix=".jsonc.tmp")
     try:
+        try:
+            os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
             f.flush()
@@ -3075,23 +3207,29 @@ def main():
 
     elif cmd == "reset":
         if len(sys.argv) < 3:
-            print(json.dumps({"success": False, "error": "Usage: reset <key> [default_key]"}))
+            print(json.dumps({"success": False,
+                              "error": "Usage: reset <key> [default_key] [description] [action]"}))
             sys.exit(1)
         key = sys.argv[2]
         def_key = sys.argv[3] if len(sys.argv) > 3 else ""
+        row_desc = sys.argv[4] if len(sys.argv) > 4 else ""
+        row_action = sys.argv[5] if len(sys.argv) > 5 else ""
         try:
-            res = reset_keybinding(key, def_key)
+            res = reset_keybinding(key, def_key, description=row_desc, action=row_action)
         except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
             res = {"success": False, "error": str(e)}
         print(json.dumps(res))
 
     elif cmd == "disable":
         if len(sys.argv) < 3:
-            print(json.dumps({"success": False, "error": "Usage: disable <key>"}))
+            print(json.dumps({"success": False,
+                              "error": "Usage: disable <key> [description] [action]"}))
             sys.exit(1)
         key = sys.argv[2]
+        row_desc = sys.argv[3] if len(sys.argv) > 3 else ""
+        row_action = sys.argv[4] if len(sys.argv) > 4 else ""
         try:
-            res = disable_keybinding(key)
+            res = disable_keybinding(key, description=row_desc, action=row_action)
         except Exception as e:  # noqa: BLE001 — always emit JSON for the UI
             res = {"success": False, "error": str(e)}
         print(json.dumps(res))
