@@ -1224,15 +1224,20 @@ Item {
                       radius: Style.cornerRadius
 
                       readonly property string st: (modRow.modelData && modRow.modelData.status) || "modified"
-                      color: (st === "custom") ? Util.alpha("#4CAF50", 0.2) : Util.alpha("#FF9800", 0.2)
-                      borderSpec: Border.flat((st === "custom") ? "#4CAF50" : "#FF9800", 1)
+                      color: (st === "custom") ? Util.alpha("#4CAF50", 0.2)
+                             : (st === "disabled") ? Util.alpha("#9E9E9E", 0.2)
+                             : Util.alpha("#FF9800", 0.2)
+                      borderSpec: Border.flat((st === "custom") ? "#4CAF50"
+                                             : (st === "disabled") ? "#9E9E9E" : "#FF9800", 1)
 
                       Text {
                         textFormat: Text.PlainText
                         id: modStatusText
                         anchors.centerIn: parent
                         text: (modRow.modelData && modRow.modelData.status ? modRow.modelData.status.toUpperCase() : "MODIFIED")
-                        color: (modRow.modelData && modRow.modelData.status === "custom" ? "#4CAF50" : "#FF9800")
+                        color: (modRow.modelData && modRow.modelData.status === "custom" ? "#4CAF50"
+                               : (modRow.modelData && modRow.modelData.status === "disabled") ? "#9E9E9E"
+                               : "#FF9800")
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption - 2
                         font.bold: true

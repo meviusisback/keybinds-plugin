@@ -25,19 +25,33 @@ def _trusted_binary(name: str) -> str:
     plus a bare name that execvp re-resolves. Anything the plugin executes (hyprctl
     reload, the luac compile gate) goes through here instead.
     """
-    found = shutil.which(name)
-    if not found or not os.path.isabs(found):
+    candidates = []
+    for entry in (os.environ.get("PATH", "") or "").split(os.pathsep):
+        if not entry:
+            continue
+        cand = os.path.join(entry, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            candidates.append(cand)
+    if not candidates:
         return ""
+    for found in candidates:
+      if not _binary_is_trusted(found):
+        continue
+      return os.path.realpath(found)
+    return ""
+
+
+def _binary_is_trusted(found: str) -> bool:
     try:
         real = os.path.realpath(found)
         st = os.stat(real)
         # The file we will execute: regular, and not writable by anyone else.
         if not stat.S_ISREG(st.st_mode):
-            return ""
+            return False
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return ""
+            return False
         if st.st_uid not in (0, os.geteuid()):
-            return ""
+            return False
         # ... and every directory above it: a clean binary inside a world-writable
         # ancestor can be swapped by someone else just the same.
         probe = real
@@ -45,14 +59,18 @@ def _trusted_binary(name: str) -> str:
             probe = os.path.dirname(probe)
             pst = os.stat(probe)
             if not stat.S_ISDIR(pst.st_mode):
-                return ""
+                return False
             if pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                return ""
+                return False
+            # A directory owned by a third party can be re-pointed by that owner
+            # even when its mode looks clean.
+            if pst.st_uid not in (0, os.geteuid()):
+                return False
             if probe in ("/", ""):
                 break
     except OSError:
-        return ""
-    return real
+        return False
+    return True
 
 
 def _hyprctl() -> str:
@@ -612,13 +630,74 @@ def _is_last_default_on_chord(default: dict, defaults: list) -> bool:
     return True
 
 
+def _file_has_unreadable_binds() -> bool:
+    """True when bindings.lua holds a bind whose chord the parser cannot read.
+
+    The writer refuses to guess in that state (a computed key could be on the chord
+    being enabled), so the model must not offer Enable/Reset either.
+    """
+    try:
+        raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    lines, _newline = _split_lines(raw)
+    for _unit_lines, text, is_comment in _lua_units(lines):
+        if is_comment or not text or not _bind_head(text):
+            continue
+        if not _bind_chord_of(text):
+            return True
+    return False
+
+
+def _row_in_file(entry) -> bool:
+    """True when a bind with this row's description + action is in bindings.lua."""
+    if not entry:
+        return False
+    key = normalize_key_chord(entry.get("key", ""))
+    desc = (entry.get("description", "") or "").strip().lower()
+    act = _identity_value(entry.get("action"))
+    try:
+        raw = _read_bounded_regular_file(USER_BINDINGS_PATH)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    lines, _nl = _split_lines(raw)
+    for _ul, text, is_comment in _lua_units(lines):
+        if is_comment or not text:
+            continue
+        chord = _bind_chord_of(text)
+        if normalize_key_chord(chord) != key:
+            continue
+        head = _bind_head(text)
+        parsed = _parse_bind_line(text[head.start():].split("\n")[0]) if head else None
+        if not parsed:
+            continue
+        if (parsed[1] or "").strip().lower() == desc and _identity_value(parsed[2]) == act:
+            return True
+    return False
+
+
 def _bind_chord_of(text: str) -> str:
-    """The chord a bind statement registers, normalised; "" when unreadable."""
-    m = _search_in_code(r"\b(?:o\s*\.\s*bind[_a-z]*|hl\s*\.\s*bind)\s*\(", text)
-    if not m:
+    """The chord a bind statement registers, normalised; "" when unreadable.
+
+    Uses the SAME parser the model uses (_parse_bind_line). A second, narrower
+    regex here meant a bind with a computed key (`local k = "SUPER + W"`) looked like
+    "no bind on that chord", so Enable deleted the user's shadow unbind and left two
+    actions live on one keypress.
+    """
+    head = _bind_head(text)
+    if not head:
         return ""
-    value, _err, ok = _read_lua_string(text, m.end())
-    return normalize_key_chord(value) if ok and value else ""
+    parsed = _parse_bind_line(text[head.start():].split("\n")[0])
+    if not parsed:
+        return ""
+    # _parse_bind_line returns (key, description, action[, toggle])
+    key = parsed[0] if isinstance(parsed, (tuple, list)) else (
+        parsed.get("key") if isinstance(parsed, dict) else "")
+    return normalize_key_chord(key) if key else ""
 
 
 def _bind_head(text: str):
@@ -2015,6 +2094,13 @@ def build_complete_model():
             None)
         if same_key_user_bind is None and _candidates and _is_last_default_on_chord(d, default_binds):
             same_key_user_bind = _candidates[0]
+            # This default is now shadowed by a binding that names something else:
+            # keep it listed as a disabled row instead of dropping it from the panel.
+            _shadowed_default = dict(d)
+            _shadowed_default["status"] = "disabled"
+            _shadowed_default["disabled_row"] = True
+            _shadowed_default["default_key"] = k
+            all_active.append(_shadowed_default)
         if same_key_user_bind:
             item = dict(same_key_user_bind)
             item["status"] = "modified" if same_key_user_bind["description"].lower() == d["description"].lower() else "custom"
@@ -2059,12 +2145,18 @@ def build_complete_model():
             item["disabled_from"] = item["status"]
             item["status"] = "disabled"
             item["disabled_row"] = True
+        elif item.get("status") == "disabled":
+            # A shipped default switched off from the panel is the user's doing too:
+            # the Modified & Custom tab lists it (it used to vanish from the tab AND
+            # from the badge, while the README said it stays there).
+            item["disabled_row"] = True
 
     # What the row can do, decided HERE: the panel used to gate Reset on
     # status=='modified' and Delete on status=='custom', so a disabled override
     # was listed with neither button and could only be removed via Enable.
     live_chords = {b["key"] for b in all_active
                    if b.get("status") in ("default", "modified", "custom")}
+    _unreadable = _file_has_unreadable_binds()
     for item in all_active:
         status = item.get("status")
         on_default_chord = bool(item.get("default_key"))
@@ -2076,7 +2168,10 @@ def build_complete_model():
         # Enable can only remove an unbind that no live bind follows on that chord.
         # A default shadowed by a sibling's bind (ALT+TAB) would always be refused,
         # so offer Reset there instead of a button that can only fail.
-        item["can_enable"] = status == "disabled" and item["key"] not in live_chords
+        item["can_enable"] = (status == "disabled" and item["key"] not in live_chords
+                              and not _unreadable)
+        if _unreadable and status == "disabled":
+            item["can_reset"] = False
         item["can_disable"] = status in ("default", "modified", "custom")
 
     # 3. Sort Alphabetically by Description (case-insensitive)
@@ -2108,6 +2203,11 @@ def build_complete_model():
                     {"key": x["key"], "description": x["description"], "action": x["action"],
                      "command": x.get("command", ""),
                      "description_raw": x.get("description_raw", ""),
+                     # raw_key keeps the file's own spelling when the user edits a row
+                     # from this card ("ALT + Alt_R" must not become "ALT + ALT_R").
+                     "raw_key": x.get("raw_key", ""),
+                     "category": x.get("category", ""),
+                     "default_key": x.get("default_key", ""),
                      "status": x.get("status", "unknown")}
                     for x in group
                 ],
@@ -2293,7 +2393,7 @@ def _lua_compile_error(text: str) -> str:
             f.write(text)
         try:
             res = subprocess.run([luac, "-p", tmp], capture_output=True, text=True,
-                                 timeout=10)
+                                 timeout=10, start_new_session=True)
         except Exception:
             return ""  # a broken compiler is not a reason to lose the edit
         if res.returncode != 0:
@@ -2353,8 +2453,10 @@ def _code_only(text: str) -> str:
                 end = src.find(closer, i + long_comment.end())
                 end = n if end < 0 else end + len(closer)
             else:
-                end = src.find("\n", i)
-                end = n if end < 0 else end
+                nl = src.find("\n", i)
+                cr = src.find("\r", i)
+                ends = [e for e in (nl, cr) if e >= 0]
+                end = min(ends) if ends else n
             out.append("".join("\n" if c == "\n" else " " for c in src[i:end]))
             i = end
             continue
@@ -2426,7 +2528,22 @@ def _resolve_bindings_write_path(path: str):
     # or planted link turned any save into a rewrite of an arbitrary user-writable
     # file (probe: bindings.lua -> /var/tmp/victim.lua, rewritten, .bak dropped
     # beside it). Keep it inside the home directory.
+    # Dotfile managers legitimately keep bindings.lua elsewhere in the home, so the
+    # bound stays $HOME - but a link into a credential or autostart location is not
+    # a dotfiles link, and neither is a target that is not a .lua file.
     home = os.path.realpath(os.path.expanduser("~"))
+    _denied = (os.path.join(".ssh"), os.path.join(".gnupg"), os.path.join(".password-store"),
+               os.path.join(".config", "autostart"), os.path.join(".local", "bin"),
+               os.path.join(".config", "systemd"))
+    _rel = os.path.relpath(resolved, home) if home not in ("", "/") else resolved
+    if any(_rel == d or _rel.startswith(d + os.sep) for d in _denied):
+        raise ValueError(
+            f"the bindings file resolves to {resolved}, which is not a keybindings "
+            "file; refusing to write there")
+    if not resolved.lower().endswith(".lua"):
+        raise ValueError(
+            f"the bindings file resolves to {resolved}, which is not a .lua file; "
+            "refusing to write there")
     if home not in ("", "/") and not (resolved == home
                                       or resolved.startswith(home + os.sep)):
         raise ValueError(
@@ -2491,6 +2608,9 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     previous_identity = _written_bind_identity(previous_entry) if previous_entry else None
     identities = [i for i in (previous_identity, preserve_identity) if i is not None]
     overrides = set(normalize_key_chord(k) for k in (override_keys or []))
+    # Validate the target BEFORE creating anything: a refused save must not leave a
+    # directory behind (the refusal claims nothing was written).
+    _resolve_bindings_write_path(USER_BINDINGS_PATH)
     os.makedirs(cfg_dir, exist_ok=True)
 
     resolved_path, exists = _resolve_bindings_write_path(USER_BINDINGS_PATH)
@@ -2560,12 +2680,23 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     # any other binding was saved later, and made a hand-written disable dead.
     _units = list(_lua_units(current_lines))
     _bind_index_by_chord = {}
+    _unreadable_binds = False
     for _i, (_ul, _ut, _uc) in enumerate(_units):
         if _uc or not _ut or not _bind_head(_ut):
             continue
         _k = _bind_chord_of(_ut)
         if _k:
             _bind_index_by_chord[_k] = _i
+        else:
+            # A bind we cannot read could be on the chord being enabled: guessing
+            # "no bind follows" deleted the shadow unbind and left two actions live.
+            _unreadable_binds = True
+    if unbind_only_keys and _unreadable_binds:
+        raise ValueError(
+            "this file holds a binding whose shortcut cannot be read (a computed "
+            "key or description); refusing to remove an unbind that might belong "
+            "to it")
+
     trailing_unbind_units = set()
     for _i, (_ul, _ut, _uc) in enumerate(_units):
         if _uc or not _ut:
@@ -3231,8 +3362,14 @@ def set_keybinding(key: str, description: str, command: str, action: str = "", o
                             # on the identity helper recognising every literal form.
                             # Only when a row is really being replaced: a first
                             # bind on a free chord legitimately goes 0 -> 1.
+                            # The proof exists to catch a duplicate of the row being
+                            # replaced. On a two-default chord the sibling has no
+                            # statement yet, so its edit legitimately grows the chord
+                            # from one bind to two - demanding the count not change
+                            # made Edit on that row impossible.
                             no_duplicate_keys=([norm_key]
-                                               if (in_place and previous_entry) else []))
+                                               if (in_place and previous_entry
+                                                   and _row_in_file(previous_entry)) else []))
     except ValueError as e:
         return {"success": False, "error": str(e)}
     if keep_disabled:
@@ -3280,6 +3417,24 @@ def reset_keybinding(key: str, default_key: str = "", description: str = "",
 
     default_binds = parse_default_bindings()
     user_state = parse_user_bindings()
+
+    # Another live binding on this chord needs the shadow unbind: freeing the chord
+    # would re-arm the shipped default beside it (two actions on one keypress).
+    _target_desc = (description or "").strip().lower()
+    _target_act = _identity_value(action)
+    _others_live = []
+    for ub in user_state["binds"]:
+        if ub["key"] != norm_key:
+            continue
+        same_row = (identity is not None
+                    and (ub.get("description", "") or "").strip().lower() == _target_desc
+                    and _identity_value(ub.get("action")) == _target_act)
+        if not same_row:
+            _others_live.append(ub)
+    if norm_key in user_state["unbinds"] and _others_live:
+        return {"success": False,
+                "error": ("another binding of yours uses this shortcut; remove it "
+                          "first, otherwise the default would come back beside it")}
 
     # A moved override frees the chord it moved OFF. The match must be that
     # binding's own default (same action) AND that chord must carry an hl.unbind,

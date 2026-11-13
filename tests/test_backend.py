@@ -1943,11 +1943,17 @@ class TestRoundElevenRegressions(unittest.TestCase):
             "SUPER + W", "Close window (mine)", "killactive")
         self.assertTrue(res["success"], res)
         rows = [r for r in self._rows() if r["key"] == "SUPER + W"]
-        self.assertEqual([r["status"] for r in rows], ["disabled"])
+        # The user's row AND the shipped default it shadows are both dead now.
+        self.assertTrue(rows)
+        self.assertEqual({r["status"] for r in rows}, {"disabled"})
         res = keybinds_manager.enable_keybinding("SUPER + W")
         self.assertTrue(res["success"], res)
         rows = [r for r in self._rows() if r["key"] == "SUPER + W"]
-        self.assertNotIn("disabled", [r["status"] for r in rows])
+        # The user's binding is live again; the shipped default stays hidden by the
+        # shadow unbind (that is the point of keeping it).
+        self.assertIn("custom", [r["status"] for r in rows])
+        self.assertTrue(any(r["status"] == "disabled" and r["default_key"] == "SUPER + W"
+                            for r in rows))
         self.assertIn("killactive", self._read())
 
     def test_a_user_bind_on_a_two_default_chord_is_listed_once(self):
@@ -2256,7 +2262,12 @@ class TestRoundFifteenEnableAndBinaries(TestRoundTwelveRegressions):
         saved_path = os.environ.get("PATH", "")
         os.environ["PATH"] = tmp + ":" + saved_path
         try:
-            self.assertEqual(keybinds_manager._trusted_binary("luac"), "")
+            resolved = keybinds_manager._trusted_binary("luac")
+            # The poisoned entry is skipped, and the resolver falls through to a
+            # trusted luac further down PATH instead of giving up (which used to
+            # silently disable the compile gate).
+            self.assertNotEqual(resolved, fake)
+            self.assertFalse(resolved.startswith(tmp))
         finally:
             os.environ["PATH"] = saved_path
 
@@ -2269,6 +2280,76 @@ class TestRoundFifteenEnableAndBinaries(TestRoundTwelveRegressions):
         mine = next(b for b in rows if b["description"] == "Reveal active window on top")
         self.assertEqual(mine["status"], "modified", rows)
         self.assertTrue(mine["can_reset"])
+
+
+class TestRoundSixteenAgreement(TestRoundTwelveRegressions):
+    """Sixteenth round: the model and the writer must read the file the same way."""
+
+    def _row_for(self, key):
+        model = keybinds_manager.build_complete_model()
+        return next((b for b in model["active"] if b["key"] == key), None)
+
+    def test_a_computed_key_bind_makes_enable_refuse_instead_of_guessing(self):
+        # Enable used to delete the user's shadow unbind here and answer success,
+        # leaving the shipped default AND the user's binding live on one key.
+        self._write('hl.unbind("SUPER + W")\nlocal k = "SUPER + W"\no.bind(k, "mine", "swapwindow")\n')
+        row = self._row_for("SUPER + W")
+        self.assertFalse(row["can_enable"])
+        res = keybinds_manager.enable_keybinding("SUPER + W")
+        self.assertFalse(res["success"], res)
+        self.assertIn('hl.unbind("SUPER + W")', self._read())
+
+    def test_a_bracket_spelling_bind_is_seen_too(self):
+        self._write('hl.unbind("SUPER + W")\no["bind"]("SUPER + W", "mine", "swapwindow")\n')
+        self.assertFalse(keybinds_manager.enable_keybinding("SUPER + W")["success"])
+
+    def test_a_disabled_shipped_default_is_listed_in_modified(self):
+        self._write('hl.unbind("SUPER + W")\n')
+        model = keybinds_manager.build_complete_model()
+        row = next(b for b in model["active"] if b["key"] == "SUPER + W")
+        self.assertTrue(row["disabled_row"])
+        self.assertGreaterEqual(model["total_modified"], 1)
+
+    def test_both_defaults_of_a_two_default_chord_stay_listed(self):
+        self._write('hl.unbind("ALT + TAB")\no.bind("ALT + TAB", "My tab", "hyprctl dispatch cyclenext")\n')
+        model = keybinds_manager.build_complete_model()
+        rows = [b["description"] for b in model["active"] if b["key"] == "ALT + TAB"]
+        self.assertIn("Focus on next window", rows)
+        self.assertIn("Reveal active window on top", rows)
+        self.assertIn("My tab", rows)
+
+    def test_reset_refuses_to_free_a_chord_another_binding_uses(self):
+        self._write("")
+        keybinds_manager.set_keybinding("ALT + TAB", "Reveal active window on top (mine)",
+                                        "my-activate",
+                                        old_action="hl.dsp.window.bring_to_top()")
+        res = keybinds_manager.reset_keybinding(
+            "ALT + TAB", "ALT + TAB", "Focus on next window", "hl.dsp.window.cycle_next()")
+        self.assertFalse(res["success"], res)
+        self.assertIn('hl.unbind("ALT + TAB")', self._read())
+
+    def test_the_sibling_of_a_two_default_chord_can_be_edited(self):
+        self._write("")
+        keybinds_manager.set_keybinding("ALT + TAB", "Reveal active window on top (mine)",
+                                        "my-activate",
+                                        old_action="hl.dsp.window.bring_to_top()")
+        res = keybinds_manager.set_keybinding(
+            "ALT + TAB", "Focus on next window (mine)", "my-cycle",
+            old_key="ALT + TAB", old_description="Focus on next window",
+            old_action="hl.dsp.window.cycle_next()")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(self._read().count('hl.unbind("ALT + TAB")'), 1)
+
+    def test_the_containment_bound_refuses_a_non_lua_target(self):
+        import tempfile as _tf
+        outside = os.path.join(self.home, ".profile")
+        open(outside, "w").write("export X=1\n")
+        if os.path.lexists(self.path):
+            os.remove(self.path)
+        os.symlink(outside, self.path)
+        res = keybinds_manager.set_keybinding("SUPER + B", "B", "true")
+        self.assertFalse(res["success"], res)
+        self.assertEqual(open(outside).read(), "export X=1\n")
 
 
 if __name__ == "__main__":
