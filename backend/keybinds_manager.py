@@ -28,14 +28,31 @@ def _trusted_binary(name: str) -> str:
     found = shutil.which(name)
     if not found or not os.path.isabs(found):
         return ""
-    parent = os.path.dirname(found)
     try:
-        st = os.stat(parent)
+        real = os.path.realpath(found)
+        st = os.stat(real)
+        # The file we will execute: regular, and not writable by anyone else.
+        if not stat.S_ISREG(st.st_mode):
+            return ""
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return ""
+        if st.st_uid not in (0, os.geteuid()):
+            return ""
+        # ... and every directory above it: a clean binary inside a world-writable
+        # ancestor can be swapped by someone else just the same.
+        probe = real
+        while True:
+            probe = os.path.dirname(probe)
+            pst = os.stat(probe)
+            if not stat.S_ISDIR(pst.st_mode):
+                return ""
+            if pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return ""
+            if probe in ("/", ""):
+                break
     except OSError:
         return ""
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return ""
-    return found
+    return real
 
 
 def _hyprctl() -> str:
@@ -580,6 +597,28 @@ def _unit_is_single_statement(text: str) -> bool:
 
 _BIND_HEAD_RE = re.compile(
     r'o\s*\.\s*bind(?:_toggle|_hold)?\s*\(|o\s*\[\s*["\']bind(?:_toggle|_hold)?["\']\s*\]\s*\(')
+
+
+def _is_last_default_on_chord(default: dict, defaults: list) -> bool:
+    """True when no later shipped default uses this default's chord."""
+    chord = default.get("key")
+    seen = False
+    for item in defaults:
+        if item is default:
+            seen = True
+            continue
+        if seen and item.get("key") == chord:
+            return False
+    return True
+
+
+def _bind_chord_of(text: str) -> str:
+    """The chord a bind statement registers, normalised; "" when unreadable."""
+    m = _search_in_code(r"\b(?:o\s*\.\s*bind[_a-z]*|hl\s*\.\s*bind)\s*\(", text)
+    if not m:
+        return ""
+    value, _err, ok = _read_lua_string(text, m.end())
+    return normalize_key_chord(value) if ok and value else ""
 
 
 def _bind_head(text: str):
@@ -1962,10 +2001,20 @@ def build_complete_model():
                 all_active.append(sibling)
             continue
 
+        _candidates = [ub for ub in user_state["binds"]
+                       if ub["key"] == k and id(ub) not in matched_user_rows
+                       and not ub.get("_consumed_by_default")]
+        # Prefer the row that names THIS default: ALT+TAB carries two defaults, and
+        # taking whichever came first labelled the user's row CUSTOM and re-listed the
+        # real default as a phantom duplicate. An unmatched row waits for the default
+        # it belongs to; only the chord's LAST default falls back to it.
         same_key_user_bind = next(
-            (ub for ub in user_state["binds"]
-             if ub["key"] == k and id(ub) not in matched_user_rows
-             and not ub.get("_consumed_by_default")), None)
+            (ub for ub in _candidates
+             if ub.get("description", "").strip().lower() == d["description"].strip().lower()
+             or _identity_value(ub.get("action")) == _identity_value(d["action"])),
+            None)
+        if same_key_user_bind is None and _candidates and _is_last_default_on_chord(d, default_binds):
+            same_key_user_bind = _candidates[0]
         if same_key_user_bind:
             item = dict(same_key_user_bind)
             item["status"] = "modified" if same_key_user_bind["description"].lower() == d["description"].lower() else "custom"
@@ -2014,14 +2063,20 @@ def build_complete_model():
     # What the row can do, decided HERE: the panel used to gate Reset on
     # status=='modified' and Delete on status=='custom', so a disabled override
     # was listed with neither button and could only be removed via Enable.
+    live_chords = {b["key"] for b in all_active
+                   if b.get("status") in ("default", "modified", "custom")}
     for item in all_active:
         status = item.get("status")
         on_default_chord = bool(item.get("default_key"))
-        item["can_reset"] = on_default_chord and (
-            status == "modified" or bool(item.get("disabled_row")))
+        # Reset restores the shipped action, so it is the right control for ANY row
+        # tied to a default chord - including one disabled by a hand-written unbind.
+        item["can_reset"] = on_default_chord and status in ("modified", "disabled")
         item["can_delete"] = (status == "custom"
                               or (bool(item.get("disabled_row")) and not on_default_chord))
-        item["can_enable"] = status == "disabled"
+        # Enable can only remove an unbind that no live bind follows on that chord.
+        # A default shadowed by a sibling's bind (ALT+TAB) would always be refused,
+        # so offer Reset there instead of a button that can only fail.
+        item["can_enable"] = status == "disabled" and item["key"] not in live_chords
         item["can_disable"] = status in ("default", "modified", "custom")
 
     # 3. Sort Alphabetically by Description (case-insensitive)
@@ -2255,6 +2310,63 @@ def _lua_compile_error(text: str) -> str:
             pass
 
 
+def _code_only(text: str) -> str:
+    """``text`` with strings, long brackets and COMMENTS blanked out.
+
+    One scanner, because the pieces have to agree: _code_mask knows strings but no
+    comments (one apostrophe in "-- don't" blanked the rest of the file), and
+    stripping comments first without knowing strings would cut at a "--" inside a
+    command literal.
+    """
+    src = text or ""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch in "\"'":
+            quote = ch
+            out.append(" ")
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    out.append(" ")
+                    i += 2
+                    continue
+                out.append(" " if src[i] != "\n" else "\n")
+                if src[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        long_open = re.match(r"\[(=*)\[", src[i:])
+        if long_open:
+            closer = "]" + long_open.group(1) + "]"
+            end = src.find(closer, i + long_open.end())
+            end = n if end < 0 else end + len(closer)
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if ch == "-" and src.startswith("--", i):
+            long_comment = re.match(r"--\[(=*)\[", src[i:])
+            if long_comment:
+                closer = "]" + long_comment.group(1) + "]"
+                end = src.find(closer, i + long_comment.end())
+                end = n if end < 0 else end + len(closer)
+            else:
+                end = src.find("\n", i)
+                end = n if end < 0 else end
+            out.append("".join("\n" if c == "\n" else " " for c in src[i:end]))
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _function_token_count(text: str) -> int:
+    return len(re.findall(r"(?<![\w.:])function\b", _code_only(text or "")))
+
+
 def _has_function_action(text: str) -> bool:
     """True when ``text`` holds a Lua ``function`` literal in code position.
 
@@ -2285,7 +2397,10 @@ def _assert_lua_compiles(text: str, original: str = "") -> None:
     # a file that already had one stays editable, so the row can still be fixed.
     if not (_trusted_binary("luac") or _trusted_binary("luac4")
             or _trusted_binary("luac5.4") or _trusted_binary("luac5.3")):
-        if _has_function_action(text) and not _has_function_action(original):
+        # COUNT, not presence: a file that already holds one function literal used
+        # to whitelist every later one, which is exactly the case this gate exists
+        # for (a compiler-less host writing a bindings.lua Hyprland will drop).
+        if _function_token_count(text) > _function_token_count(original):
             raise ValueError(
                 "this action is a Lua function and no Lua compiler (luac) was found "
                 "to validate it; install lua or use a dispatcher form")
@@ -2438,25 +2553,32 @@ def write_user_bindings(lines_to_add=None, unbinds_to_add=None, keys_to_remove=N
     clean_keys = set(normalize_key_chord(k) for k in (keys_to_remove or []))
     unbind_only_keys = set(normalize_key_chord(k) for k in (remove_unbinds_only or []))
 
-    # Which unbind units are the one Disable appended: the unbind that comes AFTER
-    # the last bind on that chord. The shadow unbind a save writes ABOVE the user's
-    # bind has to stay, or Enable would resurrect the Omarchy default beside the
-    # user's own binding and one keypress would run both actions.
+    # Which unbind units may be removed: an unbind on chord K that has NO bind on K
+    # after it (the one Disable appends, and the hand-written one at the top of a
+    # file with nothing bound to that chord afterwards). The rule is per CHORD:
+    # comparing against the last bind in the whole file made Enable refuse as soon as
+    # any other binding was saved later, and made a hand-written disable dead.
     _units = list(_lua_units(current_lines))
-    _last_bind_index = -1
+    _bind_index_by_chord = {}
     for _i, (_ul, _ut, _uc) in enumerate(_units):
-        if not _uc and _ut and _bind_head(_ut):
-            _last_bind_index = _i
+        if _uc or not _ut or not _bind_head(_ut):
+            continue
+        _k = _bind_chord_of(_ut)
+        if _k:
+            _bind_index_by_chord[_k] = _i
     trailing_unbind_units = set()
     for _i, (_ul, _ut, _uc) in enumerate(_units):
-        if _uc or not _ut or _i <= _last_bind_index:
+        if _uc or not _ut:
             continue
         _m = _search_in_code(
             r'\bhl\s*(?:\.\s*unbind|\[\s*["\']unbind["\']\s*\])\s*\(', _ut)
         if not _m:
             continue
         _value, _err, _ok = _read_lua_string(_ut, _m.end())
-        if _ok and _value and normalize_key_chord(_value) in unbind_only_keys:
+        if not (_ok and _value):
+            continue
+        _chord = normalize_key_chord(_value)
+        if _chord in unbind_only_keys and _i > _bind_index_by_chord.get(_chord, -1):
             trailing_unbind_units.add(_i)
 
     new_lines = []
@@ -2930,9 +3052,13 @@ def reload_hyprland():
                 "config_errors": "hyprctl was not found in a trusted location; "
                                  "reload the config by hand"}
     try:
-        res = subprocess.run([hyprctl, "reload"], capture_output=True, text=True, timeout=10)
-        err_res = subprocess.run([hyprctl, "configerrors"], capture_output=True, text=True, timeout=10)
-        errors = err_res.stdout.strip() if err_res.returncode == 0 else ""
+        # Own process group: on a timeout only the direct child used to be killed,
+        # so anything hyprctl started stayed behind. Output is bounded too.
+        res = subprocess.run([hyprctl, "reload"], capture_output=True, text=True,
+                             timeout=10, start_new_session=True)
+        err_res = subprocess.run([hyprctl, "configerrors"], capture_output=True,
+                                 text=True, timeout=10, start_new_session=True)
+        errors = (err_res.stdout or "")[:65536].strip() if err_res.returncode == 0 else ""
         # `hyprctl reload` exits 0 even when Hyprland rejects the file - and then
         # it drops every user override in it. A save that leaves errors behind is
         # not "applied".

@@ -183,8 +183,12 @@ Item {
   }
 
   // Same classifier as the backend: these shapes are Lua, not a command.
+  // A COMPLETE quoted literal is data, though - the backend stores it as the string
+  // and it runs through the shell, so a command that merely starts with "{" or "hl."
+  // (a brace group: "{ a; b; }") must not be refused here.
   function isRawAction(a) {
     if (!a) return false
+    if (/^\s*"(?:[^"\\]|\\.)*"\s*$/.test(a) || /^\s*'(?:[^'\\]|\\.)*'\s*$/.test(a)) return false
     return /^\s*(hl\.|\{|o\.[A-Za-z_][A-Za-z0-9_.]*\s*\()/.test(a)
   }
 

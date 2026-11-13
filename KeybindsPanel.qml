@@ -61,7 +61,9 @@ Item {
     // would then swallow the keys the recorder is waiting for.
     if (recordingSearch) {
       recordingSearch = false
-      searchInput.text = ""
+      // Clear through the model, not the field: assigning text here replaced the
+      // declarative binding and the saved search stopped coming back.
+      root.searchQuery = ""
     }
     closingFromHost = false
     window.visible = true
@@ -1068,7 +1070,7 @@ Item {
 
                       // Enable (if disabled)
                       Button {
-                        visible: Boolean(activeRow.modelData && activeRow.modelData.status === "disabled")
+                        visible: Boolean(activeRow.modelData && activeRow.modelData.can_enable)
                         text: "Enable"
                         iconText: "✓"
                         accent: "#4CAF50"
@@ -1302,6 +1304,17 @@ Item {
                         horizontalPadding: Style.space(8)
                         verticalPadding: Style.space(4)
                         onClicked: editDialog.openEdit(modRow.modelData)
+                      }
+
+                      Button {
+                        visible: Boolean(modRow.modelData && modRow.modelData.can_enable)
+                        text: "Enable"
+                        iconText: "✓"
+                        accent: "#4CAF50"
+                        tooltipText: "Re-enable Keybinding"
+                        horizontalPadding: Style.space(8)
+                        verticalPadding: Style.space(4)
+                        onClicked: root.enableKeybinding(modRow.modelData.key)
                       }
 
                       Button {

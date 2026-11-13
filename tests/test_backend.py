@@ -2120,7 +2120,7 @@ class TestRoundThirteenRegressions(TestRoundTwelveRegressions):
         self.assertEqual(text.count('hl.unbind("' + key + '")'), 1, text)
         self.assertIn("my-term", text)
 
-    def test_a_disabled_override_keeps_reset_and_delete(self):
+    def test_a_disabled_override_keeps_reset_and_offers_no_dead_enable(self):
         self._write("")
         key = "SUPER + SHIFT + B"
         keybinds_manager.set_keybinding(key, "Browser Override", "my-browser")
@@ -2128,9 +2128,15 @@ class TestRoundThirteenRegressions(TestRoundTwelveRegressions):
         row = self._row_for(key)
         self.assertEqual(row["status"], "disabled")
         self.assertTrue(row["disabled_row"])
+        # A row on a default chord is restored (Reset); Delete belongs to custom rows.
         self.assertTrue(row["can_reset"])
-        self.assertFalse(row["can_delete"])  # it sits on a default chord
+        self.assertFalse(row["can_delete"])
+        # Enable works there (it removes the unbind Disable appended and keeps the
+        # shadow), so the model offers it.
         self.assertTrue(row["can_enable"])
+        res = keybinds_manager.enable_keybinding(key)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(self._read().count('hl.unbind("' + key + '")'), 1)
 
     def test_a_second_bind_on_an_overridden_chord_stays_visible(self):
         self._write('hl.unbind("ALT + TAB")\n'
@@ -2192,6 +2198,77 @@ class TestRoundThirteenRegressions(TestRoundTwelveRegressions):
         text = self._read()
         self.assertEqual(text.count('hl.unbind("' + key + '")'), 2, text)
         self.assertIn(key, keybinds_manager._chords_disabled_by_unbind())
+
+
+class TestRoundFifteenEnableAndBinaries(TestRoundTwelveRegressions):
+    """Fifteenth round: Enable must work on the shapes users actually have."""
+
+    def test_enable_works_on_a_hand_written_unbind(self):
+        self._write('-- my overrides\nhl.unbind("SUPER + W")\n'
+                    'o.bind("SUPER + F9", "Mine", "cmd")\n')
+        res = keybinds_manager.enable_keybinding("SUPER + W")
+        self.assertTrue(res["success"], res)
+        self.assertNotIn('hl.unbind("SUPER + W")', self._read())
+
+    def test_enable_survives_a_later_save(self):
+        # "trailing" must mean "after the last bind ON THIS CHORD": comparing with
+        # the last bind in the file made the button dead after any other save.
+        self._write("")
+        keybinds_manager.set_keybinding("SUPER + RETURN", "Term Override", "my-term")
+        keybinds_manager.disable_keybinding("SUPER + RETURN", "Term Override", "my-term")
+        keybinds_manager.set_keybinding("SUPER + F8", "Other", "other-cmd")
+        res = keybinds_manager.enable_keybinding("SUPER + RETURN")
+        self.assertTrue(res["success"], res)
+        text = self._read()
+        self.assertEqual(text.count('hl.unbind("SUPER + RETURN")'), 1, text)  # shadow stays
+        self.assertIn("my-term", text)
+
+    def test_one_function_row_does_not_whitelist_a_broken_second(self):
+        self._write("-- don't remove this header\n"
+                    'o.bind("SUPER + F6", "Existing", function() return 1 end)\n')
+        orig = keybinds_manager._trusted_binary
+        keybinds_manager._trusted_binary = lambda name: ""
+        try:
+            for payload in ("function() if x end", "f(function() if x end)"):
+                with self.subTest(payload=payload):
+                    res = keybinds_manager.set_keybinding("SUPER + F7", "New", "", payload)
+                    self.assertFalse(res["success"], res)
+        finally:
+            keybinds_manager._trusted_binary = orig
+
+    def test_a_comment_with_an_apostrophe_does_not_hide_the_gate(self):
+        self._write("-- don't remove this header\n")
+        orig = keybinds_manager._trusted_binary
+        keybinds_manager._trusted_binary = lambda name: ""
+        try:
+            res = keybinds_manager.set_keybinding("SUPER + F7", "New", "", "function() if x end")
+        finally:
+            keybinds_manager._trusted_binary = orig
+        self.assertFalse(res["success"], res)
+
+    def test_a_world_writable_binary_is_not_trusted(self):
+        import stat as _stat
+        tmp = tempfile.mkdtemp(dir=self.home)
+        fake = os.path.join(tmp, "luac")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(fake, 0o777)
+        saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = tmp + ":" + saved_path
+        try:
+            self.assertEqual(keybinds_manager._trusted_binary("luac"), "")
+        finally:
+            os.environ["PATH"] = saved_path
+
+    def test_a_default_on_a_two_default_chord_pairs_by_name(self):
+        self._write('hl.unbind("ALT + TAB")\n'
+                    'o.bind("ALT + TAB", "Reveal active window on top", '
+                    '"hyprctl dispatch bringactivetotop")\n')
+        model = keybinds_manager.build_complete_model()
+        rows = [b for b in model["active"] if b["key"] == "ALT + TAB"]
+        mine = next(b for b in rows if b["description"] == "Reveal active window on top")
+        self.assertEqual(mine["status"], "modified", rows)
+        self.assertTrue(mine["can_reset"])
 
 
 if __name__ == "__main__":
